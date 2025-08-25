@@ -31,9 +31,15 @@ class UserFileCreationService: UserFileCreationServiceProtocol {
         return formatter
     }()
 
+    private static let hourFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:00"
+        return formatter
+    }()
+
     func generateCSV(completion: @escaping (URL?) -> Void) {
         let metricNames = Self.metricNames()
-        let header = (["Date"] + metricNames).joined(separator: ",")
+        let header = (["Date", "Time"] + metricNames).joined(separator: ",")
 
         fetchAllMetricsData { dailyRows, monthlyRows in
             var csvRows: [String] = [header]
@@ -57,7 +63,8 @@ class UserFileCreationService: UserFileCreationServiceProtocol {
         let calendar = Calendar.current
         let group = DispatchGroup()
 
-        var dailyData: [String: [String: Double]] = [:]
+        // hourlyData[dateString][timeString][metric] = value
+        var hourlyData: [String: [String: [String: Double]]] = [:]
 
         // Build date range
         let dailyDates: [Date] = (0..<180).compactMap { calendar.date(byAdding: .day, value: -$0, to: today) }
@@ -66,23 +73,39 @@ class UserFileCreationService: UserFileCreationServiceProtocol {
             if let quantityType = HealthMetricMapper.quantityType(for: metric),
                let hkType = HKObjectType.quantityType(forIdentifier: quantityType) {
                 group.enter()
-                fetchQuantityData(
+                fetchQuantityDataHourly(
                     type: hkType,
                     metric: metric,
                     dailyDates: dailyDates
-                ) { daily in
-                    for (date, value) in daily { dailyData[date, default: [:]][metric] = value }
+                ) { perDayHourly in
+                    for (dateStr, timeValues) in perDayHourly {
+                        var timeDict = hourlyData[dateStr, default: [:]]
+                        for (timeStr, value) in timeValues {
+                            var metricDict = timeDict[timeStr, default: [:]]
+                            metricDict[metric] = value
+                            timeDict[timeStr] = metricDict
+                        }
+                        hourlyData[dateStr] = timeDict
+                    }
                     group.leave()
                 }
             } else if let categoryType = HealthMetricMapper.categoryType(for: metric),
                       let hkType = HKObjectType.categoryType(forIdentifier: categoryType) {
                 group.enter()
-                fetchCategoryData(
+                fetchCategoryDataHourly(
                     type: hkType,
                     metric: metric,
                     dailyDates: dailyDates
-                ) { daily in
-                    for (date, value) in daily { dailyData[date, default: [:]][metric] = value }
+                ) { perDayHourly in
+                    for (dateStr, timeValues) in perDayHourly {
+                        var timeDict = hourlyData[dateStr, default: [:]]
+                        for (timeStr, value) in timeValues {
+                            var metricDict = timeDict[timeStr, default: [:]]
+                            metricDict[metric] = value
+                            timeDict[timeStr] = metricDict
+                        }
+                        hourlyData[dateStr] = timeDict
+                    }
                     group.leave()
                 }
             }
@@ -90,15 +113,19 @@ class UserFileCreationService: UserFileCreationServiceProtocol {
 
         group.notify(queue: .main) {
             let sortedDaily = dailyDates.map { Self.dateFormatter.string(from: $0) }
-            let dailyRows: [String] = sortedDaily.map { dateStr in
-                let values = metricNames.map { metric in
-                    if let val = dailyData[dateStr]?[metric] {
-                        return String(format: "%.2f", val)
-                    } else {
-                        return ""
+            let timesDesc: [String] = (0..<24).reversed().map { String(format: "%02d:00", $0) }
+            var dailyRows: [String] = []
+            for dateStr in sortedDaily {
+                for timeStr in timesDesc {
+                    let values = metricNames.map { metric in
+                        if let val = hourlyData[dateStr]?[timeStr]?[metric] {
+                            return String(format: "%.2f", val)
+                        } else {
+                            return ""
+                        }
                     }
+                    dailyRows.append(([dateStr, timeStr] + values).joined(separator: ","))
                 }
-                return ([dateStr] + values).joined(separator: ",")
             }
 
             completion(dailyRows, [])
@@ -147,51 +174,104 @@ class UserFileCreationService: UserFileCreationServiceProtocol {
         }
     }
 
-    private func fetchCategoryData(type: HKCategoryType, metric: String, dailyDates: [Date], completion: @escaping ([String: Double]) -> Void) {
+    private func fetchQuantityDataHourly(type: HKQuantityType, metric: String, dailyDates: [Date], completion: @escaping ([String: [String: Double]]) -> Void) {
         let calendar = Calendar.current
-        let now = Date()
-        let startDate = calendar.date(byAdding: .year, value: -2, to: now) ?? now
-        let predicate = HKQuery.predicateForSamples(withStart: startDate, end: now, options: .strictStartDate)
+        let today = Date()
+        guard let startDay = dailyDates.last else { completion([:]); return }
+        let rangeStart = calendar.startOfDay(for: startDay)
+        let rangeEnd = calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: dailyDates.first ?? today)) ?? today
 
-        var dailyResults: [String: Double] = [:]
+        let predicate = HKQuery.predicateForSamples(withStart: rangeStart, end: rangeEnd, options: .strictStartDate)
+        let unitStr = HealthMetricMapper.unit(for: metric)
+        let unit = HKUnit(from: unitStr)
+        let statsOption = HealthMetricMapper.statisticsOption(for: metric)
 
-        let query = HKSampleQuery(sampleType: type, predicate: predicate, limit: HKObjectQueryNoLimit, sortDescriptors: nil) { [weak self] _, samples, error in
+        var resultsPerDay: [String: [String: Double]] = [:]
+
+        let interval = DateComponents(hour: 1)
+        let anchorDate = calendar.startOfDay(for: rangeStart)
+        let query = HKStatisticsCollectionQuery(quantityType: type, quantitySamplePredicate: predicate, options: statsOption, anchorDate: anchorDate, intervalComponents: interval)
+        query.initialResultsHandler = { [weak self] _, results, error in
+            if let error = error {
+                print("Error fetching hourly \(metric): \(error.localizedDescription)")
+                completion(resultsPerDay)
+                return
+            }
+
+            if let statsCollection = results {
+                statsCollection.enumerateStatistics(from: rangeStart, to: rangeEnd) { stat, _ in
+                    guard let value = self?.extractQuantityValue(stat: stat, unit: unit, statsOption: statsOption) else { return }
+                    let dateStr = Self.dateFormatter.string(from: stat.startDate)
+                    let timeStr = Self.hourFormatter.string(from: stat.startDate)
+                    var perHour = resultsPerDay[dateStr, default: [:]]
+                    perHour[timeStr] = value
+                    resultsPerDay[dateStr] = perHour
+                }
+            }
+            completion(resultsPerDay)
+        }
+        self.healthStoreService.healthStore.execute(query)
+    }
+
+    private func fetchCategoryDataHourly(type: HKCategoryType, metric: String, dailyDates: [Date], completion: @escaping ([String: [String: Double]]) -> Void) {
+        let calendar = Calendar.current
+        let today = Date()
+        guard let startDay = dailyDates.last else { completion([:]); return }
+        let rangeStart = calendar.startOfDay(for: startDay)
+        let rangeEnd = calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: dailyDates.first ?? today)) ?? today
+
+        let predicate = HKQuery.predicateForSamples(withStart: rangeStart, end: rangeEnd, options: .strictStartDate)
+
+        var perDayHourResults: [String: [String: Double]] = [:]
+
+        let query = HKSampleQuery(sampleType: type, predicate: predicate, limit: HKObjectQueryNoLimit, sortDescriptors: nil) { _, samples, error in
             if let error = error {
                 print("Error fetching category \(metric): \(error.localizedDescription)")
-                completion(dailyResults)
+                completion(perDayHourResults)
                 return
             }
 
             guard let samples = samples as? [HKCategorySample] else {
-                completion(dailyResults)
+                completion(perDayHourResults)
                 return
             }
 
             for date in dailyDates {
                 let dayStart = calendar.startOfDay(for: date)
-                let dayEnd = calendar.date(byAdding: .day, value: 1, to: dayStart) ?? dayStart
-                let daySamples = samples.filter { $0.startDate >= dayStart && $0.startDate < dayEnd }
-                if !daySamples.isEmpty {
-                    let total = self?.calculateCategoryTotal(samples: daySamples, metric: metric)
-                    if let total = total {
-                        dailyResults[Self.dateFormatter.string(from: date)] = total
+                for hour in 0..<24 {
+                    let hourStart = calendar.date(byAdding: .hour, value: hour, to: dayStart) ?? dayStart
+                    let hourEnd = calendar.date(byAdding: .hour, value: 1, to: hourStart) ?? hourStart
+                    let overlapping = samples.filter { $0.endDate > hourStart && $0.startDate < hourEnd }
+                    if !overlapping.isEmpty {
+                        let total = self.calculateCategoryOverlapTotal(samples: overlapping, metric: metric, hourStart: hourStart, hourEnd: hourEnd)
+                        if total > 0 {
+                            let dateStr = Self.dateFormatter.string(from: dayStart)
+                            let timeStr = String(format: "%02d:00", hour)
+                            var perHour = perDayHourResults[dateStr, default: [:]]
+                            perHour[timeStr] = total
+                            perDayHourResults[dateStr] = perHour
+                        }
                     }
                 }
             }
-            completion(dailyResults)
+            completion(perDayHourResults)
         }
         self.healthStoreService.healthStore.execute(query)
     }
 
-    private func calculateCategoryTotal(samples: [HKCategorySample], metric: String) -> Double {
-        if metric == "Sleep Duration" {
-            let totalSeconds = samples.reduce(0.0) { $0 + $1.endDate.timeIntervalSince($1.startDate) }
-            return totalSeconds / 3600.0 // Return in hours
-        } else if metric == "Mindfulness Minutes" {
-            let totalSeconds = samples.reduce(0.0) { $0 + $1.endDate.timeIntervalSince($1.startDate) }
-            return totalSeconds / 60.0 // Return in minutes
+    private func calculateCategoryOverlapTotal(samples: [HKCategorySample], metric: String, hourStart: Date, hourEnd: Date) -> Double {
+        let overlappedSeconds = samples.reduce(0.0) { partial, s in
+            let start = max(s.startDate, hourStart)
+            let end = min(s.endDate, hourEnd)
+            let interval = end.timeIntervalSince(start)
+            return interval > 0 ? partial + interval : partial
         }
-        fatalError("Unknown category metric: \(metric)") // Should never be reached
+        if metric == "Sleep Duration" {
+            return overlappedSeconds / 3600.0
+        } else if metric == "Mindfulness Minutes" {
+            return overlappedSeconds / 60.0
+        }
+        fatalError("Unknown category metric: \(metric)")
     }
 
     private func writeCSVToFile(csvString: String) -> URL? {
