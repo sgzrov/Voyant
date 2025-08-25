@@ -9,7 +9,7 @@ logger.setLevel(logging.INFO)
 logger.propagate = True
 
 class StudySummaryAgent:
-    def __init__(self, api_key: str, prompt_path: str, model: str = "gpt-4o-mini") -> None:
+    def __init__(self, api_key: str, prompt_path: str, model: str = "gpt-5") -> None:
         self.api_key = api_key
         self.model = model
         self.client = openai.OpenAI(api_key = api_key)
