@@ -20,9 +20,6 @@ protocol SSEServiceProtocol {
 protocol AgentBackendServiceProtocol {
     func chatWithCIStream(csvFilePath: String, userInput: String, conversationId: String?) async throws -> AsyncStream<String>
     func simpleChatStream(userInput: String, conversationId: String?) async throws -> AsyncStream<String>
-    func generateOutcomeStream(csvFilePath: String, userInput: String, studyId: String?) async throws -> AsyncStream<String>
-    func summarizeStudyStream(userInput: String, studyId: String?) async throws -> AsyncStream<String>
-    func createStudy() async throws -> String
     func shouldUseCodeInterpreter(userInput: String) async throws -> Bool
 }
 

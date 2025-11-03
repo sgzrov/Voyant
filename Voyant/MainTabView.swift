@@ -1,10 +1,3 @@
-//
-//  MainTabView.swift
-//  HealthPredictor
-//
-//  Created by Stephan  on 01.04.2025.
-//
-
 import SwiftUI
 import Clerk
 
@@ -20,11 +13,6 @@ struct MainTabView: View {
     var body: some View {
         TabView {
             if !userToken.isEmpty {
-                StudiesHomeView(userToken: userToken)
-                    .tabItem {
-                        Image(systemName: "list.bullet.rectangle")
-                        Text("Studies")
-                    }
                 MainChatView(userToken: userToken)
                     .tabItem {
                         Image(systemName: "message")
@@ -35,10 +23,6 @@ struct MainTabView: View {
                     ProgressView()
                     Text("Signing in...")
                         .foregroundColor(.secondary)
-                }
-                .tabItem {
-                    Image(systemName: "list.bullet.rectangle")
-                    Text("Studies")
                 }
                 VStack {
                     ProgressView()

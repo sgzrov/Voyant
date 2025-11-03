@@ -7,7 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		04203C8D2E22607900B9C575 /* Clerk in Frameworks */ = {isa = PBXBuildFile; productRef = 04203C8C2E22607900B9C575 /* Clerk */; };
+		0437D8962EB95EB80005BF5C /* Clerk in Frameworks */ = {isa = PBXBuildFile; productRef = 0437D8952EB95EB80005BF5C /* Clerk */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -40,7 +40,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				04203C8D2E22607900B9C575 /* Clerk in Frameworks */,
+				0437D8962EB95EB80005BF5C /* Clerk in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -75,9 +75,9 @@
 			);
 			name = Voyant;
 			packageProductDependencies = (
-				04203C8C2E22607900B9C575 /* Clerk */,
+				0437D8952EB95EB80005BF5C /* Clerk */,
 			);
-			productName = HealthPredictor;
+			productName = Voyant;
 			productReference = 0437D5F42EB887280005BF5C /* Voyant.app */;
 			productType = "com.apple.product-type.application";
 		};
@@ -107,7 +107,7 @@
 			mainGroup = 046F70D62D91216400D6B0E2;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
-				04203C8B2E22607900B9C575 /* XCRemoteSwiftPackageReference "clerk-ios" */,
+				0437D8942EB95EB80005BF5C /* XCRemoteSwiftPackageReference "clerk-ios" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 046F70D62D91216400D6B0E2;
@@ -269,14 +269,15 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CLANG_ENABLE_MODULES = YES;
-				CODE_SIGN_ENTITLEMENTS = HealthPredictor/HealthPredictor.entitlements;
+				CODE_SIGN_ENTITLEMENTS = Voyant/Voyant.entitlements;
+				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_ASSET_PATHS = "\"HealthPredictor/Preview Content\"";
+				DEVELOPMENT_ASSET_PATHS = "\"Voyant/Preview Content\"";
 				DEVELOPMENT_TEAM = 7VS44S3CU5;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_FILE = HealthPredictor/Info.plist;
+				INFOPLIST_FILE = Voyant/Info.plist;
 				INFOPLIST_KEY_LSApplicationCategoryType = "";
 				INFOPLIST_KEY_NSHealthShareUsageDescription = "This app reads your health data to provide insights.";
 				INFOPLIST_KEY_NSHealthUpdateUsageDescription = "This app writes health data to help track your progress.";
@@ -290,8 +291,9 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = Stephan.HealthPredictor;
+				PRODUCT_BUNDLE_IDENTIFIER = Stephan.Voyant;
 				PRODUCT_NAME = "$(TARGET_NAME)";
+				PROVISIONING_PROFILE_SPECIFIER = "";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 				SWIFT_VERSION = 5.0;
@@ -305,14 +307,15 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CLANG_ENABLE_MODULES = YES;
-				CODE_SIGN_ENTITLEMENTS = HealthPredictor/HealthPredictor.entitlements;
+				CODE_SIGN_ENTITLEMENTS = Voyant/Voyant.entitlements;
+				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_ASSET_PATHS = "\"HealthPredictor/Preview Content\"";
+				DEVELOPMENT_ASSET_PATHS = "\"Voyant/Preview Content\"";
 				DEVELOPMENT_TEAM = 7VS44S3CU5;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_FILE = HealthPredictor/Info.plist;
+				INFOPLIST_FILE = Voyant/Info.plist;
 				INFOPLIST_KEY_LSApplicationCategoryType = "";
 				INFOPLIST_KEY_NSHealthShareUsageDescription = "This app reads your health data to provide insights.";
 				INFOPLIST_KEY_NSHealthUpdateUsageDescription = "This app writes health data to help track your progress.";
@@ -326,8 +329,9 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = Stephan.HealthPredictor;
+				PRODUCT_BUNDLE_IDENTIFIER = Stephan.Voyant;
 				PRODUCT_NAME = "$(TARGET_NAME)";
+				PROVISIONING_PROFILE_SPECIFIER = "";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
@@ -358,20 +362,20 @@
 /* End XCConfigurationList section */
 
 /* Begin XCRemoteSwiftPackageReference section */
-		04203C8B2E22607900B9C575 /* XCRemoteSwiftPackageReference "clerk-ios" */ = {
+		0437D8942EB95EB80005BF5C /* XCRemoteSwiftPackageReference "clerk-ios" */ = {
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/clerk/clerk-ios";
 			requirement = {
 				kind = upToNextMajorVersion;
-				minimumVersion = 0.59.0;
+				minimumVersion = 0.70.0;
 			};
 		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
-		04203C8C2E22607900B9C575 /* Clerk */ = {
+		0437D8952EB95EB80005BF5C /* Clerk */ = {
 			isa = XCSwiftPackageProductDependency;
-			package = 04203C8B2E22607900B9C575 /* XCRemoteSwiftPackageReference "clerk-ios" */;
+			package = 0437D8942EB95EB80005BF5C /* XCRemoteSwiftPackageReference "clerk-ios" */;
 			productName = Clerk;
 		};
 /* End XCSwiftPackageProductDependency section */
