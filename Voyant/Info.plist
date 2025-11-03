@@ -47,8 +47,6 @@
     <key>UILaunchStoryboardName</key>
     <string>LaunchScreen</string>
 
-    <!-- ATS exceptions removed; Railway uses HTTPS so defaults are sufficient -->
-
     <key>CFBundleURLTypes</key>
     <array>
         <dict>

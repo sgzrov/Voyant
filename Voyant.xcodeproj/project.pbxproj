@@ -7,11 +7,11 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		0437D8962EB95EB80005BF5C /* Clerk in Frameworks */ = {isa = PBXBuildFile; productRef = 0437D8952EB95EB80005BF5C /* Clerk */; };
+		042E182F2EB9694E00E66509 /* Clerk in Frameworks */ = {isa = PBXBuildFile; productRef = 042E182E2EB9694E00E66509 /* Clerk */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		0437D5F42EB887280005BF5C /* Voyant.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Voyant.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		042E17D72EB9650300E66509 /* Voyant.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Voyant.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -40,7 +40,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				0437D8962EB95EB80005BF5C /* Clerk in Frameworks */,
+				042E182F2EB9694E00E66509 /* Clerk in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -51,7 +51,7 @@
 			isa = PBXGroup;
 			children = (
 				04B33E382DA1F48800ACC4CA /* Voyant */,
-				0437D5F42EB887280005BF5C /* Voyant.app */,
+				042E17D72EB9650300E66509 /* Voyant.app */,
 			);
 			sourceTree = "<group>";
 		};
@@ -75,10 +75,10 @@
 			);
 			name = Voyant;
 			packageProductDependencies = (
-				0437D8952EB95EB80005BF5C /* Clerk */,
+				042E182E2EB9694E00E66509 /* Clerk */,
 			);
 			productName = Voyant;
-			productReference = 0437D5F42EB887280005BF5C /* Voyant.app */;
+			productReference = 042E17D72EB9650300E66509 /* Voyant.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -107,7 +107,7 @@
 			mainGroup = 046F70D62D91216400D6B0E2;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
-				0437D8942EB95EB80005BF5C /* XCRemoteSwiftPackageReference "clerk-ios" */,
+				042E182D2EB9694E00E66509 /* XCRemoteSwiftPackageReference "clerk-ios" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 046F70D62D91216400D6B0E2;
@@ -279,11 +279,14 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Voyant/Info.plist;
 				INFOPLIST_KEY_LSApplicationCategoryType = "";
+				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
 				INFOPLIST_KEY_NSHealthShareUsageDescription = "This app reads your health data to provide insights.";
 				INFOPLIST_KEY_NSHealthUpdateUsageDescription = "This app writes health data to help track your progress.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
-				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UILaunchStoryboardName = LaunchScreen;
+				INFOPLIST_KEY_UIRequiredDeviceCapabilities = arm64;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -317,11 +320,14 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Voyant/Info.plist;
 				INFOPLIST_KEY_LSApplicationCategoryType = "";
+				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
 				INFOPLIST_KEY_NSHealthShareUsageDescription = "This app reads your health data to provide insights.";
 				INFOPLIST_KEY_NSHealthUpdateUsageDescription = "This app writes health data to help track your progress.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
-				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UILaunchStoryboardName = LaunchScreen;
+				INFOPLIST_KEY_UIRequiredDeviceCapabilities = arm64;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -362,7 +368,7 @@
 /* End XCConfigurationList section */
 
 /* Begin XCRemoteSwiftPackageReference section */
-		0437D8942EB95EB80005BF5C /* XCRemoteSwiftPackageReference "clerk-ios" */ = {
+		042E182D2EB9694E00E66509 /* XCRemoteSwiftPackageReference "clerk-ios" */ = {
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/clerk/clerk-ios";
 			requirement = {
@@ -373,9 +379,9 @@
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
-		0437D8952EB95EB80005BF5C /* Clerk */ = {
+		042E182E2EB9694E00E66509 /* Clerk */ = {
 			isa = XCSwiftPackageProductDependency;
-			package = 0437D8942EB95EB80005BF5C /* XCRemoteSwiftPackageReference "clerk-ios" */;
+			package = 042E182D2EB9694E00E66509 /* XCRemoteSwiftPackageReference "clerk-ios" */;
 			productName = Clerk;
 		};
 /* End XCSwiftPackageProductDependency section */
