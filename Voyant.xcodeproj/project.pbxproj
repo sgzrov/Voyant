@@ -11,26 +11,26 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		046F70DF2D91216400D6B0E2 /* HealthPredictor.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = HealthPredictor.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		0437D5F42EB887280005BF5C /* Voyant.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Voyant.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
-		043DB8432DF4D37700AFD667 /* Exceptions for "HealthPredictor" folder in "HealthPredictor" target */ = {
+		043DB8432DF4D37700AFD667 /* Exceptions for "Voyant" folder in "Voyant" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				Info.plist,
 			);
-			target = 046F70DE2D91216400D6B0E2 /* HealthPredictor */;
+			target = 046F70DE2D91216400D6B0E2 /* Voyant */;
 		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
-		04B33E382DA1F48800ACC4CA /* HealthPredictor */ = {
+		04B33E382DA1F48800ACC4CA /* Voyant */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
-				043DB8432DF4D37700AFD667 /* Exceptions for "HealthPredictor" folder in "HealthPredictor" target */,
+				043DB8432DF4D37700AFD667 /* Exceptions for "Voyant" folder in "Voyant" target */,
 			);
-			path = HealthPredictor;
+			path = Voyant;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -50,25 +50,17 @@
 		046F70D62D91216400D6B0E2 = {
 			isa = PBXGroup;
 			children = (
-				046F70E02D91216400D6B0E2 /* Products */,
-				04B33E382DA1F48800ACC4CA /* HealthPredictor */,
+				04B33E382DA1F48800ACC4CA /* Voyant */,
+				0437D5F42EB887280005BF5C /* Voyant.app */,
 			);
-			sourceTree = "<group>";
-		};
-		046F70E02D91216400D6B0E2 /* Products */ = {
-			isa = PBXGroup;
-			children = (
-				046F70DF2D91216400D6B0E2 /* HealthPredictor.app */,
-			);
-			name = Products;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		046F70DE2D91216400D6B0E2 /* HealthPredictor */ = {
+		046F70DE2D91216400D6B0E2 /* Voyant */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 046F70ED2D91216400D6B0E2 /* Build configuration list for PBXNativeTarget "HealthPredictor" */;
+			buildConfigurationList = 046F70ED2D91216400D6B0E2 /* Build configuration list for PBXNativeTarget "Voyant" */;
 			buildPhases = (
 				046F70DB2D91216400D6B0E2 /* Sources */,
 				046F70DC2D91216400D6B0E2 /* Frameworks */,
@@ -79,14 +71,14 @@
 			dependencies = (
 			);
 			fileSystemSynchronizedGroups = (
-				04B33E382DA1F48800ACC4CA /* HealthPredictor */,
+				04B33E382DA1F48800ACC4CA /* Voyant */,
 			);
-			name = HealthPredictor;
+			name = Voyant;
 			packageProductDependencies = (
 				04203C8C2E22607900B9C575 /* Clerk */,
 			);
 			productName = HealthPredictor;
-			productReference = 046F70DF2D91216400D6B0E2 /* HealthPredictor.app */;
+			productReference = 0437D5F42EB887280005BF5C /* Voyant.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -97,7 +89,7 @@
 			attributes = {
 				BuildIndependentTargetsInParallel = 1;
 				LastSwiftUpdateCheck = 1620;
-				LastUpgradeCheck = 1630;
+				LastUpgradeCheck = 2600;
 				TargetAttributes = {
 					046F70DE2D91216400D6B0E2 = {
 						CreatedOnToolsVersion = 16.2;
@@ -105,7 +97,7 @@
 					};
 				};
 			};
-			buildConfigurationList = 046F70DA2D91216400D6B0E2 /* Build configuration list for PBXProject "HealthPredictor" */;
+			buildConfigurationList = 046F70DA2D91216400D6B0E2 /* Build configuration list for PBXProject "Voyant" */;
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
 			knownRegions = (
@@ -118,11 +110,11 @@
 				04203C8B2E22607900B9C575 /* XCRemoteSwiftPackageReference "clerk-ios" */,
 			);
 			preferredProjectObjectVersion = 77;
-			productRefGroup = 046F70E02D91216400D6B0E2 /* Products */;
+			productRefGroup = 046F70D62D91216400D6B0E2;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				046F70DE2D91216400D6B0E2 /* HealthPredictor */,
+				046F70DE2D91216400D6B0E2 /* Voyant */,
 			);
 		};
 /* End PBXProject section */
@@ -207,6 +199,7 @@
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
 				SDKROOT = iphoneos;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 			};
@@ -264,6 +257,7 @@
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				SDKROOT = iphoneos;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_COMPILATION_MODE = wholemodule;
 				VALIDATE_PRODUCT = YES;
 			};
@@ -343,7 +337,7 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		046F70DA2D91216400D6B0E2 /* Build configuration list for PBXProject "HealthPredictor" */ = {
+		046F70DA2D91216400D6B0E2 /* Build configuration list for PBXProject "Voyant" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				046F70EB2D91216400D6B0E2 /* Debug */,
@@ -352,7 +346,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		046F70ED2D91216400D6B0E2 /* Build configuration list for PBXNativeTarget "HealthPredictor" */ = {
+		046F70ED2D91216400D6B0E2 /* Build configuration list for PBXNativeTarget "Voyant" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				046F70EE2D91216400D6B0E2 /* Debug */,
