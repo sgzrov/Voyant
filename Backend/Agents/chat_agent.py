@@ -69,27 +69,6 @@ class ChatAgent:
             messages.append(msg)
         return messages
 
-    # Generate a streaming simple chat response (without OpenAI tools)
-    def simple_chat(self, user_input: str, user_id: str, prompt: Optional[str] = None,
-                    conversation_id: Optional[str] = None, session = None) -> Generator[Any, None, None]:
-        conversation_context = self._build_conversation_context_string(conversation_id, user_id, session)
-        instructions = prompt if prompt is not None else self.prompt
-
-        try:
-            response = self.client.responses.create(
-                model = self.model,
-                input = f"{instructions}\nConversation:\n{conversation_context}\nUser: {user_input}",
-                stream = True
-            )
-            for chunk in response:
-                yield chunk
-        except openai.APIError as e:
-            logger.error(f"OpenAI API error: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"Unexpected error in simple_chat: {e}")
-            raise
-
     # Generate a streaming chat response using Code Interpreter (always on)
     def chat_with_ci(self, file_obj: BinaryIO, user_input: str, user_id: str,
                      prompt: Optional[str] = None, conversation_id: Optional[str] = None,
