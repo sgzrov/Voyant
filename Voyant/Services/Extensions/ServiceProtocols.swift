@@ -19,11 +19,6 @@ protocol SSEServiceProtocol {
 
 protocol AgentBackendServiceProtocol {
     func chatWithCIStream(csvFilePath: String, userInput: String, conversationId: String?) async throws -> AsyncStream<String>
-    func simpleChatStream(userInput: String, conversationId: String?) async throws -> AsyncStream<String>
-    func generateOutcomeStream(csvFilePath: String, userInput: String, studyId: String?) async throws -> AsyncStream<String>
-    func summarizeStudyStream(userInput: String, studyId: String?) async throws -> AsyncStream<String>
-    func createStudy() async throws -> String
-    func shouldUseCodeInterpreter(userInput: String) async throws -> Bool
 }
 
 protocol UserFileCacheServiceProtocol {
@@ -45,9 +40,4 @@ protocol HealthStoreServiceProtocol {
 protocol FileUploadToBackendServiceProtocol {
     func uploadHealthDataFile(fileData: Data) async throws -> String
     func buildMultipartRequest(endpoint: String, fileData: Data, additionalFields: [String: String]) async throws -> URLRequest
-}
-
-protocol TextExtractionBackendServiceProtocol {
-    func extractTextFromFile(fileURL: URL) async throws -> String
-    func extractTextFromURL(urlString: String) async throws -> String
 }

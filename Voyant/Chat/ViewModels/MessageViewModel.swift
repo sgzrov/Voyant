@@ -54,31 +54,12 @@ class MessageViewModel: ObservableObject {
 
     private func processMessage(userInput: String) async {
         do {
-            let needsCodeInterpreter = try await backendService.shouldUseCodeInterpreter(userInput: userInput)
-            await sendStreamingMessage(userInput: userInput, needsCodeInterpreter: needsCodeInterpreter)
-        } catch {
-            print("Error: \(error.localizedDescription)")
-        }
-        isLoading = false
-    }
-
-    private func sendStreamingMessage(userInput: String, needsCodeInterpreter: Bool) async {
-        do {
-            let stream: AsyncStream<String>
-
-            if needsCodeInterpreter {
-                let csvPath = try await healthFileCacheService.getCachedHealthFile()
-                stream = try await backendService.chatWithCI(
-                    csvFilePath: csvPath,
-                    userInput: userInput,
-                    conversationId: session.conversationId
-                )
-            } else {
-                stream = try await backendService.simpleChat(
-                    userInput: userInput,
-                    conversationId: session.conversationId
-                )
-            }
+            let csvPath = try await healthFileCacheService.getCachedHealthFile()
+            let stream = try await backendService.chatWithCI(
+                csvFilePath: csvPath,
+                userInput: userInput,
+                conversationId: session.conversationId
+            )
 
             let messageIndex = messages.count - 1
             var isFirstChunk = true
@@ -108,8 +89,9 @@ class MessageViewModel: ObservableObject {
             // Notify that chat has been updated
             NotificationCenter.default.post(name: .chatUpdated, object: nil)
         } catch {
-            print("Error: \(needsCodeInterpreter ? "Chat" : "Simple chat") streaming error: \(error.localizedDescription)")
+            print("Error: Chat streaming error: \(error.localizedDescription)")
         }
+        isLoading = false
     }
 
     private func extractConversationId(from chunk: String) -> String? {

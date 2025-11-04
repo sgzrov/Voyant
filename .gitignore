@@ -16,3 +16,4 @@ CodeResources
 PrivacyInfo.xcprivacy
 *.ipa
 exportOptions.plist
+buildServer.json

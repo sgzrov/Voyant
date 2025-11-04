@@ -1,3 +1,0 @@
-Does this task require the use of code interpreter?
-
-Context: You have access to a user's health data via a CSV file. If the user asks a question (e.g. about a health metric) or makes a statement that requires you to analyze data, answer "yes". If no, answer "no".

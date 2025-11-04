@@ -6,7 +6,6 @@ from typing import BinaryIO, Optional, List, Any, Generator
 from dataclasses import dataclass
 
 from Backend.Database.chat_repository import create_chat_message, get_chat_history
-from Backend.rag_pipeline import RAGPipeline
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -91,53 +90,47 @@ class ChatAgent:
             logger.error(f"Unexpected error in simple_chat: {e}")
             raise
 
-    # Generate a streaming chat response using RAG (no code interpreter)
-    def chat_with_rag(self, file_obj: BinaryIO, user_input: str, user_id: str,
-                      prompt: Optional[str] = None, conversation_id: Optional[str] = None,
-                      filename: str = "user_health_data.csv", session = None) -> Generator[Any, None, None]:
-
+    # Generate a streaming chat response using Code Interpreter (always on)
+    def chat_with_ci(self, file_obj: BinaryIO, user_input: str, user_id: str,
+                     prompt: Optional[str] = None, conversation_id: Optional[str] = None,
+                     filename: str = "user_health_data.csv", session = None) -> Generator[Any, None, None]:
         conversation_context = self._build_conversation_context_string(conversation_id, user_id, session)
         instructions = prompt if prompt is not None else self.prompt
 
         try:
-            db_url = os.getenv("DATABASE_URL") # Get database URL from environment for pgvector
-
-            # Create RAG pipeline instance with pgvector support
-            # Note: pgvector should be installed in your PostgreSQL database for optimal performance
-            rag_pipeline = RAGPipeline(self.api_key, db_url=db_url)
-
-            # Step 1: Ingest (if provided) and find relevant data scoped to user/conversation
-            logger.info(f"[RAG] Processing question: {user_input}")
-            relevant_data = rag_pipeline.process_question_with_rag(
-                user_question = user_input,
-                user_id = user_id,
-                csv_file = file_obj,
-                dataset_id = conversation_id
+            # Upload the file to OpenAI for use with the code interpreter tool
+            uploaded = self.client.files.create(
+                file=(filename, file_obj),
+                purpose="assistants"
             )
 
-            # Step 2: Create prompt with focused data
-            data_context = f"""
-            Relevant Health Data (JSON format):
-            {json.dumps(relevant_data, indent=2)}
-            """
-
-            full_prompt = f"{instructions}\nConversation:\n{conversation_context}\n{data_context}\nUser: {user_input}"
-
-            # Step 3: Send to LLM directly (no CI needed)
-            logger.info(f"[RAG] Sending {len(relevant_data)} relevant rows to LLM")
-            response = self.client.chat.completions.create(
+            # Build a responses API request enabling the code interpreter tool
+            response = self.client.responses.create(
                 model=self.model,
-                messages=[{"role": "user", "content": full_prompt}],
+                tools=[{"type": "code_interpreter"}],
+                input=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": f"{instructions}\nConversation:\n{conversation_context}\nUser: {user_input}"
+                            },
+                            {
+                                "type": "input_file",
+                                "file_id": uploaded.id
+                            }
+                        ]
+                    }
+                ],
                 stream=True
             )
 
-            # Step 4: Stream response back
             for chunk in response:
                 yield chunk
-
         except openai.APIError as e:
             logger.error(f"OpenAI API error: {e}")
             raise
         except Exception as e:
-            logger.error(f"Unexpected error in RAG chat: {e}")
+            logger.error(f"Unexpected error in CI chat: {e}")
             raise

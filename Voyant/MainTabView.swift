@@ -20,26 +20,12 @@ struct MainTabView: View {
     var body: some View {
         TabView {
             if !userToken.isEmpty {
-                StudiesHomeView(userToken: userToken)
-                    .tabItem {
-                        Image(systemName: "list.bullet.rectangle")
-                        Text("Studies")
-                    }
                 MainChatView(userToken: userToken)
                     .tabItem {
                         Image(systemName: "message")
                         Text("Chat")
                     }
             } else {
-                VStack {
-                    ProgressView()
-                    Text("Signing in...")
-                        .foregroundColor(.secondary)
-                }
-                .tabItem {
-                    Image(systemName: "list.bullet.rectangle")
-                    Text("Studies")
-                }
                 VStack {
                     ProgressView()
                     Text("Signing in...")
