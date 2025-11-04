@@ -1,8 +1,6 @@
 import logging
-import os
-import json
 import openai
-from typing import BinaryIO, Optional, List, Any, Generator
+from typing import Optional, List, Any, Generator
 from dataclasses import dataclass
 
 from Backend.Database.chat_repository import create_chat_message, get_chat_history
@@ -16,7 +14,7 @@ class Message:
     role: str
     content: str
 
-class ChatAgent:
+class Chat:
     def __init__(self, api_key: str, prompt_path: str, model: str = "gpt-5") -> None:
         self.api_key = api_key
         self.model = model
@@ -100,3 +98,5 @@ class ChatAgent:
         except Exception as e:
             logger.error(f"Unexpected error in text-only chat: {e}")
             raise
+
+

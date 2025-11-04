@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
 
-from Backend.Agents.chat_agent import ChatAgent
+from Backend.Agents.chat import Chat
 
 
 from Backend.auth import verify_clerk_jwt
@@ -23,7 +23,7 @@ from Backend.Routers.chat_router import router as chat_router
 
 logging.basicConfig(level = logging.DEBUG)
 logger = logging.getLogger(__name__)
-logging.getLogger('chat_agent').setLevel(logging.DEBUG)
+logging.getLogger('Backend.Agents.chat').setLevel(logging.DEBUG)
 
 load_dotenv()
 
@@ -48,9 +48,7 @@ PROMPT_PATHS = {
     "chat": os.path.join(PROMPT_DIR, "ChatWithCodeInterpreterPrompt.txt"),
 }
 
-chat_agent = ChatAgent(api_key, prompt_path = PROMPT_PATHS["chat"])
-
-# Helpers moved from Utils:
+chat_agent = Chat(api_key, prompt_path = PROMPT_PATHS["chat"])
 
 # Generate a conversation id, or use an existing one if provided
 def generate_conversation_id(existing_conversation_id: Optional[str] = None) -> str:
