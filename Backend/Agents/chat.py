@@ -70,23 +70,25 @@ class Chat:
     def chat_stream(self, user_input: str, user_id: str,
                     prompt: Optional[str] = None, conversation_id: Optional[str] = None,
                     session = None) -> Generator[Any, None, None]:
-        conversation_context = self._build_conversation_context_string(conversation_id, user_id, session)
         instructions = prompt if prompt is not None else self.prompt
 
+        # Build messages: system prompt + prior conversation + current user message
+        messages: list[dict[str, str]] = []
+        if instructions:
+            messages.append({"role": "system", "content": instructions})
+
+        if conversation_id and user_id and session is not None:
+            for msg in self.get_conversation_messages(conversation_id, user_id, session):
+                # Only include supported roles
+                role = "assistant" if msg.role == "assistant" else "user"
+                messages.append({"role": role, "content": msg.content})
+
+        messages.append({"role": "user", "content": user_input})
+
         try:
-            response = self.client.responses.create(
+            response = self.client.chat.completions.create(
                 model = self.model,
-                input = [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "input_text",
-                                "text": f"{instructions}\nConversation:\n{conversation_context}\nUser: {user_input}"
-                            }
-                        ]
-                    }
-                ],
+                messages = messages,
                 stream = True
             )
 
@@ -96,7 +98,7 @@ class Chat:
             logger.error(f"OpenAI API error: {e}")
             raise
         except Exception as e:
-            logger.error(f"Unexpected error in text-only chat: {e}")
+            logger.error(f"Unexpected error in chat_stream: {e}")
             raise
 
 

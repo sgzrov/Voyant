@@ -12,12 +12,10 @@ from Backend.Agents.chat import Chat
 
 from Backend.auth import verify_clerk_jwt
 from Backend.Database.db import SessionLocal
-from Backend.Database.s3_storage import S3Storage
 from Backend.Models.requests import ChatRequest
 
 from Backend.Database import *
 
-from Backend.Routers.file_router import router as file_router
 from Backend.Routers.chat_router import router as chat_router
 
 
@@ -29,15 +27,9 @@ load_dotenv()
 
 app = FastAPI()
 
-app.include_router(file_router)
 app.include_router(chat_router)
 
 
-try:
-    s3_storage = S3Storage()
-except ValueError as e:
-    logger.warning(f"S3Storage initialization failed: {e}")
-    s3_storage = None
 
 api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
@@ -45,7 +37,7 @@ if not api_key:
 
 PROMPT_DIR = os.path.join(os.path.dirname(__file__), "Prompts")
 PROMPT_PATHS = {
-    "chat": os.path.join(PROMPT_DIR, "ChatWithCodeInterpreterPrompt.txt"),
+    "chat": os.path.join(PROMPT_DIR, "ChatPrompt.txt"),
 }
 
 chat_agent = Chat(api_key, prompt_path = PROMPT_PATHS["chat"])
@@ -77,6 +69,24 @@ def setup_conversation_history(conversation_id: Optional[str],
     return save_conversation, None, conversation_id
 
 def extract_text_from_chunk(chunk: Any, full_response: str = "") -> str:
+    # Support Chat Completions streaming (choices[0].delta.content)
+    try:
+        choices = getattr(chunk, 'choices', None)
+        if choices and len(choices) > 0:
+            choice = choices[0]
+            delta = getattr(choice, 'delta', None)
+            if delta is not None:
+                content = getattr(delta, 'content', None)
+                if isinstance(content, str):
+                    return content or ""
+            # Some SDKs may expose incremental text under choice.text
+            text_piece = getattr(choice, 'text', None)
+            if isinstance(text_piece, str):
+                return text_piece or ""
+    except Exception:
+        pass
+
+    # Fallback: previous Responses API formats
     if hasattr(chunk, 'type'):
         if chunk.type == 'text_delta':
             if hasattr(chunk, 'delta') and chunk.delta and hasattr(chunk.delta, 'text'):
@@ -139,7 +149,7 @@ async def chat_stream(request: ChatRequest, req: Request):
                 for event in process_streaming_response(response, save_conversation, save_partial_conversation):
                     yield event
             except Exception as e:
-                logger.error(f"CI health analysis error: {e}")
+                logger.error(f"chat stream error: {e}")
                 yield f"data: {json.dumps({'error': str(e), 'done': True})}\n\n"
         finally:
             session.close()
