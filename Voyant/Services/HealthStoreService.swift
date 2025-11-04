@@ -8,7 +8,7 @@
 import Foundation
 import HealthKit
 
-class HealthStoreService: HealthStoreServiceProtocol {
+class HealthStoreService {
 
     static let shared = HealthStoreService()
 

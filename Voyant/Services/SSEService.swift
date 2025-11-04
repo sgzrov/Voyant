@@ -34,7 +34,7 @@ struct StreamingChunk: Codable {
     let error: String?
 }
 
-class SSEService: NSObject, URLSessionDataDelegate, SSEServiceProtocol {
+class SSEService: NSObject, URLSessionDataDelegate {
 
     static let shared = SSEService()
 

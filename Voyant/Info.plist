@@ -93,6 +93,9 @@
     <true/>
     <key>LSSupportsOpeningDocumentsInPlace</key>
     <true/>
+
+    <key>BACKEND_BASE_URL</key>
+    <string>https://healthpredictor-production.up.railway.app</string>
 </dict>
 </plist>
 

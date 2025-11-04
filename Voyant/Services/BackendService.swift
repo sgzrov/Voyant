@@ -26,21 +26,17 @@ class BackendService {
 
     static let shared = BackendService()
 
-    private let agentService: AgentBackendServiceProtocol
-    private let fileUploadService: FileUploadToBackendServiceProtocol
+    private let agentService: AgentBackendService
 
     private init() {
         self.agentService = AgentBackendService.shared
-        self.fileUploadService = FileUploadToBackendService.shared
     }
 
-    func chatWithCI(csvFilePath: String, userInput: String, conversationId: String? = nil) async throws -> AsyncStream<String> {
-        return try await agentService.chatWithCIStream(csvFilePath: csvFilePath, userInput: userInput, conversationId: conversationId)
+    func chat(userInput: String, conversationId: String? = nil) async throws -> AsyncStream<String> {
+        return try await agentService.chatStream(userInput: userInput, conversationId: conversationId)
     }
 
-    func uploadHealthDataFile(fileData: Data) async throws -> String {
-        return try await fileUploadService.uploadHealthDataFile(fileData: fileData)
-    }
+    // File upload removed as part of deleting file processing logic
 }
 
 extension BackendService {
@@ -59,7 +55,7 @@ extension BackendService {
     // MARK: - Chat Operations
 
     func fetchChatSessions(userToken: String, completion: @escaping ([(String, Date?)]) -> Void) {
-        guard let url = URL(string: "\(APIConstants.baseURL)/chat/retrieve-chat-sessions/") else {
+        guard let url = URL(string: "\(AuthService.backendBaseURL)/chat/retrieve-chat-sessions/") else {
             DispatchQueue.main.async { completion([]) }
             return
         }
@@ -100,20 +96,20 @@ extension BackendService {
             }
 
             let sessions = result.sessions.map { session in
-                (session.conversationId, DateUtilities.parseBackendDate(session.lastActiveDate))
+                (session.conversationId, Self.parseBackendDate(session.lastActiveDate))
             }
             DispatchQueue.main.async { completion(sessions) }
         }.resume()
     }
 
     func fetchChatHistory(conversationId: String, userToken: String, completion: @escaping ([ChatMessage]) -> Void) {
-        guard let url = URL(string: "\(APIConstants.baseURL)/chat/all-messages/\(conversationId)") else {
+        guard let url = URL(string: "\(AuthService.backendBaseURL)/chat/all-messages/\(conversationId)") else {
             DispatchQueue.main.async { completion([]) }
             return
         }
 
         let request = makeAuthenticatedRequest(url: url, userToken: userToken)
-        let decoder = DateUtilities.createBackendDecoder()
+        let decoder = Self.createBackendDecoder()
         URLSession.shared.dataTask(with: request) { data, response, error in
             if let error = error {
                 print("Error fetching chat history: \(error)")
@@ -150,4 +146,32 @@ extension BackendService {
     }
 
     // MARK: - (Studies removed)
+}
+
+// MARK: - Inlined Date Utilities
+extension BackendService {
+    private static func parseBackendDate(_ dateString: String?) -> Date? {
+        guard let dateString = dateString else { return nil }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSSSSZZZZZ"
+        return formatter.date(from: dateString)
+    }
+
+    private static func createBackendDecoder() -> JSONDecoder {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .custom { decoder in
+            let container = try decoder.singleValueContainer()
+            let dateString = try container.decode(String.self)
+            guard let date = parseBackendDate(dateString) else {
+                throw DecodingError.dataCorruptedError(
+                    in: container,
+                    debugDescription: "Cannot decode date string \(dateString)"
+                )
+            }
+            return date
+        }
+        return decoder
+    }
 }

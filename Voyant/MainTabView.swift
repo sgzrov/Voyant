@@ -10,7 +10,6 @@ import Clerk
 
 struct MainTabView: View {
 
-    @State private var healthDataSetup = false
     @State private var userToken: String = ""
     @State private var userId: String = ""
     @State private var isSignedIn: Bool = false
@@ -74,17 +73,6 @@ struct MainTabView: View {
             userId = session.user?.id ?? ""
             isSignedIn = true
             print("[DEBUG] Successfully got auth token from TokenManager, length: \(token.count)")
-            if !healthDataSetup {
-                print("User authenticated - starting health data collection")
-                UserFileCacheService.shared.setupCSVFile()
-                do {
-                    _ = try await UserFileCacheService.shared.getCachedHealthFile()
-                    print("Health file created after authentication")
-                } catch {
-                    print("Failed to create health file after authentication: \(error)")
-                }
-                healthDataSetup = true
-            }
         } catch {
             print("[DEBUG] Failed to get Clerk JWT: \(error)")
             userToken = ""

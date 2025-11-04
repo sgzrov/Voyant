@@ -18,7 +18,6 @@ class MessageViewModel: ObservableObject {
     private var session: ChatSession
 
     private let backendService = BackendService.shared
-    private let healthFileCacheService = UserFileCacheService.shared
 
     private let userToken: String
 
@@ -54,9 +53,7 @@ class MessageViewModel: ObservableObject {
 
     private func processMessage(userInput: String) async {
         do {
-            let csvPath = try await healthFileCacheService.getCachedHealthFile()
-            let stream = try await backendService.chatWithCI(
-                csvFilePath: csvPath,
+            let stream = try await backendService.chat(
                 userInput: userInput,
                 conversationId: session.conversationId
             )

@@ -69,40 +69,27 @@ class ChatAgent:
             messages.append(msg)
         return messages
 
-    # Generate a streaming chat response using Code Interpreter (always on)
-    def chat_with_ci(self, file_obj: BinaryIO, user_input: str, user_id: str,
-                     prompt: Optional[str] = None, conversation_id: Optional[str] = None,
-                     filename: str = "user_health_data.csv", session = None) -> Generator[Any, None, None]:
+    def chat_stream(self, user_input: str, user_id: str,
+                    prompt: Optional[str] = None, conversation_id: Optional[str] = None,
+                    session = None) -> Generator[Any, None, None]:
         conversation_context = self._build_conversation_context_string(conversation_id, user_id, session)
         instructions = prompt if prompt is not None else self.prompt
 
         try:
-            # Upload the file to OpenAI for use with the code interpreter tool
-            uploaded = self.client.files.create(
-                file=(filename, file_obj),
-                purpose="assistants"
-            )
-
-            # Build a responses API request enabling the code interpreter tool
             response = self.client.responses.create(
-                model=self.model,
-                tools=[{"type": "code_interpreter"}],
-                input=[
+                model = self.model,
+                input = [
                     {
                         "role": "user",
                         "content": [
                             {
                                 "type": "input_text",
                                 "text": f"{instructions}\nConversation:\n{conversation_context}\nUser: {user_input}"
-                            },
-                            {
-                                "type": "input_file",
-                                "file_id": uploaded.id
                             }
                         ]
                     }
                 ],
-                stream=True
+                stream = True
             )
 
             for chunk in response:
@@ -111,5 +98,5 @@ class ChatAgent:
             logger.error(f"OpenAI API error: {e}")
             raise
         except Exception as e:
-            logger.error(f"Unexpected error in CI chat: {e}")
+            logger.error(f"Unexpected error in text-only chat: {e}")
             raise

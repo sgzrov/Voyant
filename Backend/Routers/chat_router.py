@@ -1,4 +1,5 @@
 import logging
+import uuid
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Request
 from sqlalchemy import func
@@ -6,12 +7,17 @@ from sqlalchemy import func
 from Backend.Database.db import SessionLocal
 from Backend.Database.chat_repository import get_chat_history, create_chat_message
 from Backend.Database.chat_models import ChatsDB
-from Backend.Utils.conversation_utils import generate_conversation_id
 from Backend.auth import verify_clerk_jwt
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
 logger = logging.getLogger(__name__)
+
+# Generate a conversation id, or use an existing one if provided
+def generate_conversation_id(existing_conversation_id: Optional[str] = None) -> str:
+    if existing_conversation_id:
+        return existing_conversation_id
+    return str(uuid.uuid4())
 
 # Retrieve all chat sessions for a user
 @router.get("/retrieve-chat-sessions/")

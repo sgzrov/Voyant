@@ -8,16 +8,21 @@
 import Foundation
 import Clerk
 
-class AuthService: AuthServiceProtocol {
+class AuthService {
 
     static let shared = AuthService()
+    static let backendBaseURL: String = {
+        if let url = Bundle.main.object(forInfoDictionaryKey: "BACKEND_BASE_URL") as? String, !url.isEmpty {
+            return url
+        }
+        fatalError("BACKEND_BASE_URL not configured in Info.plist")
+    }()
 
     private init() {}
 
-    private let baseURL = APIConstants.baseURL
-
     // Create an authenticated URLRequest with the Clerk JWT token
     func authenticatedRequest(for endpoint: String, method: String = "GET", body: Data? = nil) async throws -> URLRequest {
+        let baseURL = Self.backendBaseURL
         guard let url = URL(string: "\(baseURL)\(endpoint)") else {
             print("🔍 AUTH: Invalid URL: \(baseURL)\(endpoint)")
             throw AuthError.invalidURL
