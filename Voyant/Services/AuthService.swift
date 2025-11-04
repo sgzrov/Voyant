@@ -18,6 +18,11 @@ class AuthService {
         fatalError("BACKEND_BASE_URL not configured in Info.plist")
     }()
 
+    private static var cachedToken: String?
+    private static var tokenExpiry: Date?
+    private static let refreshBuffer: TimeInterval = 5
+    private static let clerkTokenExpiry: TimeInterval = 15
+
     private init() {}
 
     // Create an authenticated URLRequest with the Clerk JWT token
@@ -31,7 +36,7 @@ class AuthService {
         var request = URLRequest(url: url)
         request.httpMethod = method
 
-        let token = try await Self.getAuthToken()
+        let token = try await Self.getValidToken()
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 
         if let body = body {
@@ -63,6 +68,31 @@ class AuthService {
             print("🔍 AUTH: Error getting JWT token: \(error)")
             throw AuthError.notAuthenticated
         }
+    }
+
+    static func getValidToken() async throws -> String {
+        if let token = cachedToken,
+           let expiry = tokenExpiry,
+           expiry > Date().addingTimeInterval(refreshBuffer) {
+            print("[DEBUG] AuthService: Using cached token (expires in \(Int(expiry.timeIntervalSinceNow)) seconds)")
+            return token
+        }
+        let newToken = try await getAuthToken()
+        cachedToken = newToken
+        tokenExpiry = Date().addingTimeInterval(clerkTokenExpiry)
+        print("[DEBUG] AuthService: Cached fresh token (expires at \(tokenExpiry?.description ?? "unknown"))")
+        return newToken
+    }
+
+    static func forceRefreshToken() async throws -> String {
+        print("[DEBUG] AuthService: Force refreshing token due to presumed 401 error")
+        clearCachedToken()
+        return try await getValidToken()
+    }
+
+    static func clearCachedToken() {
+        cachedToken = nil
+        tokenExpiry = nil
     }
 }
 

@@ -48,7 +48,7 @@ extension BackendService {
     }
 
     private func handleTokenRefresh<T>(_ operation: @escaping (String) async throws -> T) async throws -> T {
-        let freshToken = try await TokenManager.shared.forceRefreshToken()
+        let freshToken = try await AuthService.forceRefreshToken()
         return try await operation(freshToken)
     }
 
@@ -76,7 +76,7 @@ extension BackendService {
             if httpResponse.statusCode == 401 {
                 Task {
                     do {
-                        let freshToken = try await TokenManager.shared.forceRefreshToken()
+                        let freshToken = try await AuthService.forceRefreshToken()
                         self.fetchChatSessions(userToken: freshToken, completion: completion)
                     } catch {
                         DispatchQueue.main.async { completion([]) }
@@ -125,7 +125,7 @@ extension BackendService {
             if httpResponse.statusCode == 401 {
                 Task {
                     do {
-                        let freshToken = try await TokenManager.shared.forceRefreshToken()
+                        let freshToken = try await AuthService.forceRefreshToken()
                         self.fetchChatHistory(conversationId: conversationId, userToken: freshToken, completion: completion)
                     } catch {
                         DispatchQueue.main.async { completion([]) }

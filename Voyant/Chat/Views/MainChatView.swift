@@ -128,7 +128,7 @@ struct MainChatView: View {
                     }
                 }
                 .refreshable {
-                    _ = try? await TokenManager.shared.getValidToken()
+                    _ = try? await AuthService.getValidToken()
                     chatHistoryVM.loadChatSessions()
                 }
                 .background(Color.clear)
@@ -136,7 +136,7 @@ struct MainChatView: View {
                 .onAppear {
                     if chatHistoryVM.chatSessions.isEmpty && !chatHistoryVM.isLoading {  // Refresh the chats only once (when the MainChatView first appears)
                         Task {
-                            _ = try? await TokenManager.shared.getValidToken()
+                            _ = try? await AuthService.getValidToken()
                         }
                         chatHistoryVM.loadChatSessions()
                     }

@@ -34,11 +34,11 @@ class ChatHistoryViewModel: ObservableObject {
         print("[DEBUG] ChatHistoryViewModel: Starting to load chat sessions at \(Date())")
         isLoading = true
 
-        // Get a valid token from TokenManager
+        // Get a valid token
         Task {
             do {
-                let token = try await TokenManager.shared.getValidToken()
-                print("[DEBUG] ChatHistoryViewModel: Got token from TokenManager, length: \(token.count)")
+                let token = try await AuthService.getValidToken()
+                print("[DEBUG] ChatHistoryViewModel: Got token, length: \(token.count)")
 
                 BackendService.shared.fetchChatSessions(userToken: token) { sessionTuples in
                     print("[DEBUG] ChatHistoryViewModel: Received \(sessionTuples.count) session tuples at \(Date())")
@@ -84,10 +84,10 @@ class ChatHistoryViewModel: ObservableObject {
         // Silent refresh without showing loading state
         print("[DEBUG] ChatHistoryViewModel: Starting silent refresh at \(Date())")
 
-        // Get a valid token from TokenManager
+        // Get a valid token
         Task {
             do {
-                let token = try await TokenManager.shared.getValidToken()
+                let token = try await AuthService.getValidToken()
                 print("[DEBUG] ChatHistoryViewModel: Got token for silent refresh, length: \(token.count)")
 
                 BackendService.shared.fetchChatSessions(userToken: token) { sessionTuples in

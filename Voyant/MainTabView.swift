@@ -39,7 +39,7 @@ struct MainTabView: View {
                 userToken = ""
                 userId = ""
                 isSignedIn = false
-                TokenManager.shared.clearCachedToken()
+                AuthService.clearCachedToken()
                 print("[DEBUG] Signed out, cleared userToken, userId, and cached token")
             })
                 .tabItem {
@@ -68,11 +68,11 @@ struct MainTabView: View {
         }
         print("[DEBUG] Clerk session found, user ID: \(session.user?.id ?? "nil")")
         do {
-            let token = try await TokenManager.shared.getValidToken()
+            let token = try await AuthService.getValidToken()
             userToken = token
             userId = session.user?.id ?? ""
             isSignedIn = true
-            print("[DEBUG] Successfully got auth token from TokenManager, length: \(token.count)")
+            print("[DEBUG] Successfully got auth token, length: \(token.count)")
         } catch {
             print("[DEBUG] Failed to get Clerk JWT: \(error)")
             userToken = ""
