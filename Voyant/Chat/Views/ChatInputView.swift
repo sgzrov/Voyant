@@ -10,6 +10,7 @@ import SwiftUI
 struct ChatInputView: View {
 
     @Binding var inputMessage: String
+    @Binding var selectedModel: ModelOption
 
     @FocusState private var isInputFocused: Bool
 
@@ -20,6 +21,13 @@ struct ChatInputView: View {
         VStack(spacing: 0) {
             Divider()
             HStack(spacing: 12) {
+                Picker("Model", selection: $selectedModel) {
+                    ForEach(ModelOption.allCases) { option in
+                        Text(option.displayName).tag(option)
+                    }
+                }
+                .pickerStyle(.menu)
+
                 TextField("Ask about your health...", text: $inputMessage, axis: .vertical)
                     .focused($isInputFocused)
                     .lineLimit(1...5)
@@ -52,6 +60,7 @@ struct ChatInputView: View {
     VStack {
         ChatInputView(
             inputMessage: .constant(""),
+            selectedModel: .constant(.openai_gpt5mini),
             isLoading: false,
             onSend: {}
         )

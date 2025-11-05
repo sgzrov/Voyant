@@ -32,11 +32,9 @@ class BackendService {
         self.agentService = AgentBackendService.shared
     }
 
-    func chat(userInput: String, conversationId: String? = nil) async throws -> AsyncStream<String> {
-        return try await agentService.chatStream(userInput: userInput, conversationId: conversationId)
+    func chat(userInput: String, conversationId: String? = nil, provider: String? = nil, model: String? = nil) async throws -> AsyncStream<String> {
+        return try await agentService.chatStream(userInput: userInput, conversationId: conversationId, provider: provider, model: model)
     }
-
-    // File upload removed as part of deleting file processing logic
 }
 
 extension BackendService {

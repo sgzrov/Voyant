@@ -69,6 +69,9 @@ def setup_conversation_history(conversation_id: Optional[str],
     return save_conversation, None, conversation_id
 
 def extract_text_from_chunk(chunk: Any, full_response: str = "") -> str:
+    # Direct strings from provider-specific adapters
+    if isinstance(chunk, str):
+        return chunk
     # Support Chat Completions streaming (choices[0].delta.content)
     try:
         choices = getattr(chunk, 'choices', None)
@@ -153,7 +156,14 @@ async def chat_stream(request: ChatRequest, req: Request):
                 logger.error(f"[DEBUG] Failed to emit initial conversation_id event: {e}")
 
             try:
-                response = chat_agent.chat_stream(user_input_str, user_id, conversation_id = conversation_id, session = session)
+                response = chat_agent.chat_stream(
+                    user_input_str,
+                    user_id,
+                    provider = request.provider,
+                    model_override = request.model,
+                    conversation_id = conversation_id,
+                    session = session
+                )
                 for event in process_streaming_response(response, save_conversation, save_partial_conversation):
                     yield event
             except Exception as e:

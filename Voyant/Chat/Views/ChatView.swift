@@ -63,6 +63,7 @@ struct ChatView: View {
 
             ChatInputView(
                 inputMessage: $messageVM.inputMessage,
+                selectedModel: $messageVM.selectedModel,
                 isLoading: messageVM.isLoading,
                 onSend: {
                     messageVM.sendMessage()

@@ -14,6 +14,7 @@ class MessageViewModel: ObservableObject {
     @Published var isLoading: Bool = false
     @Published var inputMessage: String = ""
     @Published var messages: [ChatMessage]
+    @Published var selectedModel: ModelOption = .openai_gpt5mini
 
     private var session: ChatSession
 
@@ -55,7 +56,9 @@ class MessageViewModel: ObservableObject {
         do {
             let stream = try await backendService.chat(
                 userInput: userInput,
-                conversationId: session.conversationId
+                conversationId: session.conversationId,
+                provider: selectedModel.providerId,
+                model: selectedModel.modelId
             )
 
             let messageIndex = messages.count - 1

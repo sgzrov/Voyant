@@ -19,11 +19,13 @@ class AgentBackendService {
         self.sseService = SSEService.shared
     }
 
-    func chatStream(userInput: String, conversationId: String?) async throws -> AsyncStream<String> {
+    func chatStream(userInput: String, conversationId: String?, provider: String?, model: String?) async throws -> AsyncStream<String> {
         var body: [String: Any] = ["user_input": userInput]
         if let conversationId = conversationId {
             body["conversation_id"] = conversationId
         }
+        if let provider = provider { body["provider"] = provider }
+        if let model = model { body["model"] = model }
         let jsonData = try JSONSerialization.data(withJSONObject: body)
         var request = try await authService.authenticatedRequest(
             for: "/chat/stream/",
