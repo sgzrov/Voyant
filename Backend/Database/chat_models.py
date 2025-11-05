@@ -3,7 +3,7 @@ from sqlalchemy import Column, Integer, String, Text, DateTime, func
 from .db import Base
 
 class ChatsDB(Base):
-    __tablename__ = 'user_chats_data'  # Name of the table
+    __tablename__ = 'user_chats_data'
     id = Column(Integer, primary_key = True, autoincrement = True)
     conversation_id = Column(String(64), index = True, nullable = False)
     user_id = Column(String(64), index = True, nullable = False)

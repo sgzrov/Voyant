@@ -178,6 +178,12 @@ class SSEStreamDelegate: NSObject, URLSessionDataDelegate {
         print("[SSEStreamDelegate] Handling SSEEvent: type=\(event.type), id=\(event.id ?? "nil"), data=\(event.data.prefix(200)))")
         switch event.type {
         case .message:
+            // If the server provides a conversation_id in the event payload, forward the raw JSON
+            // so the consumer can extract and persist it before streaming content arrives.
+            if event.data.contains("\"conversation_id\"") {
+                continuation.yield(event.data)
+                return
+            }
             let jsonData = Data(event.data.utf8)
             if let chunk = try? JSONDecoder().decode(StreamingChunk.self, from: jsonData) {
                 if let error = chunk.error {

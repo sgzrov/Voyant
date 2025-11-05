@@ -66,6 +66,9 @@ class MessageViewModel: ObservableObject {
                 if isFirstChunk {
                     if let id = extractConversationId(from: chunk) {
                         session.conversationId = id
+                        // Skip appending this initial JSON chunk (conversation_id metadata)
+                        isFirstChunk = false
+                        continue
                     }
                     isFirstChunk = false
                 }

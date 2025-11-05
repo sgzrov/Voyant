@@ -37,10 +37,10 @@ if not api_key:
 
 PROMPT_DIR = os.path.join(os.path.dirname(__file__), "Prompts")
 PROMPT_PATHS = {
-    "chat": os.path.join(PROMPT_DIR, "ChatPrompt.txt"),
+    "chat_prompt": os.path.join(PROMPT_DIR, "chat_prompt.txt"),
 }
 
-chat_agent = Chat(api_key, prompt_path = PROMPT_PATHS["chat"])
+chat_agent = Chat(api_key, prompt_path = PROMPT_PATHS["chat_prompt"])
 
 # Generate a conversation id, or use an existing one if provided
 def generate_conversation_id(existing_conversation_id: Optional[str] = None) -> str:
@@ -143,8 +143,16 @@ async def chat_stream(request: ChatRequest, req: Request):
             user_input_str = request.user_input
             save_conversation, save_partial_conversation, new_conversation_id = setup_conversation_history(request.conversation_id, user_input_str, user_id, session, chat_agent)
 
+            # Always determine the conversation_id that will be used for this request
+            conversation_id = new_conversation_id or request.conversation_id
+
+            # Emit the conversation_id upfront so the client can persist and reuse it
             try:
-                conversation_id = new_conversation_id or request.conversation_id
+                yield f"data: {json.dumps({'conversation_id': conversation_id, 'content': '', 'done': False})}\n\n"
+            except Exception as e:
+                logger.error(f"[DEBUG] Failed to emit initial conversation_id event: {e}")
+
+            try:
                 response = chat_agent.chat_stream(user_input_str, user_id, conversation_id = conversation_id, session = session)
                 for event in process_streaming_response(response, save_conversation, save_partial_conversation):
                     yield event

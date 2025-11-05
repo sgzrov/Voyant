@@ -15,7 +15,7 @@ class Message:
     content: str
 
 class Chat:
-    def __init__(self, api_key: str, prompt_path: str, model: str = "gpt-5") -> None:
+    def __init__(self, api_key: str, prompt_path: str, model: str = "gpt-5-mini") -> None:
         self.api_key = api_key
         self.model = model
         self.client = openai.OpenAI(api_key = api_key)
@@ -83,17 +83,17 @@ class Chat:
                 role = "assistant" if msg.role == "assistant" else "user"
                 messages.append({"role": role, "content": msg.content})
 
-        messages.append({"role": "user", "content": user_input})
-
         try:
-            response = self.client.chat.completions.create(
+            # Stream via the Responses API with GPT-5 params
+            with self.client.responses.stream(
                 model = self.model,
-                messages = messages,
-                stream = True
-            )
-
-            for chunk in response:
-                yield chunk
+                input = messages,
+                text = {"verbosity": "medium"},
+                reasoning = {"effort": "minimal"},
+            ) as stream:
+                for event in stream:
+                    yield event
+                _ = stream.get_final_response()
         except openai.APIError as e:
             logger.error(f"OpenAI API error: {e}")
             raise

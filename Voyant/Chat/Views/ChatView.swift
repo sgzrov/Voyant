@@ -52,8 +52,11 @@ struct ChatView: View {
                         proxy.scrollTo(newValue.last?.id, anchor: .bottom)
                     }
                     if !hasSentFirstMessage && oldValue.isEmpty && !newValue.isEmpty {
-                        hasSentFirstMessage = true
-                        newSessionHandler?(session)
+                        // Only append to history once the conversation_id is known
+                        if session.conversationId != nil {
+                            hasSentFirstMessage = true
+                            newSessionHandler?(session)
+                        }
                     }
                 }
             }

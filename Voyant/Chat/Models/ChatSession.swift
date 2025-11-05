@@ -12,6 +12,7 @@ struct ChatSession: Identifiable, Hashable, Codable {
     var title: String
     var messages: [ChatMessage]
     var lastActiveDate: Date?
+    private var localId: String = UUID().uuidString
 
     init(conversationId: String? = nil, title: String = "New Chat", messages: [ChatMessage] = [], lastActiveDate: Date? = nil) {
         self.conversationId = conversationId
@@ -36,21 +37,16 @@ struct ChatSession: Identifiable, Hashable, Codable {
 
     // - For existing sessions: returns conversation_id from backend
     // - For new local sessions (that do not have at least a single message from the user): returns temporary UUID until backend assigns conversation_id
-    var id: String {
-        if let conversationId = conversationId {
-            return conversationId
-        } else {
-            let tempId = UUID().uuidString
-            print("[CHAT_SESSION_ID] ChatSession has no conversationId, id should only be created for new sessions: \(tempId)")
-            return tempId
-        }
-    }
+    var id: String { conversationId ?? localId }
 
     func hash(into hasher: inout Hasher) {
-        hasher.combine(conversationId)
+        hasher.combine(conversationId ?? localId)
     }
 
     static func == (lhs: ChatSession, rhs: ChatSession) -> Bool {
-        lhs.conversationId == rhs.conversationId
+        if let l = lhs.conversationId, let r = rhs.conversationId {
+            return l == r
+        }
+        return lhs.localId == rhs.localId
     }
 }

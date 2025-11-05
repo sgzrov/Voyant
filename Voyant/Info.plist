@@ -95,7 +95,7 @@
     <true/>
 
     <key>BACKEND_BASE_URL</key>
-    <string>https://healthpredictor-production.up.railway.app</string>
+    <string>https://voyant-production-bff4.up.railway.app</string>
 </dict>
 </plist>
 
