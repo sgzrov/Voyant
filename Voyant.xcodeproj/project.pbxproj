@@ -7,7 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		04203C8D2E22607900B9C575 /* Clerk in Frameworks */ = {isa = PBXBuildFile; productRef = 04203C8C2E22607900B9C575 /* Clerk */; };
+		04EB79062EBC38CC00CE73CE /* Clerk in Frameworks */ = {isa = PBXBuildFile; productRef = 04EB79052EBC38CC00CE73CE /* Clerk */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -40,7 +40,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				04203C8D2E22607900B9C575 /* Clerk in Frameworks */,
+				04EB79062EBC38CC00CE73CE /* Clerk in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -75,7 +75,7 @@
 			);
 			name = Voyant;
 			packageProductDependencies = (
-				04203C8C2E22607900B9C575 /* Clerk */,
+				04EB79052EBC38CC00CE73CE /* Clerk */,
 			);
 			productName = HealthPredictor;
 			productReference = 0437D5F42EB887280005BF5C /* Voyant.app */;
@@ -107,7 +107,7 @@
 			mainGroup = 046F70D62D91216400D6B0E2;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
-				04203C8B2E22607900B9C575 /* XCRemoteSwiftPackageReference "clerk-ios" */,
+				04EB79042EBC38CC00CE73CE /* XCRemoteSwiftPackageReference "clerk-ios" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 046F70D62D91216400D6B0E2;
@@ -358,20 +358,20 @@
 /* End XCConfigurationList section */
 
 /* Begin XCRemoteSwiftPackageReference section */
-		04203C8B2E22607900B9C575 /* XCRemoteSwiftPackageReference "clerk-ios" */ = {
+		04EB79042EBC38CC00CE73CE /* XCRemoteSwiftPackageReference "clerk-ios" */ = {
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/clerk/clerk-ios";
 			requirement = {
 				kind = upToNextMajorVersion;
-				minimumVersion = 0.59.0;
+				minimumVersion = 0.70.0;
 			};
 		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
-		04203C8C2E22607900B9C575 /* Clerk */ = {
+		04EB79052EBC38CC00CE73CE /* Clerk */ = {
 			isa = XCSwiftPackageProductDependency;
-			package = 04203C8B2E22607900B9C575 /* XCRemoteSwiftPackageReference "clerk-ios" */;
+			package = 04EB79042EBC38CC00CE73CE /* XCRemoteSwiftPackageReference "clerk-ios" */;
 			productName = Clerk;
 		};
 /* End XCSwiftPackageProductDependency section */
