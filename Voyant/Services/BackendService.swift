@@ -35,6 +35,16 @@ class BackendService {
     func chat(userInput: String, conversationId: String? = nil, provider: String? = nil, model: String? = nil) async throws -> AsyncStream<String> {
         return try await agentService.chatStream(userInput: userInput, conversationId: conversationId, provider: provider, model: model)
     }
+
+    // MARK: - Health Upload & Query
+
+    func uploadHealthCSV(data: Data) async throws -> String {
+        return try await agentService.uploadHealthCSV(data)
+    }
+
+    func healthQuery(question: String) async throws -> AsyncStream<String> {
+        return try await agentService.healthQueryStream(question: question)
+    }
 }
 
 extension BackendService {

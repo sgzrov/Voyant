@@ -1,9 +1,16 @@
 from logging.config import fileConfig
 import os
+import sys
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, pool
 from alembic import context
-from Database.db import Base  # Adjust path if needed
+
+# Ensure project root is on sys.path so `import Backend...` works when CWD is Backend/
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from Backend.database import Base  # type: ignore  # After sys.path adjustment
 
 # Load environment variables from .env
 load_dotenv()

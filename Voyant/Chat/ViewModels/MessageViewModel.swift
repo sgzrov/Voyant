@@ -22,8 +22,6 @@ class MessageViewModel: ObservableObject {
 
     private let userToken: String
 
-    private static let streamingDelay: UInt64 = 4_000_000
-
     init(session: ChatSession, userToken: String) {
         self.session = session
         self.userToken = userToken
@@ -83,7 +81,6 @@ class MessageViewModel: ObservableObject {
                 fullContent += chunk
                 messages[messageIndex].content = fullContent
                 session.messages = messages
-                try? await Task.sleep(nanoseconds: Self.streamingDelay)
             }
 
             messages[messageIndex].state = .complete

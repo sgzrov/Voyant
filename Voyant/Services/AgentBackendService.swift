@@ -35,4 +35,33 @@ class AgentBackendService {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         return try await sseService.streamSSE(request: request)
     }
+
+    func uploadHealthCSV(_ data: Data) async throws -> (String) {
+        var request = try await authService.authenticatedRequest(for: "/health/upload-csv", method: "POST")
+        let boundary = "Boundary-\(UUID().uuidString)"
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+
+        var body = Data()
+        body.append("--\(boundary)\r\n".data(using: .utf8)!)
+        body.append("Content-Disposition: form-data; name=\"file\"; filename=\"health.csv\"\r\n".data(using: .utf8)!)
+        body.append("Content-Type: text/csv\r\n\r\n".data(using: .utf8)!)
+        body.append(data)
+        body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
+        request.httpBody = body
+
+        let (respData, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw NSError(domain: "upload", code: -1, userInfo: [NSLocalizedDescriptionKey: "Upload failed"])
+        }
+        struct UploadResponse: Decodable { let task_id: String? }
+        let taskId = (try? JSONDecoder().decode(UploadResponse.self, from: respData))?.task_id ?? ""
+        return taskId
+    }
+
+    func healthQueryStream(question: String) async throws -> AsyncStream<String> {
+        let body = try JSONSerialization.data(withJSONObject: ["question": question])
+        var request = try await authService.authenticatedRequest(for: "/health/query/stream", method: "POST", body: body)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        return try await sseService.streamSSE(request: request)
+    }
 }

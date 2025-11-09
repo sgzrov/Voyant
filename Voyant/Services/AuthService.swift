@@ -84,6 +84,23 @@ class AuthService {
         return newToken
     }
 
+    // Decode the JWT and return the Clerk user id (sub)
+    static func getUserId() async throws -> String {
+        let jwt = try await getValidToken()
+        let parts = jwt.split(separator: ".")
+        guard parts.count >= 2 else { throw AuthError.notAuthenticated }
+        let payloadB64 = String(parts[1])
+        var payloadPadded = payloadB64.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        while payloadPadded.count % 4 != 0 { payloadPadded.append("=") }
+        guard let data = Data(base64Encoded: payloadPadded),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let sub = json["sub"] as? String
+        else {
+            throw AuthError.notAuthenticated
+        }
+        return sub
+    }
+
     static func forceRefreshToken() async throws -> String {
         print("[DEBUG] AuthService: Force refreshing token due to presumed 401 error")
         clearCachedToken()

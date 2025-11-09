@@ -1,6 +1,7 @@
 from sqlalchemy import Column, Integer, String, Text, DateTime, func
 
-from .db import Base
+from Backend.database import Base
+
 
 class ChatsDB(Base):
     __tablename__ = 'user_chats_data'
@@ -10,3 +11,5 @@ class ChatsDB(Base):
     role = Column(String(16), nullable = False)
     content = Column(Text, nullable = False)
     timestamp = Column(DateTime(timezone = True), server_default = func.now())
+
+
