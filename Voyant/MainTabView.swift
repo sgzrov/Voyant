@@ -73,6 +73,10 @@ struct MainTabView: View {
             userId = session.user?.id ?? ""
             isSignedIn = true
             print("[DEBUG] Successfully got auth token, length: \(token.count)")
+
+            if !userId.isEmpty {
+                HealthSyncService.shared.startBackgroundSync(userId: userId)
+            }
         } catch {
             print("[DEBUG] Failed to get Clerk JWT: \(error)")
             userToken = ""
