@@ -30,6 +30,9 @@ class HealthStoreService {
             .heartRateVariabilitySDNN,
             .stepCount,
             .walkingSpeed,
+            .distanceWalkingRunning,
+            .distanceCycling,
+            .distanceSwimming,
             .vo2Max,
             .activeEnergyBurned,
             .dietaryWater,
@@ -38,7 +41,10 @@ class HealthStoreService {
             .bloodGlucose,
             .oxygenSaturation,
             .bloodPressureSystolic,
-            .bloodPressureDiastolic
+            .bloodPressureDiastolic,
+            .respiratoryRate,
+            .bodyTemperature,
+            .appleExerciseTime
         ]
 
         let categoryTypes: [HKCategoryTypeIdentifier] = [
@@ -48,7 +54,8 @@ class HealthStoreService {
 
         let readTypes: Set<HKObjectType> = Set(
             quantityTypes.compactMap { HKObjectType.quantityType(forIdentifier: $0) } +
-            categoryTypes.compactMap { HKObjectType.categoryType(forIdentifier: $0) }
+            categoryTypes.compactMap { HKObjectType.categoryType(forIdentifier: $0) } +
+            [HKObjectType.workoutType()]
         )
 
         healthStore.requestAuthorization(toShare: [], read: readTypes) { success, error in

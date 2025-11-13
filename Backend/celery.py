@@ -14,6 +14,8 @@ def make_celery() -> Celery:
         result_serializer="json",
         timezone="UTC",
         enable_utc=True,
+        imports=("Backend.background_tasks.csv_ingest",),
+        worker_concurrency = 2,
     )
     return app
 

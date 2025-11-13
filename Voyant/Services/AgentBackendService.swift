@@ -58,6 +58,32 @@ class AgentBackendService {
         return taskId
     }
 
+    struct HealthTaskStatus: Decodable {
+        let id: String
+        let state: String
+    }
+
+    func getHealthTaskStatus(_ taskId: String) async throws -> HealthTaskStatus {
+        let request = try await authService.authenticatedRequest(for: "/health/task-status/\(taskId)", method: "GET")
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw NSError(domain: "upload", code: -2, userInfo: [NSLocalizedDescriptionKey: "Status check failed"])
+        }
+        return try JSONDecoder().decode(HealthTaskStatus.self, from: data)
+    }
+
+    func waitForHealthTask(_ taskId: String, timeout: TimeInterval = 120, pollInterval: TimeInterval = 2) async throws -> HealthTaskStatus {
+        let start = Date()
+        while Date().timeIntervalSince(start) < timeout {
+            let st = try await getHealthTaskStatus(taskId)
+            if st.state == "SUCCESS" || st.state == "FAILURE" || st.state == "REVOKED" {
+                return st
+            }
+            try await Task.sleep(nanoseconds: UInt64(pollInterval * 1_000_000_000))
+        }
+        throw NSError(domain: "upload", code: -3, userInfo: [NSLocalizedDescriptionKey: "Status timeout"])
+    }
+
     func healthQueryStream(question: String) async throws -> AsyncStream<String> {
         let body = try JSONSerialization.data(withJSONObject: ["question": question])
         var request = try await authService.authenticatedRequest(for: "/health/query/stream", method: "POST", body: body)

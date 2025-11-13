@@ -117,9 +117,16 @@ async def upload_csv(file: UploadFile = File(...), request: Request = None):
     user = verify_clerk_jwt(request)
     user_id = user["sub"]
     content = await file.read()
-    b64 = base64.b64encode(content).decode("utf-8")
-    task = process_csv_upload.delay(user_id, b64)
-    return {"task_id": task.id}
+    try:
+        logger.info("upload_csv: user_id=%s filename=%s bytes=%s content_type=%s",
+                    user_id, getattr(file, 'filename', None), len(content), getattr(file, 'content_type', None))
+        b64 = base64.b64encode(content).decode("utf-8")
+        task = process_csv_upload.delay(user_id, b64)
+        logger.info("upload_csv: enqueued task_id=%s", task.id)
+        return {"task_id": task.id}
+    except Exception as e:
+        logger.exception("upload_csv: failed to enqueue task for user_id=%s", user_id)
+        raise HTTPException(status_code=500, detail=f"Failed to enqueue CSV ingest: {e}")
 
 
 @router.get("/health/task-status/{task_id}")

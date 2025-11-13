@@ -25,7 +25,7 @@ struct HealthCSVExporter {
         let specs = MetricSpec.defaultSpecs().filter { requestedMetrics.isEmpty ? true : requestedMetrics.contains($0.name) }
 
         let group = DispatchGroup()
-        var encounteredError: Error?
+        let encounteredError: Error? = nil
 
         for spec in specs {
             // Hourly for last 14 days
@@ -45,7 +45,8 @@ struct HealthCSVExporter {
                         rows.append(line)
                     }
                 case .failure(let error):
-                    encounteredError = error
+                    // Non-fatal: ignore per-metric authorization or data errors
+                    print("[HealthCSVExporter] hourly last14 '\(spec.name)' error: \(error.localizedDescription)")
                 }
                 group.leave()
             }
@@ -67,29 +68,7 @@ struct HealthCSVExporter {
                         rows.append(line)
                     }
                 case .failure(let error):
-                    encounteredError = error
-                }
-                group.leave()
-            }
-
-            // Daily aggregate for previous 150 days
-            group.enter()
-            queryQuantityOrCategory(
-                healthStore: healthStore,
-                spec: spec,
-                start: start164,
-                end: start14,
-                interval: DateComponents(day: 1),
-                aggregation: spec.aggregation
-            ) { result in
-                switch result {
-                case .success(let points):
-                    points.forEach { p in
-                        let line = "\(userId),\(iso.string(from: p.timestamp)),\(spec.name),\(formatValue(p.value)),\(spec.unitLabel),\(p.source),\(tz),\(createdAt)"
-                        rows.append(line)
-                    }
-                case .failure(let error):
-                    encounteredError = error
+                    print("[HealthCSVExporter] four-hour prev150 '\(spec.name)' error: \(error.localizedDescription)")
                 }
                 group.leave()
             }
@@ -103,7 +82,8 @@ struct HealthCSVExporter {
         let workoutQuery = HKSampleQuery(sampleType: workoutType, predicate: workoutPredicate, limit: HKObjectQueryNoLimit, sortDescriptors: [sort]) { _, samples, error in
             defer { group.leave() }
             if let error = error {
-                encounteredError = error
+                // Non-fatal: skip workouts if unauthorized
+                print("[HealthCSVExporter] workouts query error: \(error.localizedDescription)")
                 return
             }
             guard let workouts = samples as? [HKWorkout] else { return }
@@ -147,6 +127,7 @@ struct HealthCSVExporter {
                                  start: Date,
                                  end: Date,
                                  metrics requestedMetrics: [String] = [],
+                                 minuteResolution: Bool = false,
                                  completion: @escaping (Result<Data, Error>) -> Void) {
         let healthStore = HKHealthStore()
         let tz = TimeZone.current.identifier
@@ -158,7 +139,7 @@ struct HealthCSVExporter {
         let specs = MetricSpec.defaultSpecs().filter { requestedMetrics.isEmpty ? true : requestedMetrics.contains($0.name) }
 
         let group = DispatchGroup()
-        var encounteredError: Error?
+        let encounteredError: Error? = nil
 
         for spec in specs {
             group.enter()
@@ -167,7 +148,7 @@ struct HealthCSVExporter {
                 spec: spec,
                 start: start,
                 end: end,
-                interval: DateComponents(hour: 1),
+                interval: minuteResolution ? DateComponents(minute: 1) : DateComponents(hour: 1),
                 aggregation: spec.aggregation
             ) { result in
                 switch result {
@@ -177,7 +158,8 @@ struct HealthCSVExporter {
                         rows.append(line)
                     }
                 case .failure(let error):
-                    encounteredError = error
+                    // Non-fatal: ignore per-metric authorization or data errors
+                    print("[HealthCSVExporter] delta hourly '\(spec.name)' error: \(error.localizedDescription)")
                 }
                 group.leave()
             }
@@ -191,7 +173,7 @@ struct HealthCSVExporter {
         let workoutQuery = HKSampleQuery(sampleType: workoutType, predicate: workoutPredicate, limit: HKObjectQueryNoLimit, sortDescriptors: [sort]) { _, samples, error in
             defer { group.leave() }
             if let error = error {
-                encounteredError = error
+                print("[HealthCSVExporter] delta workouts query error: \(error.localizedDescription)")
                 return
             }
             guard let workouts = samples as? [HKWorkout] else { return }
@@ -236,32 +218,41 @@ struct HealthCSVExporter {
         let unit: HKUnit?
         let unitLabel: String
         let aggregation: Aggregation
+        let allowZero: Bool
 
         static func defaultSpecs() -> [MetricSpec] {
             var list: [MetricSpec] = []
             func q(_ id: HKQuantityTypeIdentifier) -> HKQuantityType { HKObjectType.quantityType(forIdentifier: id)! }
             func c(_ id: HKCategoryTypeIdentifier) -> HKCategoryType { HKObjectType.categoryType(forIdentifier: id)! }
 
-            list.append(MetricSpec(name: "heart_rate", quantityType: q(.heartRate), categoryType: nil, unit: HKUnit.count().unitDivided(by: .minute()), unitLabel: "bpm", aggregation: .average))
-            list.append(MetricSpec(name: "resting_heart_rate", quantityType: q(.restingHeartRate), categoryType: nil, unit: HKUnit.count().unitDivided(by: .minute()), unitLabel: "bpm", aggregation: .average))
-            list.append(MetricSpec(name: "walking_hr_avg", quantityType: q(.walkingHeartRateAverage), categoryType: nil, unit: HKUnit.count().unitDivided(by: .minute()), unitLabel: "bpm", aggregation: .average))
-            list.append(MetricSpec(name: "hr_variability_sdnn", quantityType: q(.heartRateVariabilitySDNN), categoryType: nil, unit: HKUnit.secondUnit(with: .milli), unitLabel: "ms", aggregation: .average))
-            list.append(MetricSpec(name: "steps", quantityType: q(.stepCount), categoryType: nil, unit: HKUnit.count(), unitLabel: "count", aggregation: .sum))
-            list.append(MetricSpec(name: "walking_speed", quantityType: q(.walkingSpeed), categoryType: nil, unit: HKUnit.meter().unitDivided(by: .second()), unitLabel: "m_per_s", aggregation: .average))
-            list.append(MetricSpec(name: "vo2_max", quantityType: q(.vo2Max), categoryType: nil, unit: HKUnit(from: "ml/(kg*min)"), unitLabel: "ml_per_kg_min", aggregation: .average))
-            list.append(MetricSpec(name: "active_energy_burned", quantityType: q(.activeEnergyBurned), categoryType: nil, unit: HKUnit.kilocalorie(), unitLabel: "kcal", aggregation: .sum))
-            list.append(MetricSpec(name: "dietary_water", quantityType: q(.dietaryWater), categoryType: nil, unit: HKUnit.liter(), unitLabel: "L", aggregation: .sum))
-            list.append(MetricSpec(name: "body_mass", quantityType: q(.bodyMass), categoryType: nil, unit: HKUnit.gramUnit(with: .kilo), unitLabel: "kg", aggregation: .average))
-            list.append(MetricSpec(name: "body_mass_index", quantityType: q(.bodyMassIndex), categoryType: nil, unit: HKUnit.count(), unitLabel: "bmi", aggregation: .average))
-            list.append(MetricSpec(name: "blood_glucose", quantityType: q(.bloodGlucose), categoryType: nil, unit: HKUnit(from: "mg/dL"), unitLabel: "mg_dL", aggregation: .average))
-            list.append(MetricSpec(name: "oxygen_saturation", quantityType: q(.oxygenSaturation), categoryType: nil, unit: HKUnit.percent(), unitLabel: "percent", aggregation: .average))
-            list.append(MetricSpec(name: "blood_pressure_systolic", quantityType: q(.bloodPressureSystolic), categoryType: nil, unit: HKUnit.millimeterOfMercury(), unitLabel: "mmHg", aggregation: .average))
-            list.append(MetricSpec(name: "blood_pressure_diastolic", quantityType: q(.bloodPressureDiastolic), categoryType: nil, unit: HKUnit.millimeterOfMercury(), unitLabel: "mmHg", aggregation: .average))
-            list.append(MetricSpec(name: "respiratory_rate", quantityType: q(.respiratoryRate), categoryType: nil, unit: HKUnit.count().unitDivided(by: .minute()), unitLabel: "breaths_per_min", aggregation: .average))
-            list.append(MetricSpec(name: "body_temperature", quantityType: q(.bodyTemperature), categoryType: nil, unit: HKUnit.degreeCelsius(), unitLabel: "degC", aggregation: .average))
-            list.append(MetricSpec(name: "mindfulness_minutes", quantityType: nil, categoryType: c(.mindfulSession), unit: HKUnit.minute(), unitLabel: "min", aggregation: .sum))
-            list.append(MetricSpec(name: "sleep_hours", quantityType: nil, categoryType: c(.sleepAnalysis), unit: HKUnit.hour(), unitLabel: "hours", aggregation: .sum))
-            list.append(MetricSpec(name: "active_time_minutes", quantityType: q(.appleExerciseTime), categoryType: nil, unit: HKUnit.minute(), unitLabel: "min", aggregation: .sum))
+            list.append(MetricSpec(name: "heart_rate",               quantityType: q(.heartRate),               categoryType: nil, unit: HKUnit.count().unitDivided(by: .minute()), unitLabel: "bpm",   aggregation: .average, allowZero: false))
+            list.append(MetricSpec(name: "resting_heart_rate",       quantityType: q(.restingHeartRate),        categoryType: nil, unit: HKUnit.count().unitDivided(by: .minute()), unitLabel: "bpm",   aggregation: .average, allowZero: false))
+            list.append(MetricSpec(name: "walking_hr_avg",           quantityType: q(.walkingHeartRateAverage), categoryType: nil, unit: HKUnit.count().unitDivided(by: .minute()), unitLabel: "bpm",   aggregation: .average, allowZero: false))
+            list.append(MetricSpec(name: "hr_variability_sdnn",      quantityType: q(.heartRateVariabilitySDNN),categoryType: nil, unit: HKUnit.secondUnit(with: .milli),          unitLabel: "ms",    aggregation: .average, allowZero: false))
+            list.append(MetricSpec(name: "steps",                    quantityType: q(.stepCount),              categoryType: nil, unit: HKUnit.count(),                          unitLabel: "count", aggregation: .sum,    allowZero: true))
+            list.append(MetricSpec(name: "walking_speed",            quantityType: q(.walkingSpeed),           categoryType: nil, unit: HKUnit.meter().unitDivided(by: .second()), unitLabel: "m_per_s",aggregation: .average, allowZero: false))
+            list.append(MetricSpec(name: "vo2_max",                  quantityType: q(.vo2Max),                 categoryType: nil, unit: HKUnit(from: "ml/(kg*min)"),             unitLabel: "ml_per_kg_min", aggregation: .average, allowZero: false))
+            list.append(MetricSpec(name: "active_energy_burned",     quantityType: q(.activeEnergyBurned),     categoryType: nil, unit: HKUnit.kilocalorie(),                     unitLabel: "kcal",  aggregation: .sum,    allowZero: true))
+            // Standalone distances to support inferred sessions when no HKWorkout exists
+            list.append(MetricSpec(name: "distance_walking_running_km", quantityType: q(.distanceWalkingRunning), categoryType: nil, unit: HKUnit.meterUnit(with: .kilo), unitLabel: "km", aggregation: .sum, allowZero: true))
+            if let qc = HKObjectType.quantityType(forIdentifier: .distanceCycling) {
+                list.append(MetricSpec(name: "distance_cycling_km", quantityType: qc, categoryType: nil, unit: HKUnit.meterUnit(with: .kilo), unitLabel: "km", aggregation: .sum, allowZero: true))
+            }
+            if let qs = HKObjectType.quantityType(forIdentifier: .distanceSwimming) {
+                list.append(MetricSpec(name: "distance_swimming_km", quantityType: qs, categoryType: nil, unit: HKUnit.meterUnit(with: .kilo), unitLabel: "km", aggregation: .sum, allowZero: true))
+            }
+            list.append(MetricSpec(name: "dietary_water",            quantityType: q(.dietaryWater),           categoryType: nil, unit: HKUnit.liter(),                           unitLabel: "L",     aggregation: .sum,    allowZero: true))
+            list.append(MetricSpec(name: "body_mass",                quantityType: q(.bodyMass),               categoryType: nil, unit: HKUnit.gramUnit(with: .kilo),             unitLabel: "kg",    aggregation: .average, allowZero: false))
+            list.append(MetricSpec(name: "body_mass_index",          quantityType: q(.bodyMassIndex),          categoryType: nil, unit: HKUnit.count(),                          unitLabel: "bmi",   aggregation: .average, allowZero: false))
+            list.append(MetricSpec(name: "blood_glucose",            quantityType: q(.bloodGlucose),           categoryType: nil, unit: HKUnit(from: "mg/dL"),                    unitLabel: "mg_dL", aggregation: .average, allowZero: false))
+            list.append(MetricSpec(name: "oxygen_saturation",        quantityType: q(.oxygenSaturation),       categoryType: nil, unit: HKUnit.percent(),                          unitLabel: "percent",aggregation: .average, allowZero: false))
+            list.append(MetricSpec(name: "blood_pressure_systolic",  quantityType: q(.bloodPressureSystolic),  categoryType: nil, unit: HKUnit.millimeterOfMercury(),             unitLabel: "mmHg",  aggregation: .average, allowZero: false))
+            list.append(MetricSpec(name: "blood_pressure_diastolic", quantityType: q(.bloodPressureDiastolic), categoryType: nil, unit: HKUnit.millimeterOfMercury(),             unitLabel: "mmHg",  aggregation: .average, allowZero: false))
+            list.append(MetricSpec(name: "respiratory_rate",         quantityType: q(.respiratoryRate),        categoryType: nil, unit: HKUnit.count().unitDivided(by: .minute()), unitLabel: "breaths_per_min", aggregation: .average, allowZero: false))
+            list.append(MetricSpec(name: "body_temperature",         quantityType: q(.bodyTemperature),        categoryType: nil, unit: HKUnit.degreeCelsius(),                   unitLabel: "degC",  aggregation: .average, allowZero: false))
+            list.append(MetricSpec(name: "mindfulness_minutes",      quantityType: nil,                        categoryType: c(.mindfulSession), unit: HKUnit.minute(),            unitLabel: "min",   aggregation: .sum,    allowZero: false))
+            list.append(MetricSpec(name: "sleep_hours",              quantityType: nil,                        categoryType: c(.sleepAnalysis),  unit: HKUnit.hour(),              unitLabel: "hours", aggregation: .sum,    allowZero: false))
+            list.append(MetricSpec(name: "active_time_minutes",      quantityType: q(.appleExerciseTime),      categoryType: nil, unit: HKUnit.minute(),                           unitLabel: "min",   aggregation: .sum,    allowZero: true))
             return list
         }
     }
@@ -277,7 +268,7 @@ struct HealthCSVExporter {
                                                 aggregation: MetricSpec.Aggregation,
                                                 completion: @escaping (Result<[DataPoint], Error>) -> Void) {
         if let qt = spec.quantityType {
-            queryQuantity(healthStore: healthStore, quantityType: qt, unit: spec.unit, start: start, end: end, interval: interval, aggregation: aggregation, completion: completion)
+            queryQuantity(healthStore: healthStore, quantityType: qt, unit: spec.unit, start: start, end: end, interval: interval, aggregation: aggregation, allowZero: spec.allowZero, completion: completion)
         } else if let ct = spec.categoryType {
             if ct.identifier == HKCategoryTypeIdentifier.sleepAnalysis.rawValue {
                 querySleep(healthStore: healthStore, start: start, end: end, interval: interval, completion: completion)
@@ -298,6 +289,7 @@ struct HealthCSVExporter {
                                       end: Date,
                                       interval: DateComponents,
                                       aggregation: MetricSpec.Aggregation,
+                                      allowZero: Bool,
                                       completion: @escaping (Result<[DataPoint], Error>) -> Void) {
         let predicate = HKQuery.predicateForSamples(withStart: start, end: end, options: .strictStartDate)
         let anchorDate = start
@@ -309,14 +301,24 @@ struct HealthCSVExporter {
             var out: [DataPoint] = []
             results?.enumerateStatistics(from: start, to: end) { stats, _ in
                 let ts = stats.startDate
-                var value: Double = 0
-                if aggregation == .sum, let sumQ = stats.sumQuantity() { value = sumQ.doubleValue(for: unit ?? HKUnit.count()) }
-                if aggregation == .average, let avgQ = stats.averageQuantity() { value = avgQ.doubleValue(for: unit ?? HKUnit.count()) }
-                if quantityType.identifier == HKQuantityTypeIdentifier.oxygenSaturation.rawValue {
-                    // Convert fraction to percent
-                    value *= 100.0
+                var maybeValue: Double?
+                if aggregation == .sum, let sumQ = stats.sumQuantity() {
+                    let v = sumQ.doubleValue(for: unit ?? HKUnit.count())
+                    if v > 0 || (v == 0 && allowZero) {
+                        maybeValue = v
+                    }
                 }
-                out.append(DataPoint(timestamp: ts, value: value, source: "Apple Watch"))
+                if aggregation == .average, let avgQ = stats.averageQuantity() {
+                    let v = avgQ.doubleValue(for: unit ?? HKUnit.count())
+                    maybeValue = v
+                }
+                if var value = maybeValue {
+                    if quantityType.identifier == HKQuantityTypeIdentifier.oxygenSaturation.rawValue {
+                        // Convert fraction to percent
+                        value *= 100.0
+                    }
+                    out.append(DataPoint(timestamp: ts, value: value, source: "Apple Watch"))
+                }
             }
             completion(.success(out))
         }
@@ -350,7 +352,9 @@ struct HealthCSVExporter {
                     seconds += max(0, overlapEnd.timeIntervalSince(overlapStart))
                 }
                 let hours = seconds / 3600.0
-                out.append(DataPoint(timestamp: bucketStart, value: hours, source: "Apple Watch"))
+                if hours > 0 {
+                    out.append(DataPoint(timestamp: bucketStart, value: hours, source: "Apple Watch"))
+                }
                 bucketStart = bucketEnd
             }
             completion(.success(out))
@@ -385,7 +389,9 @@ struct HealthCSVExporter {
                     seconds += max(0, overlapEnd.timeIntervalSince(overlapStart))
                 }
                 let minutes = seconds / 60.0
-                out.append(DataPoint(timestamp: bucketStart, value: minutes, source: "Apple Watch"))
+                if minutes > 0 {
+                    out.append(DataPoint(timestamp: bucketStart, value: minutes, source: "Apple Watch"))
+                }
                 bucketStart = bucketEnd
             }
             completion(.success(out))
@@ -399,7 +405,6 @@ struct HealthCSVExporter {
     }
 
     private static func workoutActivityName(_ type: HKWorkoutActivityType) -> String {
-        // Minimal mapping; extend as needed
         switch type {
         case .running: return "running"
         case .walking: return "walking"
@@ -409,6 +414,9 @@ struct HealthCSVExporter {
         case .elliptical: return "elliptical"
         case .yoga: return "yoga"
         case .traditionalStrengthTraining: return "strength"
+        case .downhillSkiing: return "skiing_downhill"
+        case .crossCountrySkiing: return "skiing_xc"
+        case .snowboarding: return "snowboarding"
         default: return "workout"
         }
     }

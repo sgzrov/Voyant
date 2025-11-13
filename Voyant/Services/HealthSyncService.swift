@@ -18,21 +18,55 @@ final class HealthSyncService {
 
 	// Call on app launch after permissions are granted
 	func startBackgroundSync(userId: String) {
+		// Avoid double‑starting
+		guard currentUserId == nil else { return }
 		self.currentUserId = userId
-		registerObservers()
-		enableBackgroundDelivery()
-		// Kick off an initial small delta sync (last 48h) to seed
-		let now = Date()
-		let start = calendar.date(byAdding: .hour, value: -48, to: now) ?? now.addingTimeInterval(-48 * 3600)
-		HealthCSVExporter.generateDeltaCSV(for: userId, start: start, end: now) { result in
-			switch result {
-			case .success(let data):
-				Task {
-					_ = try? await AgentBackendService.shared.uploadHealthCSV(data)
-				}
-			case .failure:
-				break
+		print("[HealthSync] startBackgroundSync for user=\(userId)")
+		// Ensure HK permission is granted before attempting queries
+        HealthStoreService.shared.requestAuthorization { [weak self] (ok: Bool, err: Error?) in
+			guard let self = self else { return }
+			if !ok {
+				print("[HealthSync] HealthKit authorization not granted: \(err?.localizedDescription ?? "unknown")")
+				return
 			}
+			print("[HealthSync] HealthKit authorized, starting observers and initial seed")
+			self.registerObservers()
+			self.enableBackgroundDelivery()
+			// Give HealthKit a short moment to finalize auth state before heavy queries
+			let initialSeed = DispatchWorkItem {
+				// Initial full backfill (~164 days) to guarantee seed on first run
+				HealthCSVExporter.generateCSV(for: userId, metrics: []) { res in
+					switch res {
+					case .success(let data):
+						// Write debug CSV to Documents so it can be inspected in Files
+						do {
+							let ts = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
+							if let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
+								let url = docs.appendingPathComponent("HealthExport-\(ts).csv")
+								try data.write(to: url, options: .atomic)
+								print("[HealthSync] Saved initial CSV to \(url.path)")
+							}
+						} catch {
+							print("[HealthSync] Failed saving initial CSV: \(error)")
+						}
+						Task {
+							do {
+								print("[HealthSync] Uploading initial CSV (\(data.count) bytes)")
+								let taskId = try await AgentBackendService.shared.uploadHealthCSV(data)
+								print("[HealthSync] Enqueued process_csv_upload taskId=\(taskId)")
+								// Optionally poll for completion so we can log success
+								let status = try await AgentBackendService.shared.waitForHealthTask(taskId, timeout: 120)
+								print("[HealthSync] Initial seed completed with state=\(status.state)")
+							} catch {
+								print("[HealthSync] Initial upload failed: \(error)")
+							}
+						}
+					case .failure(let e):
+						print("[HealthSync] generateCSV failed: \(e.localizedDescription)")
+					}
+				}
+			}
+			DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: initialSeed)
 		}
 	}
 
@@ -176,9 +210,21 @@ final class HealthSyncService {
 				}
 				guard let uid = userId else { finish(); return }
 
-				HealthCSVExporter.generateDeltaCSV(for: uid, start: start, end: end) { result in
+				let minuteResolution = end.timeIntervalSince(start) <= (90 * 60)
+				HealthCSVExporter.generateDeltaCSV(for: uid, start: start, end: end, metrics: [], minuteResolution: minuteResolution) { result in
 					switch result {
 					case .success(let data):
+						// Save delta CSV for debugging
+						do {
+							let ts = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
+							if let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
+								let url = docs.appendingPathComponent("HealthDelta-\(ts).csv")
+								try data.write(to: url, options: .atomic)
+								print("[HealthSync] Saved delta CSV to \(url.path)")
+							}
+						} catch {
+							print("[HealthSync] Failed saving delta CSV: \(error)")
+						}
 						Task {
 							_ = try? await AgentBackendService.shared.uploadHealthCSV(data)
 							finish()

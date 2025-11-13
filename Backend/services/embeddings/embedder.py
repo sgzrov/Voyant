@@ -18,7 +18,7 @@ def _redis_client() -> redis.Redis | None:
 
 
 class Embedder:
-    def __init__(self, model: str = "text-embedding-3-large") -> None:
+    def __init__(self, model: str = "text-embedding-3-small") -> None:
         self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         self.model = model
         self.cache_ttl_seconds = int(os.getenv("EMBED_CACHE_TTL", "900"))
