@@ -34,6 +34,26 @@ async def _fetch_health_context(user_id: str, question: str):
 router = APIRouter()
 
 logger = logging.getLogger(__name__)
+# Ensure module logs are visible when running under gunicorn/uvicorn (which may keep root at WARNING)
+if not logger.handlers:
+    try:
+        log_level_name = os.getenv("VOYANT_LOG_LEVEL", "INFO").upper()
+        log_level = getattr(logging, log_level_name, logging.INFO)
+    except Exception:
+        log_level = logging.INFO
+    logger.setLevel(log_level)
+    _handler = logging.StreamHandler()
+    _handler.setLevel(log_level)
+    _handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    logger.addHandler(_handler)
+    # Also ensure other module loggers propagate to a handler (root)
+    root_logger = logging.getLogger()
+    if not root_logger.handlers:
+        root_logger.setLevel(log_level)
+        root_handler = logging.StreamHandler()
+        root_handler.setLevel(log_level)
+        root_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+        root_logger.addHandler(root_handler)
 
 def _openai_compatible_client(provider: str) -> OpenAI:
     if not isinstance(provider, str) or not provider.strip():

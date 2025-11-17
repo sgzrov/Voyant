@@ -3,12 +3,40 @@ from __future__ import annotations
 import os
 import re
 from typing import Any, Dict
+import logging
 from dotenv import load_dotenv
 from openai import OpenAI
 from sqlalchemy import text
 from pathlib import Path
 
 from Backend.database import SessionLocal
+
+logger = logging.getLogger(__name__)
+
+def _extract_sql_from_text(text: str) -> str:
+    """
+    Extract a bare SQL statement from LLM output.
+    - Strips ```sql ... ``` fences if present
+    - Trims any prose before the first SELECT
+    """
+    if not isinstance(text, str):
+        return ""
+    s = text.strip()
+    # Remove fenced blocks
+    if s.startswith("```"):
+        lines = s.splitlines()
+        # Drop the opening fence (``` or ```sql)
+        if lines:
+            lines = lines[1:]
+        # Drop the closing fence if present
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        s = "\n".join(lines).strip()
+    # Keep from the first SELECT onward
+    idx = s.lower().find("select")
+    if idx >= 0:
+        s = s[idx:]
+    return s.strip()
 
 load_dotenv()
 
@@ -178,6 +206,29 @@ def _sanitize_sql(sql: str) -> str:
     if limit_idx < 0:
         s = s + " LIMIT 200"
 
+    # Normalize risky numeric casts produced by the model:
+    # JSON values may contain decimals (e.g., "1465.0691") which fail for ::int.
+    # Prefer ::float for aggregates; callers can round if needed.
+    s = re.sub(r"::\s*(int|integer)\b", "::float", s, flags=re.IGNORECASE)
+
+    # If the query targets health_metrics but uses JSON metrics->>'...' syntax,
+    # rewrite those JSON extracts to aggregate over rows by metric_type.
+    # E.g., AVG((metrics->>'heart_rate')::float) -> AVG(CASE WHEN metric_type='heart_rate' THEN metric_value END)
+    if re.search(r"\bfrom\s+health_metrics\b", s, flags=re.IGNORECASE):
+        def _rewrite_json_extract(match: re.Match) -> str:
+            metric = match.group(1)
+            # Preserve any surrounding casts by replacing inner expression only
+            return f"(CASE WHEN metric_type = '{metric}' THEN metric_value END)"
+
+        # Replace metrics->>'name'
+        s_new = re.sub(r"metrics\s*->>\s*'([a-zA-Z0-9_]+)'", _rewrite_json_extract, s, flags=re.IGNORECASE)
+        if s_new != s:
+            s = s_new
+            try:
+                logging.getLogger(__name__).info("sql.rewrite.metrics: applied CASE WHEN metric_type rewrite")
+            except Exception:
+                pass
+
     # Final forbidden tokens check (case-insensitive)
     lowered = s.lower()
     forbidden_words = [" insert ", " update ", " delete ", " drop ", " alter "]
@@ -199,11 +250,25 @@ def execute_generated_sql(user_id: str, question: str) -> Dict[str, Any]:
         temperature = 0.1,
     )
     sql = resp.choices[0].message.content if resp.choices else ""
+    try:
+        trunc = (sql[:500] + "...") if isinstance(sql, str) and len(sql) > 500 else sql
+        logger.info("sql.gen.raw: %s", trunc)
+    except Exception:
+        pass
     if not isinstance(sql, str) or not sql.strip():
         return {"sql": None, "rows": [], "error": "no-sql"}
 
     try:
-        safe_sql = _sanitize_sql(sql)
+        extracted = _extract_sql_from_text(sql)
+        try:
+            logger.info("sql.gen.extracted: %s", extracted)
+        except Exception:
+            pass
+        safe_sql = _sanitize_sql(extracted)
+        try:
+            logger.info("sql.safe: %s", safe_sql)
+        except Exception:
+            pass
     except Exception as e:
         return {"sql": sql, "rows": [], "error": f"invalid-sql: {e}"}
 
@@ -211,8 +276,16 @@ def execute_generated_sql(user_id: str, question: str) -> Dict[str, Any]:
         try:
             result = session.execute(text(safe_sql), {"user_id": user_id}).mappings().all()
             rows = [dict(r) for r in result]
+            try:
+                logger.info("sql.exec: user_id=%s rows=%d", user_id, len(rows))
+            except Exception:
+                pass
             return {"sql": safe_sql, "rows": rows}
         except Exception as e:
+            try:
+                logger.exception("sql.error: user_id=%s err=%s", user_id, str(e))
+            except Exception:
+                pass
             return {"sql": safe_sql, "rows": [], "error": str(e)}
 
 
