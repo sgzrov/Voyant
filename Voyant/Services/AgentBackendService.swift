@@ -84,10 +84,16 @@ class AgentBackendService {
         throw NSError(domain: "upload", code: -3, userInfo: [NSLocalizedDescriptionKey: "Status timeout"])
     }
 
-    func healthQueryStream(question: String) async throws -> AsyncStream<String> {
-        let body = try JSONSerialization.data(withJSONObject: ["question": question])
+    func healthQueryStream(question: String, conversationId: String? = nil, provider: String? = nil, model: String? = nil, decisionModel: String? = nil) async throws -> AsyncStream<String> {
+        var payload: [String: Any] = ["question": question]
+        if let conversationId = conversationId { payload["conversation_id"] = conversationId }
+        if let provider = provider { payload["provider"] = provider }
+        if let model = model { payload["model"] = model }
+        if let decisionModel = decisionModel { payload["decision_model"] = decisionModel }
+        let body = try JSONSerialization.data(withJSONObject: payload)
         var request = try await authService.authenticatedRequest(for: "/health/query/stream", method: "POST", body: body)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(TimeZone.current.identifier, forHTTPHeaderField: "X-User-TZ")
         return try await sseService.streamSSE(request: request)
     }
 }

@@ -32,8 +32,15 @@ class BackendService {
         self.agentService = AgentBackendService.shared
     }
 
-    func chat(userInput: String, conversationId: String? = nil, provider: String? = nil, model: String? = nil) async throws -> AsyncStream<String> {
-        return try await agentService.chatStream(userInput: userInput, conversationId: conversationId, provider: provider, model: model)
+    func chat(userInput: String, conversationId: String? = nil, provider: String? = nil, model: String? = nil, decisionModel: String? = nil) async throws -> AsyncStream<String> {
+        // Route all chat through health query stream; the model decides whether to call tools
+        return try await agentService.healthQueryStream(
+            question: userInput,
+            conversationId: conversationId,
+            provider: provider,
+            model: model,
+            decisionModel: decisionModel
+        )
     }
 
     // MARK: - Health Upload & Query

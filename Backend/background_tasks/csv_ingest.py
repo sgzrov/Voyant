@@ -7,6 +7,8 @@ import base64
 from typing import Dict, List
 import math
 from sqlalchemy import text
+import time
+import random
 
 from Backend.celery import celery
 from Backend.database import SessionLocal
@@ -142,6 +144,15 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> Dict:
 
     # Perform cleanup for health_events and health_summaries tables
     with SessionLocal() as session:
+        # Per-user transaction-scoped advisory lock to serialize writes and avoid deadlocks
+        try:
+            session.execute(
+                text("SELECT pg_advisory_xact_lock(:lock_key, hashtext(:user_id))"),
+                {"lock_key": 42, "user_id": user_id},
+            )
+        except Exception:
+            logger.exception("Failed to acquire advisory lock for user_id=%s", user_id)
+            # Proceed anyway; retry blocks below will still mitigate transient errors
         try:
             session.execute(
                 text(
@@ -200,28 +211,38 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> Dict:
                 )
             ]
             if params:
-                try:
-                    session.execute(
-                        text(
-                            """
-                            INSERT INTO health_events (user_id, timestamp, event_type, value, unit, source)
-                            VALUES (:user_id, :timestamp, :event_type, :value, :unit, :source)
-                            ON CONFLICT (user_id, event_type, timestamp) DO UPDATE
-                            SET
-                                value = GREATEST(EXCLUDED.value, health_events.value),
-                                unit = COALESCE(EXCLUDED.unit, health_events.unit),
-                                source = COALESCE(EXCLUDED.source, health_events.source)
-                            """
-                        ),
-                        params,
-                    )
-                except Exception:
-                    logger.exception("Failed to bulk insert health_events for user_id=%s", user_id)
-                    # Clear failed transaction so subsequent statements can proceed
+                # Deadlock-resilient executemany
+                for attempt in range(3):
                     try:
-                        session.rollback()
-                    except Exception:
-                        logger.exception("Rollback failed after health_events error for user_id=%s", user_id)
+                        session.execute(
+                            text(
+                                """
+                                INSERT INTO health_events (user_id, timestamp, event_type, value, unit, source)
+                                VALUES (:user_id, :timestamp, :event_type, :value, :unit, :source)
+                                ON CONFLICT (user_id, event_type, timestamp) DO UPDATE
+                                SET
+                                    value = GREATEST(EXCLUDED.value, health_events.value),
+                                    unit = COALESCE(EXCLUDED.unit, health_events.unit),
+                                    source = COALESCE(EXCLUDED.source, health_events.source)
+                                """
+                            ),
+                            params,
+                        )
+                        break
+                    except Exception as e:
+                        msg = str(e).lower()
+                        if "deadlock detected" in msg and attempt < 2:
+                            try:
+                                session.rollback()
+                            except Exception:
+                                pass
+                            time.sleep(0.2 * (attempt + 1) + random.random() * 0.2)
+                            continue
+                        logger.exception("Failed to bulk insert health_events for user_id=%s", user_id)
+                        try:
+                            session.rollback()
+                        except Exception:
+                            logger.exception("Rollback failed after health_events error for user_id=%s", user_id)
 
         # Bulk insert summaries into health_summaries table
         for s in summaries:
@@ -247,51 +268,61 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> Dict:
             )
         # Bulk insert raw metrics into health_metrics
         if not df_metrics.empty:
-            try:
-                params_m = [
-                    {
-                        "user_id": user_id,
-                        "timestamp": ts,
-                        "metric_type": mtype,
-                        "metric_value": float(val),
-                        "unit": unit if unit is not None else None,
-                        "source": source if source is not None else None,
-                        "created_at": cat if pd.notna(cat) else None,
-                    }
-                    for ts, mtype, val, unit, source, cat in zip(
-                        df_metrics["timestamp"],
-                        df_metrics["metric_type"],
-                        df_metrics["metric_value"],
-                        df_metrics["unit"] if "unit" in df_metrics.columns else [None] * len(df_metrics),
-                        df_metrics["source"] if "source" in df_metrics.columns else [None] * len(df_metrics),
-                        df_metrics["created_at"] if "created_at" in df_metrics.columns else [None] * len(df_metrics),
-                    )
-                ]
-                if params_m:
-                    session.execute(
-                        text(
-                            """
-                            INSERT INTO health_metrics
-                                (user_id, timestamp, metric_type, metric_value, unit, source, created_at)
-                            VALUES
-                                (:user_id, :timestamp, :metric_type, :metric_value, :unit, :source, :created_at)
-                            ON CONFLICT (user_id, metric_type, timestamp) DO UPDATE
-                            SET
-                                metric_value = EXCLUDED.metric_value,
-                                unit = EXCLUDED.unit,
-                                source = EXCLUDED.source,
-                                created_at = COALESCE(EXCLUDED.created_at, health_metrics.created_at)
-                            """
-                        ),
-                        params_m,
-                    )
-            except Exception:
-                logger.exception("Failed to bulk insert health_metrics for user_id=%s", user_id)
-                # Clear failed transaction so subsequent statements can proceed
-                try:
-                    session.rollback()
-                except Exception:
-                    logger.exception("Rollback failed after health_metrics error for user_id=%s", user_id)
+            params_m = [
+                {
+                    "user_id": user_id,
+                    "timestamp": ts,
+                    "metric_type": mtype,
+                    "metric_value": float(val),
+                    "unit": unit if unit is not None else None,
+                    "source": source if source is not None else None,
+                    "created_at": cat if pd.notna(cat) else None,
+                }
+                for ts, mtype, val, unit, source, cat in zip(
+                    df_metrics["timestamp"],
+                    df_metrics["metric_type"],
+                    df_metrics["metric_value"],
+                    df_metrics["unit"] if "unit" in df_metrics.columns else [None] * len(df_metrics),
+                    df_metrics["source"] if "source" in df_metrics.columns else [None] * len(df_metrics),
+                    df_metrics["created_at"] if "created_at" in df_metrics.columns else [None] * len(df_metrics),
+                )
+            ]
+            if params_m:
+                for attempt in range(3):
+                    try:
+                        session.execute(
+                            text(
+                                """
+                                INSERT INTO health_metrics
+                                    (user_id, timestamp, metric_type, metric_value, unit, source, created_at)
+                                VALUES
+                                    (:user_id, :timestamp, :metric_type, :metric_value, :unit, :source, :created_at)
+                                ON CONFLICT (user_id, metric_type, timestamp) DO UPDATE
+                                SET
+                                    metric_value = EXCLUDED.metric_value,
+                                    unit = EXCLUDED.unit,
+                                    source = EXCLUDED.source,
+                                    created_at = COALESCE(EXCLUDED.created_at, health_metrics.created_at)
+                                """
+                            ),
+                            params_m,
+                        )
+                        break
+                    except Exception as e:
+                        msg = str(e).lower()
+                        if "deadlock detected" in msg and attempt < 2:
+                            try:
+                                session.rollback()
+                            except Exception:
+                                pass
+                            time.sleep(0.25 * (attempt + 1) + random.random() * 0.25)
+                            continue
+                        logger.exception("Failed to bulk insert health_metrics for user_id=%s", user_id)
+                        # Clear failed transaction so subsequent statements can proceed
+                        try:
+                            session.rollback()
+                        except Exception:
+                            logger.exception("Rollback failed after health_metrics error for user_id=%s", user_id)
         session.commit()
     # Derive health_sessions from workout events (one session per workout timestamp/type)
     try:
@@ -321,9 +352,9 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> Dict:
                         text(
                             """
                             INSERT INTO health_sessions
-                                (user_id, session_type, source, external_id, activity_type, start_ts, end_ts, duration_min, distance_km, energy_kcal, avg_hr, notes)
+                                (user_id, session_type, source, external_id, start_ts, end_ts, duration_min, distance_km, energy_kcal, avg_hr)
                             VALUES
-                                (:user_id, :session_type, :source, :external_id, :activity_type, :start_ts, :end_ts, :duration_min, :distance_km, :energy_kcal, :avg_hr, :notes)
+                                (:user_id, :session_type, :source, :external_id, :start_ts, :end_ts, :duration_min, :distance_km, :energy_kcal, :avg_hr)
                             ON CONFLICT (user_id, session_type, start_ts) DO UPDATE
                             SET
                                 end_ts = EXCLUDED.end_ts,
@@ -339,14 +370,12 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> Dict:
                             "session_type": session_type,
                             "source": "workout",
                             "external_id": None,
-                            "activity_type": None,
                             "start_ts": start_ts,
                             "end_ts": end_ts,
                             "duration_min": duration_min,
                             "distance_km": distance_km if distance_km > 0 else None,
                             "energy_kcal": energy_kcal if energy_kcal > 0 else None,
                             "avg_hr": avg_hr,
-                            "notes": None,
                         },
                     ).fetchone()
                     if not row:
@@ -498,9 +527,9 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> Dict:
                             text(
                                 """
                                 INSERT INTO health_sessions
-                                    (user_id, session_type, source, external_id, activity_type, start_ts, end_ts, duration_min, distance_km, energy_kcal, avg_hr, notes)
+                                    (user_id, session_type, source, external_id, start_ts, end_ts, duration_min, distance_km, energy_kcal, avg_hr)
                                 VALUES
-                                    (:user_id, :session_type, :source, :external_id, :activity_type, :start_ts, :end_ts, :duration_min, :distance_km, :energy_kcal, :avg_hr, :notes)
+                                    (:user_id, :session_type, :source, :external_id, :start_ts, :end_ts, :duration_min, :distance_km, :energy_kcal, :avg_hr)
                                 ON CONFLICT (user_id, session_type, start_ts) DO UPDATE
                                 SET
                                     end_ts = EXCLUDED.end_ts,
@@ -516,14 +545,12 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> Dict:
                                 "session_type": session_type,
                                 "source": "inferred",
                                 "external_id": None,
-                                "activity_type": None,
                                 "start_ts": ts,
                                 "end_ts": end_ts,
                                 "duration_min": atm,
                                 "distance_km": distance_km,
                                 "energy_kcal": kcal_v if kcal_v > 0 else None,
                                 "avg_hr": avg_hr,
-                                "notes": None,
                             },
                         ).fetchone()
                         if not row_id:

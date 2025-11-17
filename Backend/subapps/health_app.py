@@ -5,11 +5,14 @@ import os
 import pathlib
 import logging
 import uuid
-from typing import Optional, Any, Callable
+from typing import Optional
 from fastapi import APIRouter, UploadFile, File, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from openai import OpenAI
 from sqlalchemy import func
+from datetime import timezone
+from zoneinfo import ZoneInfo
+import time
 
 from Backend.auth import verify_clerk_jwt
 from Backend.background_tasks.csv_ingest import process_csv_upload
@@ -18,8 +21,6 @@ from Backend.services.ai.sql_gen import execute_generated_sql
 from Backend.database import SessionLocal
 from Backend.crud.chat import get_chat_history, create_chat_message
 from Backend.models.chat_data_model import ChatsDB
-from Backend.services.ai.openai_chat import Chat
-from Backend.schemas.chat import ChatRequest
 
 
 async def _fetch_health_context(user_id: str, question: str):
@@ -34,82 +35,55 @@ router = APIRouter()
 
 logger = logging.getLogger(__name__)
 
+def _openai_compatible_client(provider: str) -> OpenAI:
+    if not isinstance(provider, str) or not provider.strip():
+        raise HTTPException(status_code = 400, detail = "Missing provider")
+    p = provider.lower()
+    if p == "openai":
+        return OpenAI(api_key = os.getenv("OPENAI_API_KEY"))
+    if p == "grok":
+        return OpenAI(api_key = os.getenv("GROK_API_KEY"), base_url = "https://api.x.ai/v1")
+    if p == "gemini":
+        return OpenAI(api_key = os.getenv("GEMINI_API_KEY"), base_url = "https://generativelanguage.googleapis.com/v1beta/openai")
+    if p == "anthropic":
+        return OpenAI(api_key = os.getenv("ANTHROPIC_API_KEY"), base_url = "https://api.anthropic.com/v1")
+    raise HTTPException(status_code = 400, detail = f"Unsupported provider: {p}")
 
-PROMPT_PATH = (pathlib.Path(__file__).resolve().parents[1] / "resources" / "chat_prompt.txt")
-api_key = os.getenv("OPENAI_API_KEY") or ""
-chat_agent = Chat(api_key, prompt_path=str(PROMPT_PATH))
-
+DEFAULT_MODEL = {
+    "openai": "gpt-5-mini",
+    "grok": "grok-4-fast",
+    "gemini": "gemini-2.5-flash",
+    "anthropic": "claude-sonnet-4-5",
+}
 
 def generate_conversation_id(existing_conversation_id: Optional[str] = None) -> str:
     if existing_conversation_id:
         return existing_conversation_id
     return str(uuid.uuid4())
 
-def setup_conversation_history(conversation_id: Optional[str],
-                               user_input: str,
-                               user_id: str,
-                               session,
-                               chat_agent) -> tuple[Optional[Callable[[str], None]], Optional[Callable[[str], None]], Optional[str]]:
-    conversation_id = generate_conversation_id(conversation_id)
-    chat_agent._append_user_message(conversation_id, user_id, user_input, session=session)
-    def save_conversation(full_response: str) -> None:
-        chat_agent._append_assistant_response(conversation_id, user_id, full_response, session=session)
-    return save_conversation, None, conversation_id
 
-def extract_text_from_chunk(chunk: Any, full_response: str = "") -> str:
-    if isinstance(chunk, str):
-        return chunk
+def _localize_rows(rows: list[dict], tz: str) -> list[dict]:
+    """Convert known timestamp fields in SQL rows from UTC to the requested timezone and format for readability."""
     try:
-        choices = getattr(chunk, 'choices', None)
-        if choices and len(choices) > 0:
-            choice = choices[0]
-            delta = getattr(choice, 'delta', None)
-            if delta is not None:
-                content = getattr(delta, 'content', None)
-                if isinstance(content, str):
-                    return content or ""
-            text_piece = getattr(choice, 'text', None)
-            if isinstance(text_piece, str):
-                return text_piece or ""
+        zone = ZoneInfo(tz)
     except Exception:
-        pass
-    if hasattr(chunk, 'type'):
-        if chunk.type == 'text_delta':
-            if hasattr(chunk, 'delta') and chunk.delta and hasattr(chunk.delta, 'text'):
-                return chunk.delta.text or ""
-        elif chunk.type == 'response.output_text.delta':
-            if hasattr(chunk, 'delta') and chunk.delta:
-                return chunk.delta or ""
-        elif chunk.type == 'response.output_text.done':
-            if hasattr(chunk, 'text') and chunk.text:
-                remaining_text = chunk.text[len(full_response):]
-                return remaining_text or ""
-    return ""
-
-def process_streaming_response(response: Any, conversation_callback: Optional[Callable[[str], None]] = None, partial_callback: Optional[Callable[[str], None]] = None) -> Any:
-    full_response = ""
-    for chunk in response:
-        text = extract_text_from_chunk(chunk, full_response)
-        if text:
-            full_response += text
-            yield f"data: {json.dumps({'content': text, 'done': False})}\n\n"
-    if conversation_callback and full_response.strip():
-        try:
-            conversation_callback(full_response.strip())
-        except Exception:
-            pass
-    yield f"data: {json.dumps({'content': '', 'done': True})}\n\n"
-
-def create_streaming_response(generator_func: Callable, **kwargs) -> StreamingResponse:
-    return StreamingResponse(
-        generator_func(**kwargs),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-        }
-    )
-
+        zone = ZoneInfo("UTC")
+    out: list[dict] = []
+    for r in rows:
+        rr = dict(r)
+        for key in ("timestamp", "start_ts", "end_ts"):
+            if key in rr and rr[key]:
+                dt = rr[key]
+                try:
+                    # Ensure timezone-aware UTC then convert
+                    if getattr(dt, "tzinfo", None) is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    rr[key] = dt.astimezone(zone).strftime("%Y-%m-%d %I:%M %p")
+                except Exception:
+                    # Leave original on failure
+                    pass
+        out.append(rr)
+    return out
 
 
 @router.post("/health/upload-csv")
@@ -139,8 +113,18 @@ async def task_status(task_id: str):
 async def query_stream(payload: dict, request: Request):
     user = verify_clerk_jwt(request)
     user_id = user["sub"]
+    user_tz = request.headers.get("x-user-tz") or "UTC"
     question = payload.get("question")
     conversation_id = payload.get("conversation_id")
+    provider = payload.get("provider")
+    if not isinstance(provider, str) or not provider.strip():
+        raise HTTPException(status_code = 400, detail = "Missing provider")
+    provider = provider.lower()
+    answer_model = payload.get("model") or DEFAULT_MODEL.get(provider) or ""
+    if not answer_model:
+        raise HTTPException(status_code = 400, detail = f"No default model for provider: {provider}")
+    # Use same model for decision unless explicitly overridden
+    decision_model = payload.get("decision_model") or answer_model
     if conversation_id is not None and isinstance(conversation_id, str) and conversation_id.strip() == "":
         raise HTTPException(status_code = 400, detail = "conversation_id cannot be empty string")
     if not conversation_id:
@@ -149,7 +133,7 @@ async def query_stream(payload: dict, request: Request):
         raise HTTPException(status_code = 400, detail = "Missing question")
 
     async def generator():
-        client = OpenAI(api_key= os.getenv("OPENAI_API_KEY"))
+        client = _openai_compatible_client(provider)
         prompt_path = pathlib.Path(__file__).resolve().parents[1] / "resources" / "chat_prompt.txt"
         system = prompt_path.read_text(encoding = "utf-8")
 
@@ -191,19 +175,44 @@ async def query_stream(payload: dict, request: Request):
         messages.append({"role": "user", "content": question})
 
         try:
+            logger.info("health.query: conv=%s provider=%s answer_model=%s decision_model=%s", conversation_id, provider, answer_model, decision_model)
+        except Exception:
+            pass
+
+        try:
             yield f"data: {json.dumps({'conversation_id': conversation_id, 'content': '', 'done': False})}\n\n"
         except Exception:
             pass
 
+        try:
+            logger.info("tool.decision.start: model=%s", decision_model)
+        except Exception:
+            pass
         decide = client.chat.completions.create(
-            model = "gpt-4o-mini",
+            model = decision_model,
             messages = messages,
             tools = tools,
-            tool_choice = "auto",
-            temperature = 0
+            tool_choice = "auto"
         )
         choice = decide.choices[0]
         tool_calls = getattr(choice.message, "tool_calls", None)
+        try:
+            if tool_calls:
+                summaries = []
+                try:
+                    for tc in tool_calls:
+                        fname = getattr(getattr(tc, "function", None), "name", None)
+                        fargs = getattr(getattr(tc, "function", None), "arguments", None)
+                        if isinstance(fargs, str) and len(fargs) > 200:
+                            fargs = fargs[:200] + "...(truncated)"
+                        summaries.append({"name": fname, "arguments": fargs})
+                except Exception:
+                    summaries = ["unavailable"]
+                logger.info("tool.decision.result: tool_calls=%s", summaries)
+            else:
+                logger.info("tool.decision.result: no_tool_calls")
+        except Exception:
+            pass
 
         if tool_calls:
             try:
@@ -220,26 +229,68 @@ async def query_stream(payload: dict, request: Request):
                 if not isinstance(model_question, str) or not model_question.strip():
                     model_question = question
 
+                t0 = time.perf_counter()
+                try:
+                    trunc_q = model_question[:200] + ("...(truncated)" if len(model_question) > 200 else "")
+                    logger.info("tool.fetch_context.start: conv=%s question='%s'", conversation_id, trunc_q)
+                except Exception:
+                    pass
                 ctx = await _fetch_health_context(user_id, model_question)
+                # Localize SQL rows to the user's timezone for clearer model grounding
+                try:
+                    if isinstance(ctx, dict) and isinstance(ctx.get("sql"), dict):
+                        rows = ctx["sql"].get("rows")
+                        if isinstance(rows, list):
+                            ctx["sql"]["rows"] = _localize_rows(rows, user_tz)
+                except Exception:
+                    pass
+                try:
+                    dt = time.perf_counter() - t0
+                    num_rows = None
+                    num_ctx = None
+                    try:
+                        num_rows = len(ctx.get("sql", {}).get("rows", [])) if isinstance(ctx, dict) else None
+                    except Exception:
+                        num_rows = None
+                    try:
+                        num_ctx = len(ctx.get("vector", {}).get("semantic_contexts", [])) if isinstance(ctx, dict) else None
+                    except Exception:
+                        num_ctx = None
+                    logger.info("tool.fetch_context.done: conv=%s dt=%.3fs rows=%s contexts=%s", conversation_id, dt, num_rows, num_ctx)
+                except Exception:
+                    pass
                 messages.append({"role": "assistant", "tool_calls": tool_calls})
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
                     "content": json.dumps(ctx)
                 })
+                try:
+                    logger.info("tool.injected: conv=%s tool_call_id=%s", conversation_id, getattr(tool_call, "id", None))
+                except Exception:
+                    pass
             except Exception as e:
                 messages.append({
                     "role": "assistant",
                     "content": f"Tool error: {str(e)}"
                 })
+                try:
+                    logger.exception("tool.error: conv=%s err=%s", conversation_id, str(e))
+                except Exception:
+                    pass
 
         try:
+            try:
+                logger.info("stream.start: conv=%s provider=%s model=%s", conversation_id, provider, answer_model)
+            except Exception:
+                pass
             stream = client.chat.completions.create(
-                model = "gpt-5-mini",
+                model = answer_model,
                 messages = messages,
                 stream = True
             )
             full_response = ""
+            streamed_chars = 0
             for chunk in stream:
                 choice = chunk.choices[0]
                 delta = getattr(choice, "delta", None)
@@ -247,13 +298,23 @@ async def query_stream(payload: dict, request: Request):
                     content = getattr(delta, "content", None)
                     if isinstance(content, str) and content:
                         full_response += content
+                        streamed_chars += len(content)
                         yield f"data: {json.dumps({'content': content, 'done': False})}\n\n"
                 text_piece = getattr(choice, "text", None)
                 if isinstance(text_piece, str) and text_piece:
                     full_response += text_piece
+                    streamed_chars += len(text_piece)
                     yield f"data: {json.dumps({'content': text_piece, 'done': False})}\n\n"
+            try:
+                logger.info("stream.done: conv=%s chars=%d", conversation_id, streamed_chars)
+            except Exception:
+                pass
         except Exception as e:
             yield f"data: {json.dumps({'error': str(e), 'done': True})}\n\n"
+            try:
+                logger.exception("stream.error: conv=%s err=%s", conversation_id, str(e))
+            except Exception:
+                pass
             if session:
                 try:
                     session.close()
@@ -265,6 +326,10 @@ async def query_stream(payload: dict, request: Request):
         try:
             if session and full_response.strip():
                 create_chat_message(session, conversation_id, user_id, "assistant", full_response.strip())
+                try:
+                    logger.info("chat.persisted: conv=%s chars=%d", conversation_id, len(full_response.strip()))
+                except Exception:
+                    pass
         except Exception:
             pass
         if session:
@@ -325,41 +390,6 @@ def get_all_chat_messages(conversation_id: str, request: Request):
         ]
     finally:
         db_session.close()
-
-
-@router.post("/chat/stream/")
-async def chat_stream(request: ChatRequest, req: Request):
-    user = verify_clerk_jwt(req)
-    user_id = user['sub']
-
-    async def generate_stream():
-        session = SessionLocal()
-        try:
-            user_input_str = request.user_input
-            save_conversation, _, new_conversation_id = setup_conversation_history(
-                request.conversation_id, user_input_str, user_id, session, chat_agent
-            )
-            conversation_id = new_conversation_id or request.conversation_id
-            try:
-                yield f"data: {json.dumps({'conversation_id': conversation_id, 'content': '', 'done': False})}\n\n"
-            except Exception:
-                pass
-            try:
-                response = chat_agent.chat_stream(
-                    user_id,
-                    provider=request.provider,
-                    model_override=request.model,
-                    conversation_id=conversation_id,
-                    session=session
-                )
-                for event in process_streaming_response(response, save_conversation, None):
-                    yield event
-            except Exception as e:
-                yield f"data: {json.dumps({'error': str(e), 'done': True})}\n\n"
-        finally:
-            session.close()
-
-    return create_streaming_response(generate_stream)
 
 
 @router.post("/chat/add-message/")

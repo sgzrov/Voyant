@@ -10,6 +10,8 @@ from Backend.services.embeddings.embedder import Embedder
 def vector_search(user_id: str, query_text: str, limit: int = 5) -> Dict[str, Any]:
     embedder = Embedder()
     query_embedding = embedder.embed(query_text)
+    # Pass embedding as text and cast to vector in SQL to avoid numeric[] type mismatch
+    vector_text = "[" + ",".join(str(x) for x in query_embedding) + "]"
     with SessionLocal() as session:
         res = session.execute(
             text(
@@ -17,11 +19,11 @@ def vector_search(user_id: str, query_text: str, limit: int = 5) -> Dict[str, An
                 SELECT summary_text, metrics
                 FROM health_summaries
                 WHERE user_id = :user_id
-                ORDER BY embedding <=> :query_embedding
+                ORDER BY embedding <=> CAST(:query_embedding_text AS vector)
                 LIMIT :limit
                 """
             ),
-            {"user_id": user_id, "query_embedding": query_embedding, "limit": limit},
+            {"user_id": user_id, "query_embedding_text": vector_text, "limit": limit},
         ).fetchall()
     return {
         "semantic_contexts": [row[0] for row in res],

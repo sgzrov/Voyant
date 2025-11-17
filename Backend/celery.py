@@ -15,7 +15,8 @@ def make_celery() -> Celery:
         timezone="UTC",
         enable_utc=True,
         imports=("Backend.background_tasks.csv_ingest",),
-        worker_concurrency = 2,
+        worker_concurrency = 1,
+        broker_connection_retry_on_startup = True,
     )
     return app
 
