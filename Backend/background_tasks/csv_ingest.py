@@ -13,6 +13,7 @@ import random
 from Backend.celery import celery
 from Backend.database import SessionLocal
 from Backend.services.embeddings.embedder import Embedder
+from Backend.services.ai.overview import compute_overview
 
 # Module logger
 logger = logging.getLogger(__name__)
@@ -324,6 +325,155 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> Dict:
                         except Exception:
                             logger.exception("Rollback failed after health_metrics error for user_id=%s", user_id)
         session.commit()
+    # Compute rollups and upsert into rollup tables
+    try:
+        if not df_metrics.empty:
+            dfm = df_metrics.copy()
+            dfm["timestamp"] = pd.to_datetime(dfm["timestamp"], utc = True)
+            # 5-minute (last 14 days)
+            t_cut_5 = now_ts - pd.Timedelta(days = 14)
+            df5 = dfm[dfm["timestamp"] >= t_cut_5].copy()
+            if not df5.empty:
+                df5.set_index("timestamp", inplace = True)
+                parts = []
+                for metric, g in df5.groupby("metric_type"):
+                    agg = g["metric_value"].resample("5T").agg(["mean", "sum", "min", "max", "count"]).dropna(how="all")
+                    if not agg.empty:
+                        agg = agg.reset_index().rename(columns={"timestamp": "bucket_ts"})
+                        agg["metric_type"] = metric
+                        parts.append(agg)
+                if parts:
+                    r5 = pd.concat(parts, ignore_index = True)
+                    with SessionLocal() as s5:
+                        params = [
+                            {
+                                "user_id": user_id,
+                                "bucket_ts": row["bucket_ts"].to_pydatetime(),
+                                "metric_type": row["metric_type"],
+                                "avg_value": float(row["mean"]) if pd.notna(row["mean"]) else None,
+                                "sum_value": float(row["sum"]) if pd.notna(row["sum"]) else None,
+                                "min_value": float(row["min"]) if pd.notna(row["min"]) else None,
+                                "max_value": float(row["max"]) if pd.notna(row["max"]) else None,
+                                "n": int(row["count"]) if pd.notna(row["count"]) else None,
+                            }
+                            for _, row in r5.iterrows()
+                        ]
+                        if params:
+                            s5.execute(
+                                text(
+                                    """
+                                    INSERT INTO health_rollup_5min
+                                      (user_id, bucket_ts, metric_type, avg_value, sum_value, min_value, max_value, n)
+                                    VALUES
+                                      (:user_id, :bucket_ts, :metric_type, :avg_value, :sum_value, :min_value, :max_value, :n)
+                                    ON CONFLICT (user_id, metric_type, bucket_ts) DO UPDATE
+                                    SET
+                                      avg_value = COALESCE(EXCLUDED.avg_value, health_rollup_5min.avg_value),
+                                      sum_value = COALESCE(EXCLUDED.sum_value, health_rollup_5min.sum_value),
+                                      min_value = COALESCE(EXCLUDED.min_value, health_rollup_5min.min_value),
+                                      max_value = COALESCE(EXCLUDED.max_value, health_rollup_5min.max_value),
+                                      n = COALESCE(EXCLUDED.n, health_rollup_5min.n)
+                                    """
+                                ),
+                                params,
+                            )
+                            s5.commit()
+            # Hourly (last 180 days)
+            t_cut_h = now_ts - pd.Timedelta(days = 180)
+            dfh = dfm[dfm["timestamp"] >= t_cut_h].copy()
+            if not dfh.empty:
+                dfh.set_index("timestamp", inplace = True)
+                parts_h = []
+                for metric, g in dfh.groupby("metric_type"):
+                    agg = g["metric_value"].resample("1H").agg(["mean", "sum", "min", "max", "count"]).dropna(how="all")
+                    if not agg.empty:
+                        agg = agg.reset_index().rename(columns={"timestamp": "bucket_ts"})
+                        agg["metric_type"] = metric
+                        parts_h.append(agg)
+                if parts_h:
+                    rh = pd.concat(parts_h, ignore_index = True)
+                    with SessionLocal() as sh:
+                        params = [
+                            {
+                                "user_id": user_id,
+                                "bucket_ts": row["bucket_ts"].to_pydatetime(),
+                                "metric_type": row["metric_type"],
+                                "avg_value": float(row["mean"]) if pd.notna(row["mean"]) else None,
+                                "sum_value": float(row["sum"]) if pd.notna(row["sum"]) else None,
+                                "min_value": float(row["min"]) if pd.notna(row["min"]) else None,
+                                "max_value": float(row["max"]) if pd.notna(row["max"]) else None,
+                                "n": int(row["count"]) if pd.notna(row["count"]) else None,
+                            }
+                            for _, row in rh.iterrows()
+                        ]
+                        if params:
+                            sh.execute(
+                                text(
+                                    """
+                                    INSERT INTO health_rollup_hourly
+                                      (user_id, bucket_ts, metric_type, avg_value, sum_value, min_value, max_value, n)
+                                    VALUES
+                                      (:user_id, :bucket_ts, :metric_type, :avg_value, :sum_value, :min_value, :max_value, :n)
+                                    ON CONFLICT (user_id, metric_type, bucket_ts) DO UPDATE
+                                    SET
+                                      avg_value = COALESCE(EXCLUDED.avg_value, health_rollup_hourly.avg_value),
+                                      sum_value = COALESCE(EXCLUDED.sum_value, health_rollup_hourly.sum_value),
+                                      min_value = COALESCE(EXCLUDED.min_value, health_rollup_hourly.min_value),
+                                      max_value = COALESCE(EXCLUDED.max_value, health_rollup_hourly.max_value),
+                                      n = COALESCE(EXCLUDED.n, health_rollup_hourly.n)
+                                    """
+                                ),
+                                params,
+                            )
+                            sh.commit()
+            # Daily (all available in dfm)
+            dfd = dfm.copy()
+            dfd.set_index("timestamp", inplace = True)
+            parts_d = []
+            for metric, g in dfd.groupby("metric_type"):
+                agg = g["metric_value"].resample("1D").agg(["mean", "sum", "min", "max", "count"]).dropna(how="all")
+                if not agg.empty:
+                    agg = agg.reset_index().rename(columns={"timestamp": "bucket_ts"})
+                    agg["metric_type"] = metric
+                    parts_d.append(agg)
+            if parts_d:
+                rd = pd.concat(parts_d, ignore_index = True)
+                with SessionLocal() as sd:
+                    params = [
+                        {
+                            "user_id": user_id,
+                            "bucket_ts": row["bucket_ts"].to_pydatetime(),
+                            "metric_type": row["metric_type"],
+                            "avg_value": float(row["mean"]) if pd.notna(row["mean"]) else None,
+                            "sum_value": float(row["sum"]) if pd.notna(row["sum"]) else None,
+                            "min_value": float(row["min"]) if pd.notna(row["min"]) else None,
+                            "max_value": float(row["max"]) if pd.notna(row["max"]) else None,
+                            "n": int(row["count"]) if pd.notna(row["count"]) else None,
+                        }
+                        for _, row in rd.iterrows()
+                    ]
+                    if params:
+                        sd.execute(
+                            text(
+                                """
+                                INSERT INTO health_rollup_daily
+                                  (user_id, bucket_ts, metric_type, avg_value, sum_value, min_value, max_value, n)
+                                VALUES
+                                  (:user_id, :bucket_ts, :metric_type, :avg_value, :sum_value, :min_value, :max_value, :n)
+                                ON CONFLICT (user_id, metric_type, bucket_ts) DO UPDATE
+                                SET
+                                  avg_value = COALESCE(EXCLUDED.avg_value, health_rollup_daily.avg_value),
+                                  sum_value = COALESCE(EXCLUDED.sum_value, health_rollup_daily.sum_value),
+                                  min_value = COALESCE(EXCLUDED.min_value, health_rollup_daily.min_value),
+                                  max_value = COALESCE(EXCLUDED.max_value, health_rollup_daily.max_value),
+                                  n = COALESCE(EXCLUDED.n, health_rollup_daily.n)
+                                """
+                            ),
+                            params,
+                        )
+                        sd.commit()
+    except Exception:
+        logger.exception("Failed computing rollups for user_id=%s", user_id)
     # Derive health_sessions from workout events (one session per workout timestamp/type)
     try:
         df_w = df_events[df_events["metric_type"].str.startswith("workout_", na=False)].copy()
@@ -599,6 +749,13 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> Dict:
     except Exception:
         logger.exception("Failed to infer sessions from metrics for user_id=%s", user_id)
     logger.info("process_csv_upload: done user_id=%s metrics=%s events=%s summaries=%s", user_id, len(df_metrics), len(df_events), len(summaries))
-    return {"inserted": len(summaries)}  # for monitoring
+    # Refresh overview cache
+    try:
+        overview = compute_overview(user_id)
+        logger.info("process_csv_upload: overview refreshed keys=%s", list(overview.keys()))
+    except Exception:
+        logger.exception("Failed to compute overview for user_id=%s", user_id)
+        overview = None
+    return {"inserted": len(summaries), "overview": bool(overview)}  # for monitoring
 
 

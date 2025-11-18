@@ -96,4 +96,25 @@ class AgentBackendService {
         request.setValue(TimeZone.current.identifier, forHTTPHeaderField: "X-User-TZ")
         return try await sseService.streamSSE(request: request)
     }
+
+    // MARK: - Overview
+    func getHealthOverview() async throws -> [String: Any] {
+        let request = try await authService.authenticatedRequest(for: "/health/overview", method: "GET")
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw NSError(domain: "overview", code: -1, userInfo: [NSLocalizedDescriptionKey: "Overview fetch failed"])
+        }
+        let obj = try JSONSerialization.jsonObject(with: data, options: []) as? [String: Any]
+        return obj ?? [:]
+    }
+
+    func refreshHealthOverview() async throws -> [String: Any] {
+        let request = try await authService.authenticatedRequest(for: "/health/overview/refresh", method: "POST")
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw NSError(domain: "overview", code: -2, userInfo: [NSLocalizedDescriptionKey: "Overview refresh failed"])
+        }
+        let obj = try JSONSerialization.jsonObject(with: data, options: []) as? [String: Any]
+        return obj ?? [:]
+    }
 }

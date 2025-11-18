@@ -52,6 +52,15 @@ class BackendService {
     func healthQuery(question: String) async throws -> AsyncStream<String> {
         return try await agentService.healthQueryStream(question: question)
     }
+
+    // MARK: - Overview
+    func getHealthOverview() async throws -> [String: Any] {
+        return try await agentService.getHealthOverview()
+    }
+
+    func refreshHealthOverview() async throws -> [String: Any] {
+        return try await agentService.refreshHealthOverview()
+    }
 }
 
 extension BackendService {

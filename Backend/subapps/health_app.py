@@ -18,6 +18,7 @@ from Backend.auth import verify_clerk_jwt
 from Backend.background_tasks.csv_ingest import process_csv_upload
 from Backend.services.ai.vector import vector_search
 from Backend.services.ai.sql_gen import execute_generated_sql
+from Backend.services.ai.overview import compute_overview, get_cached_overview
 from Backend.database import SessionLocal
 from Backend.crud.chat import get_chat_history, create_chat_message
 from Backend.models.chat_data_model import ChatsDB
@@ -152,6 +153,19 @@ async def query_stream(payload: dict, request: Request):
     if not isinstance(question, str) or not question.strip():
         raise HTTPException(status_code = 400, detail = "Missing question")
 
+    def _is_overview_question(q: str) -> bool:
+        ql = q.strip().lower()
+        keywords = [
+            "how's my health",
+            "how is my health",
+            "overall health",
+            "health overview",
+            "health summary",
+            "how am i doing",
+            "general health",
+        ]
+        return any(k in ql for k in keywords)
+
     async def generator():
         client = _openai_compatible_client(provider)
         prompt_path = pathlib.Path(__file__).resolve().parents[1] / "resources" / "chat_prompt.txt"
@@ -203,6 +217,74 @@ async def query_stream(payload: dict, request: Request):
             yield f"data: {json.dumps({'conversation_id': conversation_id, 'content': '', 'done': False})}\n\n"
         except Exception:
             pass
+
+        # Fast path: overview intent → use cached overview + 2-3 vector snippets; skip tool calls
+        if _is_overview_question(question):
+            try:
+                ov = get_cached_overview(user_id)
+                if not ov:
+                    ov_json = compute_overview(user_id)
+                else:
+                    ov_json = ov.get("summary_json") or {}
+            except Exception:
+                ov_json = {}
+            try:
+                vec_ctx = vector_search(user_id, "overall health last 30 days", limit = 3)
+            except Exception:
+                vec_ctx = {"semantic_contexts": []}
+            # Inject compact context for narration
+            context_payload = {
+                "overview": ov_json,
+                "semantic_contexts": vec_ctx.get("semantic_contexts", [])[:3],
+            }
+            messages.append({
+                "role": "assistant",
+                "content": "Using the following structured context, write a concise, user-friendly health overview. Avoid listing too many numbers; focus on top changes and notable anomalies."
+            })
+            messages.append({
+                "role": "user",
+                "content": json.dumps(context_payload)
+            })
+            try:
+                stream = client.chat.completions.create(
+                    model = answer_model,
+                    messages = messages,
+                    stream = True
+                )
+                full_response = ""
+                streamed_chars = 0
+                for chunk in stream:
+                    choice = chunk.choices[0]
+                    delta = getattr(choice, "delta", None)
+                    if delta is not None:
+                        content = getattr(delta, "content", None)
+                        if isinstance(content, str) and content:
+                            full_response += content
+                            streamed_chars += len(content)
+                            yield f"data: {json.dumps({'content': content, 'done': False})}\n\n"
+                    text_piece = getattr(choice, "text", None)
+                    if isinstance(text_piece, str) and text_piece:
+                        full_response += text_piece
+                        streamed_chars += len(text_piece)
+                        yield f"data: {json.dumps({'content': text_piece, 'done': False})}\n\n"
+                if session and full_response.strip():
+                    try:
+                        create_chat_message(session, conversation_id, user_id, "assistant", full_response.strip())
+                    except Exception:
+                        pass
+                yield f"data: {json.dumps({'content': '', 'done': True})}\n\n"
+                if session:
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
+                return
+            except Exception as e:
+                try:
+                    logger.exception("overview.stream.error: conv=%s err=%s", conversation_id, str(e))
+                except Exception:
+                    pass
+                # Fall through to tool path on failure
 
         try:
             logger.info("tool.decision.start: model=%s", decision_model)
@@ -361,6 +443,31 @@ async def query_stream(payload: dict, request: Request):
         yield f"data: {json.dumps({'content': '', 'done': True})}\n\n"
 
     return StreamingResponse(generator(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+
+
+@router.get("/health/overview")
+def get_health_overview(request: Request):
+    user = verify_clerk_jwt(request)
+    user_id = user["sub"]
+    ov = get_cached_overview(user_id)
+    if not ov:
+        try:
+            summary = compute_overview(user_id)
+            return {"summary_json": summary, "generated": True}
+        except Exception as e:
+            raise HTTPException(status_code = 500, detail = f"Failed to compute overview: {e}")
+    return ov
+
+
+@router.post("/health/overview/refresh")
+def refresh_health_overview(request: Request):
+    user = verify_clerk_jwt(request)
+    user_id = user["sub"]
+    try:
+        summary = compute_overview(user_id)
+        return {"summary_json": summary, "generated": True}
+    except Exception as e:
+        raise HTTPException(status_code = 500, detail = f"Failed to compute overview: {e}")
 
 
 @router.get("/chat/retrieve-chat-sessions/")

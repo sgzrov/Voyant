@@ -10,7 +10,7 @@ from Backend.services.embeddings.embedder import Embedder
 logger = logging.getLogger(__name__)
 
 
-def vector_search(user_id: str, query_text: str, limit: int = 5) -> Dict[str, Any]:
+def vector_search(user_id: str, query_text: str, limit: int = 3) -> Dict[str, Any]:
     embedder = Embedder()
     query_embedding = embedder.embed(query_text)
     # Pass embedding as text and cast to vector in SQL to avoid numeric[] type mismatch
