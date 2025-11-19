@@ -129,6 +129,10 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> Dict:
     logger.info("process_csv_upload: start user_id=%s bytes=%s", user_id, len(csv_bytes_b4) if isinstance(csv_bytes_b4, (bytes, bytearray)) else "unknown")
     raw = base64.b64decode(csv_bytes_b4)
     df = _parse_csv_bytes(raw)
+    # Normalize timestamps to tz-aware UTC once up-front
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc = True, errors = "coerce")
+    if "created_at" in df.columns:
+        df["created_at"] = pd.to_datetime(df["created_at"], utc = True, errors = "coerce")
     df = df[df["user_id"] == user_id]
     if df.empty:
         logger.info("process_csv_upload: no rows for user_id=%s after filter; nothing to insert", user_id)
@@ -329,15 +333,22 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> Dict:
     try:
         if not df_metrics.empty:
             dfm = df_metrics.copy()
-            dfm["timestamp"] = pd.to_datetime(dfm["timestamp"], utc = True)
             # 5-minute (last 14 days)
             t_cut_5 = now_ts - pd.Timedelta(days = 14)
             df5 = dfm[dfm["timestamp"] >= t_cut_5].copy()
             if not df5.empty:
                 df5.set_index("timestamp", inplace = True)
                 parts = []
+                removed_5 = 0
+                kept_5 = 0
                 for metric, g in df5.groupby("metric_type"):
-                    agg = g["metric_value"].resample("5T").agg(["mean", "sum", "min", "max", "count"]).dropna(how="all")
+                    raw = g["metric_value"].resample("5T").agg(["mean", "sum", "min", "max", "count"])
+                    before = len(raw)
+                    # keep only buckets with at least one sample
+                    agg = raw[raw["count"] > 0].dropna(how="all")
+                    after = len(agg)
+                    removed_5 += max(0, before - after)
+                    kept_5 += max(0, after)
                     if not agg.empty:
                         agg = agg.reset_index().rename(columns={"timestamp": "bucket_ts"})
                         agg["metric_type"] = metric
@@ -384,8 +395,15 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> Dict:
             if not dfh.empty:
                 dfh.set_index("timestamp", inplace = True)
                 parts_h = []
+                removed_h = 0
+                kept_h = 0
                 for metric, g in dfh.groupby("metric_type"):
-                    agg = g["metric_value"].resample("1H").agg(["mean", "sum", "min", "max", "count"]).dropna(how="all")
+                    raw = g["metric_value"].resample("1H").agg(["mean", "sum", "min", "max", "count"])
+                    before = len(raw)
+                    agg = raw[raw["count"] > 0].dropna(how="all")
+                    after = len(agg)
+                    removed_h += max(0, before - after)
+                    kept_h += max(0, after)
                     if not agg.empty:
                         agg = agg.reset_index().rename(columns={"timestamp": "bucket_ts"})
                         agg["metric_type"] = metric
@@ -430,8 +448,15 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> Dict:
             dfd = dfm.copy()
             dfd.set_index("timestamp", inplace = True)
             parts_d = []
+            removed_d = 0
+            kept_d = 0
             for metric, g in dfd.groupby("metric_type"):
-                agg = g["metric_value"].resample("1D").agg(["mean", "sum", "min", "max", "count"]).dropna(how="all")
+                raw = g["metric_value"].resample("1D").agg(["mean", "sum", "min", "max", "count"])
+                before = len(raw)
+                agg = raw[raw["count"] > 0].dropna(how="all")
+                after = len(agg)
+                removed_d += max(0, before - after)
+                kept_d += max(0, after)
                 if not agg.empty:
                     agg = agg.reset_index().rename(columns={"timestamp": "bucket_ts"})
                     agg["metric_type"] = metric

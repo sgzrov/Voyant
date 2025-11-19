@@ -13,11 +13,14 @@ from Backend.database import SessionLocal
 
 logger = logging.getLogger(__name__)
 
+# Cap the number of rows returned from generated SQL (keeps responses concise).
+MAX_SQL_ROWS = 60
+
 def _extract_sql_from_text(text: str) -> str:
     """
     Extract a bare SQL statement from LLM output.
     - Strips ```sql ... ``` fences if present
-    - Trims any prose before the first SELECT
+    - Trims any prose before the first WITH or SELECT (preserve CTEs)
     """
     if not isinstance(text, str):
         return ""
@@ -32,10 +35,14 @@ def _extract_sql_from_text(text: str) -> str:
         if lines and lines[-1].strip().startswith("```"):
             lines = lines[:-1]
         s = "\n".join(lines).strip()
-    # Keep from the first SELECT onward
-    idx = s.lower().find("select")
-    if idx >= 0:
-        s = s[idx:]
+    # Keep from the first top-level keyword start: WITH or SELECT
+    m_with = re.search(r"(?is)^\s*with\b", s)
+    if m_with:
+        s = s[m_with.start():]
+    else:
+        m_select = re.search(r"(?is)\bselect\b", s)
+        if m_select:
+            s = s[m_select.start():]
     return s.strip()
 
 load_dotenv()
@@ -45,7 +52,7 @@ def _load_schema_prompt() -> str:
     prompt_path = Path(__file__).resolve().parents[2] / "resources" / "sql_schema_prompt.txt"
     return prompt_path.read_text(encoding = "utf-8")
 
-# Make generated SQL safe and scoped: require top-level SELECT, user_id = :user_id, and LIMIT 200
+# Make generated SQL safe and scoped: require top-level SELECT, user_id = :user_id, and LIMIT MAX_SQL_ROWS
 def _sanitize_sql(sql: str) -> str:
     original = sql.strip()
     if original.endswith(";"):
@@ -168,7 +175,7 @@ def _sanitize_sql(sql: str) -> str:
                 limit_idx = i
             elif token == "union":
                 has_union_top = True
-            elif token == "with" and first_token is None:
+            elif token == "with":
                 has_with_top = True
 
             i = j
@@ -180,9 +187,9 @@ def _sanitize_sql(sql: str) -> str:
         # Allow CTEs starting with WITH, but we will not rewrite those safely
         raise ValueError("Only SELECT is allowed")
 
-    if has_with_top or has_union_top:
-        # Safer to reject rather than incorrectly rewriting complex top-level structures
-        raise ValueError("Complex queries (WITH/UNION) are not allowed")
+    if has_union_top:
+        # Safer to reject UNION at top level for now
+        raise ValueError("Complex queries (UNION) are not allowed")
 
     if has_semicolon_outside:
         raise ValueError("Multiple statements are not allowed")
@@ -191,25 +198,131 @@ def _sanitize_sql(sql: str) -> str:
     clause_starts = [pos for pos in [group_idx, order_idx, limit_idx] if pos >= 0]
     next_clause_start = min(clause_starts) if clause_starts else len(s)
 
-    # If WHERE exists, ensure user_id predicate present in top-level WHERE span
-    if where_idx >= 0:
-        where_body = s[where_idx:next_clause_start]
-        if not re.search(r"(?is)\buser_id\s*=\s*:user_id\b", where_body):
-            where_keyword_end = where_idx + len("where")
-            s = s[:where_keyword_end] + " user_id = :user_id AND" + s[where_keyword_end:]
-    else:
-        # No WHERE: insert before the earliest of GROUP/ORDER/LIMIT or at end
-        insert_pos = next_clause_start
-        s = s[:insert_pos] + " WHERE user_id = :user_id" + s[insert_pos:]
+    # Detect if the query already scopes by user_id in a JOIN condition
+    has_join_scoped_user = bool(re.search(
+        r"(?is)\bjoin\b[\s\S]*?\bon\b[\s\S]*?\b[a-zA-Z_][\w]*\.user_id\s*=\s*:user_id\b", s
+    ))
+
+    # Skip injecting a top-level predicate if :user_id appears anywhere (e.g., inside CTEs)
+    references_user_param_anywhere = bool(re.search(r":user_id\b", s, flags=re.IGNORECASE))
+
+    # If WHERE exists, ensure user_id predicate present in top-level WHERE span,
+    # unless the query is already scoped via JOIN ... ON alias.user_id = :user_id, or
+    # :user_id appears elsewhere (e.g., inside CTEs).
+    if not references_user_param_anywhere:
+        if where_idx >= 0:
+            where_body = s[where_idx:next_clause_start]
+            has_where_user = bool(re.search(r"(?is)\buser_id\s*=\s*:user_id\b", where_body))
+            if not has_where_user and not has_join_scoped_user:
+                where_keyword_end = where_idx + len("where")
+                # Ensure a space after AND to avoid token merging with the following predicate
+                s = s[:where_keyword_end] + " user_id = :user_id AND " + s[where_keyword_end:]
+        else:
+            # No WHERE: insert before the earliest of GROUP/ORDER/LIMIT or at end
+            # Skip insertion if already appropriately scoped in a JOIN condition
+            if not has_join_scoped_user:
+                insert_pos = next_clause_start
+                # Add a trailing space so the next token (e.g., ORDER) doesn't merge into :user_id
+                s = s[:insert_pos] + " WHERE user_id = :user_id " + s[insert_pos:]
 
     # Ensure top-level LIMIT present
     if limit_idx < 0:
-        s = s + " LIMIT 200"
+        s = s + f" LIMIT {MAX_SQL_ROWS}"
+    else:
+        # Clamp an existing top-level LIMIT to MAX_SQL_ROWS (best-effort, only if a simple numeric follows)
+        try:
+            # Only look at the suffix from the detected top-level LIMIT onwards
+            suffix = s[limit_idx:]
+            m = re.search(r"(?is)\blimit\s+(\d+)\b", suffix)
+            if m:
+                current_limit = int(m.group(1))
+                if current_limit > MAX_SQL_ROWS:
+                    start, end = m.span(1)
+                    # Replace the numeric part only within the suffix, then reassemble
+                    new_suffix = suffix[:start] + str(MAX_SQL_ROWS) + suffix[end:]
+                    s = s[:limit_idx] + new_suffix
+        except Exception:
+            # If clamping fails, leave as-is; post-exec trimming will still enforce MAX_SQL_ROWS in memory
+            pass
+
+    # Prefer real measurements from rollups by excluding empty buckets by default.
+    # We only add "AND n > 0" when the query touches a health_rollup_* table AND
+    # the SQL does NOT explicitly reason about missing data (n = 0 / n IS NULL / COALESCE(n,...) = 0).
+    try:
+        uses_rollup = bool(re.search(r"(?is)\bfrom\s+health_rollup_(5min|hourly|daily)\b", s))
+        mentions_missing_n = bool(re.search(r"(?is)\bn\s*=\s*0\b|\bn\s+is\s+null\b|coalesce\s*\([^)]*\bn[^)]*\)\s*=\s*0", s))
+        already_filters_n_pos = bool(re.search(r"(?is)\bn\s*>\s*0\b", s))
+        if uses_rollup and not mentions_missing_n and not already_filters_n_pos:
+            # Find the LAST WHERE (closest to end) to avoid matching WHEREs in earlier CTEs/subqueries
+            where_matches = list(re.finditer(r"(?is)\bwhere\b", s))
+            m_where_last = where_matches[-1] if where_matches else None
+            # Find clause boundaries that APPEAR AFTER the chosen WHERE (or from the start if no WHERE)
+            start_idx = m_where_last.end() if m_where_last else 0
+            m_order_after = re.search(r"(?is)\border\s+by\b", s[start_idx:])
+            m_group_after = re.search(r"(?is)\bgroup\s+by\b", s[start_idx:])
+            m_limit_after = re.search(r"(?is)\blimit\b", s[start_idx:])
+            # Compute absolute indices
+            clause_indices = []
+            for m in [m_group_after, m_order_after, m_limit_after]:
+                if m:
+                    clause_indices.append(start_idx + m.start())
+            insert_pos = min(clause_indices) if clause_indices else len(s)
+            if m_where_last:
+                # Append to existing WHERE just before the next clause (or end)
+                s = s[:insert_pos] + " AND n > 0 " + s[insert_pos:]
+            else:
+                # No WHERE: inject WHERE before LIMIT/ORDER/GROUP if present; otherwise at end
+                s = s[:insert_pos] + " WHERE n > 0 " + s[insert_pos:]
+    except Exception:
+        # Best-effort; if anything goes wrong, skip injection
+        pass
+
+    # Rewrite improper HAVING without GROUP BY into an outer WHERE on a subquery,
+    # so alias filters like HAVING prev_value ... become valid.
+    try:
+        m_having = re.search(r"(?is)\bhaving\b", s)
+        if m_having:
+            # Check if there's a GROUP BY at top-level (rough check: presence of ' group by ' before ORDER/LIMIT)
+            m_group_any = re.search(r"(?is)\bgroup\s+by\b", s)
+            if not m_group_any:
+                # Extract the HAVING condition up to ORDER BY / LIMIT or end
+                start_cond = m_having.end()
+                m_order_after = re.search(r"(?is)\border\s+by\b", s[start_cond:])
+                m_limit_after = re.search(r"(?is)\blimit\b", s[start_cond:])
+                end_cond_candidates = []
+                if m_order_after:
+                    end_cond_candidates.append(start_cond + m_order_after.start())
+                if m_limit_after:
+                    end_cond_candidates.append(start_cond + m_limit_after.start())
+                end_cond = min(end_cond_candidates) if end_cond_candidates else len(s)
+                having_condition = s[start_cond:end_cond].strip()
+                base_sql = s[:m_having.start()].rstrip()
+                trailing_clauses = s[end_cond:]
+                # Build the wrapped query
+                s = f"SELECT * FROM ({base_sql}) AS sub WHERE {having_condition} {trailing_clauses}"
+    except Exception:
+        # If the rewrite fails, keep original SQL (the executor may still reject invalid forms)
+        pass
 
     # Normalize risky numeric casts produced by the model:
     # JSON values may contain decimals (e.g., "1465.0691") which fail for ::int.
     # Prefer ::float for aggregates; callers can round if needed.
     s = re.sub(r"::\s*(int|integer)\b", "::float", s, flags=re.IGNORECASE)
+
+    # Guardrail: some queries mistakenly filter inferred sessions via session_type='inferred'.
+    # Our schema uses session_type for modality (running/walking/...) and source='inferred'|'workout'.
+    # When the query touches health_sessions, rewrite that specific predicate.
+    try:
+        if re.search(r"(?is)\bfrom\s+health_sessions\b", s):
+            s_new = re.sub(r"(?is)\bsession_type\s*=\s*'inferred'\b", "source = 'inferred'", s)
+            if s_new != s:
+                s = s_new
+                try:
+                    logging.getLogger(__name__).info("sql.rewrite.sessions: replaced session_type='inferred' with source='inferred'")
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
     # If the query targets health_metrics but uses JSON metrics->>'...' syntax,
     # rewrite those JSON extracts to aggregate over rows by metric_type.
@@ -275,7 +388,8 @@ def execute_generated_sql(user_id: str, question: str) -> Dict[str, Any]:
     with SessionLocal() as session:
         try:
             result = session.execute(text(safe_sql), {"user_id": user_id}).mappings().all()
-            rows = [dict(r) for r in result]
+            # Convert to dictionaries and trim to MAX_SQL_ROWS to keep downstream output concise
+            rows = [dict(r) for r in result][:MAX_SQL_ROWS]
             try:
                 logger.info("sql.exec: user_id=%s rows=%d", user_id, len(rows))
             except Exception:
