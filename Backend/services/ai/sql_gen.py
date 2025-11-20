@@ -355,12 +355,11 @@ def execute_generated_sql(user_id: str, question: str) -> Dict[str, Any]:
     client = OpenAI(api_key = os.getenv("OPENAI_API_KEY"))
     prompt = f"Question: {question}\nReturn only SQL."
     resp = client.chat.completions.create(
-        model = "gpt-4o-mini",
+        model = "gpt-5-mini",
         messages = [
             {"role": "system", "content": _load_schema_prompt()},
             {"role": "user", "content": prompt},
-        ],
-        temperature = 0.1,
+        ]
     )
     sql = resp.choices[0].message.content if resp.choices else ""
     try:

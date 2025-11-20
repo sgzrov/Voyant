@@ -4,9 +4,9 @@ import HealthKit
 struct HealthCSVExporter {
 
     // MARK: - Public API
-    // Generates CSV matching the required schema by querying ~20 HealthKit metrics.
-    // - Last 14 days: hourly
-    // - Previous 150 days: every 4 hours + daily aggregate
+    // Generates CSV for a metrics-only backend:
+    // - Last 60 days hourly: steps (SUM), active_energy_burned (SUM), heart_rate (AVG), oxygen_saturation (AVG optional), distances, active_time_minutes (SUM)
+    // - Last 60 days daily: sleep_hours (SUM, attach to bucket start), resting_heart_rate (AVG), hr_variability_sdnn (AVG)
     static func generateCSV(for userId: String, metrics requestedMetrics: [String], completion: @escaping (Result<Data, Error>) -> Void) {
         let healthStore = HKHealthStore()
         let tz = TimeZone.current.identifier
@@ -14,8 +14,7 @@ struct HealthCSVExporter {
         let iso = ISO8601DateFormatter()
 
         let now = Date()
-        guard let start164 = Calendar.current.date(byAdding: .day, value: -164, to: now),
-              let start14 = Calendar.current.date(byAdding: .day, value: -14, to: now) else {
+        guard let start60 = Calendar.current.date(byAdding: .day, value: -60, to: now) else {
             completion(.failure(NSError(domain: "csv", code: -1, userInfo: [NSLocalizedDescriptionKey: "Date math failed"])));
             return
         }
@@ -28,26 +27,18 @@ struct HealthCSVExporter {
         let encounteredError: Error? = nil
 
         for spec in specs {
-            // Choose intervals per metric:
-            // - heart_rate, oxygen_saturation: 1m (last 14), 30m (prev 150)
-            // - additive metrics (sum): 5m (last 14), 60m (prev 150)
-            // - other continuous: 5m (last 14), 30m (prev 150)
-            let isHighFreq = (spec.name == "heart_rate" || spec.name == "oxygen_saturation")
-            let isAdditive = (spec.aggregation == .sum)
-            let interval14: DateComponents = isHighFreq
-                ? DateComponents(minute: 1)
-                : (isAdditive ? DateComponents(minute: 5) : DateComponents(minute: 5))
-            let interval150: DateComponents = isHighFreq
-                ? DateComponents(minute: 30)
-                : (isAdditive ? DateComponents(hour: 1) : DateComponents(minute: 30))
-            // Hourly for last 14 days
+            // Decide bucket size: daily for sleep/rhr/hrv, hourly for others
+            let isDaily = (spec.name == "sleep_hours" || spec.name == "resting_heart_rate" || spec.name == "hr_variability_sdnn")
+            let interval = isDaily ? DateComponents(day: 1) : DateComponents(hour: 1)
+
+            // Single window: last 60 days
             group.enter()
             queryQuantityOrCategory(
                 healthStore: healthStore,
                 spec: spec,
-                start: start14,
+                start: start60,
                 end: now,
-                interval: interval14,
+                interval: interval,
                 aggregation: spec.aggregation
             ) { result in
                 switch result {
@@ -58,29 +49,7 @@ struct HealthCSVExporter {
                     }
                 case .failure(let error):
                     // Non-fatal: ignore per-metric authorization or data errors
-                    print("[HealthCSVExporter] hourly last14 '\(spec.name)' error: \(error.localizedDescription)")
-                }
-                group.leave()
-            }
-
-            // Every 4 hours for previous 150 days
-            group.enter()
-            queryQuantityOrCategory(
-                healthStore: healthStore,
-                spec: spec,
-                start: start164,
-                end: start14,
-                interval: interval150,
-                aggregation: spec.aggregation
-            ) { result in
-                switch result {
-                case .success(let points):
-                    points.forEach { p in
-                        let line = "\(userId),\(iso.string(from: p.timestamp)),\(spec.name),\(formatValue(p.value)),\(spec.unitLabel),\(p.source),\(tz),\(createdAt)"
-                        rows.append(line)
-                    }
-                case .failure(let error):
-                    print("[HealthCSVExporter] four-hour prev150 '\(spec.name)' error: \(error.localizedDescription)")
+                    print("[HealthCSVExporter] window60 '\(spec.name)' error: \(error.localizedDescription)")
                 }
                 group.leave()
             }
@@ -89,7 +58,7 @@ struct HealthCSVExporter {
         // MARK: - Workouts + simple events
         group.enter()
         let workoutType = HKObjectType.workoutType()
-        let workoutPredicate = HKQuery.predicateForSamples(withStart: start164, end: now, options: .strictStartDate)
+        let workoutPredicate = HKQuery.predicateForSamples(withStart: start60, end: now, options: .strictStartDate)
         let sort = NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)
         let workoutQuery = HKSampleQuery(sampleType: workoutType, predicate: workoutPredicate, limit: HKObjectQueryNoLimit, sortDescriptors: [sort]) { _, samples, error in
             defer { group.leave() }

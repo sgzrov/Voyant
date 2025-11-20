@@ -9,14 +9,13 @@ from typing import Optional
 from fastapi import APIRouter, UploadFile, File, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from openai import OpenAI
-from sqlalchemy import func
+from sqlalchemy import func, text
 from datetime import timezone
 from zoneinfo import ZoneInfo
 import time
 
 from Backend.auth import verify_clerk_jwt
 from Backend.background_tasks.csv_ingest import process_csv_upload
-from Backend.services.ai.vector import vector_search
 from Backend.services.ai.sql_gen import execute_generated_sql
 from Backend.database import SessionLocal
 from Backend.crud.chat import get_chat_history, create_chat_message
@@ -25,10 +24,11 @@ from Backend.models.chat_data_model import ChatsDB
 
 async def _fetch_health_context(user_id: str, question: str):
     loop = asyncio.get_running_loop()
-    vec_task = loop.run_in_executor(None, vector_search, user_id, question)
     sql_task = loop.run_in_executor(None, execute_generated_sql, user_id, question)
-    vec_res, sql_res = await asyncio.gather(vec_task, sql_task)
-    return {"sql": sql_res, "vector": vec_res}
+    sql_res = await asyncio.gather(sql_task)
+    # gather returns a list; extract item
+    sql_out = sql_res[0] if isinstance(sql_res, (list, tuple)) else sql_res
+    return {"sql": sql_out}
 
 
 router = APIRouter()
@@ -201,7 +201,7 @@ async def query_stream(payload: dict, request: Request):
             "type": "function",
             "function": {
                 "name": "fetch_health_context",
-                "description": "Fetch both SQL rows (exact numbers) and vector summaries (context) for a health question. Call at most once.",
+                "description": "Fetch SQL rows (exact numbers) for a health question. Call at most once.",
                 "parameters": {
                     "type": "object",
                     "properties": {"question": {"type": "string"}},
@@ -284,19 +284,51 @@ async def query_stream(payload: dict, request: Request):
                             ctx["sql"]["rows"] = _localize_rows(rows, user_tz)
                 except Exception:
                     pass
+                # If no rows, compute simple coverage counts to help the model explain what's missing
+                try:
+                    if isinstance(ctx, dict) and isinstance(ctx.get("sql"), dict):
+                        rows = ctx["sql"].get("rows") or []
+                        if isinstance(rows, list) and len(rows) == 0:
+                            needs = ['steps','active_energy_burned','sleep_hours','resting_heart_rate','hr_variability_sdnn','active_time_minutes']
+                            with SessionLocal() as s_cov:
+                                cov = s_cov.execute(
+                                    text("""
+                                        WITH days AS (
+                                          SELECT generate_series(CURRENT_DATE - INTERVAL '60 days', CURRENT_DATE, '1 day')::date AS day
+                                        ),
+                                        daily AS (
+                                          SELECT timestamp::date AS day, metric_type,
+                                                 SUM(CASE WHEN metric_type IN ('steps','active_energy_burned','sleep_hours','active_time_minutes') THEN metric_value END) AS sum_v,
+                                                 AVG(CASE WHEN metric_type IN ('resting_heart_rate','hr_variability_sdnn','heart_rate') THEN metric_value END) AS avg_v
+                                          FROM health_metrics
+                                          WHERE user_id = :user_id
+                                            AND timestamp::date >= CURRENT_DATE - INTERVAL '60 days'
+                                          GROUP BY 1,2
+                                        )
+                                        SELECT m.metric_type,
+                                               COUNT(*) FILTER (WHERE d.day >= CURRENT_DATE - INTERVAL '30 days' AND (daily.sum_v IS NOT NULL OR daily.avg_v IS NOT NULL)) AS days_30,
+                                               COUNT(*) FILTER (WHERE d.day >= CURRENT_DATE - INTERVAL '60 days'
+                                                                AND d.day <  CURRENT_DATE - INTERVAL '30 days'
+                                                                AND (daily.sum_v IS NOT NULL OR daily.avg_v IS NOT NULL)) AS days_prev30
+                                        FROM (SELECT unnest(:metrics::text[]) AS metric_type) m
+                                        CROSS JOIN days d
+                                        LEFT JOIN daily ON daily.day = d.day AND daily.metric_type = m.metric_type
+                                        GROUP BY m.metric_type
+                                        ORDER BY m.metric_type
+                                    """),
+                                    {"user_id": user_id, "metrics": needs}
+                                ).mappings().all()
+                                ctx["sql"]["coverage"] = [dict(r) for r in cov]
+                except Exception:
+                    pass
                 try:
                     dt = time.perf_counter() - t0
                     num_rows = None
-                    num_ctx = None
                     try:
                         num_rows = len(ctx.get("sql", {}).get("rows", [])) if isinstance(ctx, dict) else None
                     except Exception:
                         num_rows = None
-                    try:
-                        num_ctx = len(ctx.get("vector", {}).get("semantic_contexts", [])) if isinstance(ctx, dict) else None
-                    except Exception:
-                        num_ctx = None
-                    logger.info("tool.fetch_context.done: conv=%s dt=%.3fs rows=%s contexts=%s", conversation_id, dt, num_rows, num_ctx)
+                    logger.info("tool.fetch_context.done: conv=%s dt=%.3fs rows=%s contexts=%s", conversation_id, dt, num_rows, 0)
                 except Exception:
                     pass
                 messages.append({"role": "assistant", "tool_calls": tool_calls})
