@@ -13,7 +13,7 @@ import random
 from Backend.celery import celery
 from Backend.database import SessionLocal
 from Backend.services.embeddings.embedder import Embedder
-from Backend.services.ai.overview import compute_overview
+# Overview feature removed; no import
 
 # Module logger
 logger = logging.getLogger(__name__)
@@ -333,64 +333,27 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> Dict:
     try:
         if not df_metrics.empty:
             dfm = df_metrics.copy()
-            # 5-minute (last 14 days)
-            t_cut_5 = now_ts - pd.Timedelta(days = 14)
-            df5 = dfm[dfm["timestamp"] >= t_cut_5].copy()
-            if not df5.empty:
-                df5.set_index("timestamp", inplace = True)
-                parts = []
-                removed_5 = 0
-                kept_5 = 0
-                for metric, g in df5.groupby("metric_type"):
-                    raw = g["metric_value"].resample("5T").agg(["mean", "sum", "min", "max", "count"])
-                    before = len(raw)
-                    # keep only buckets with at least one sample
-                    agg = raw[raw["count"] > 0].dropna(how="all")
-                    after = len(agg)
-                    removed_5 += max(0, before - after)
-                    kept_5 += max(0, after)
-                    if not agg.empty:
-                        agg = agg.reset_index().rename(columns={"timestamp": "bucket_ts"})
-                        agg["metric_type"] = metric
-                        parts.append(agg)
-                if parts:
-                    r5 = pd.concat(parts, ignore_index = True)
-                    with SessionLocal() as s5:
-                        params = [
-                            {
-                                "user_id": user_id,
-                                "bucket_ts": row["bucket_ts"].to_pydatetime(),
-                                "metric_type": row["metric_type"],
-                                "avg_value": float(row["mean"]) if pd.notna(row["mean"]) else None,
-                                "sum_value": float(row["sum"]) if pd.notna(row["sum"]) else None,
-                                "min_value": float(row["min"]) if pd.notna(row["min"]) else None,
-                                "max_value": float(row["max"]) if pd.notna(row["max"]) else None,
-                                "n": int(row["count"]) if pd.notna(row["count"]) else None,
-                            }
-                            for _, row in r5.iterrows()
-                        ]
-                        if params:
-                            s5.execute(
-                                text(
-                                    """
-                                    INSERT INTO health_rollup_5min
-                                      (user_id, bucket_ts, metric_type, avg_value, sum_value, min_value, max_value, n)
-                                    VALUES
-                                      (:user_id, :bucket_ts, :metric_type, :avg_value, :sum_value, :min_value, :max_value, :n)
-                                    ON CONFLICT (user_id, metric_type, bucket_ts) DO UPDATE
-                                    SET
-                                      avg_value = COALESCE(EXCLUDED.avg_value, health_rollup_5min.avg_value),
-                                      sum_value = COALESCE(EXCLUDED.sum_value, health_rollup_5min.sum_value),
-                                      min_value = COALESCE(EXCLUDED.min_value, health_rollup_5min.min_value),
-                                      max_value = COALESCE(EXCLUDED.max_value, health_rollup_5min.max_value),
-                                      n = COALESCE(EXCLUDED.n, health_rollup_5min.n)
-                                    """
-                                ),
-                                params,
-                            )
-                            s5.commit()
-            # Hourly (last 180 days)
-            t_cut_h = now_ts - pd.Timedelta(days = 180)
+            # Normalize oxygen saturation like '95%' → 95.0 and ensure numeric values for rollups
+            if "unit" in dfm.columns:
+                mask_o2 = dfm["metric_type"].isin(["oxygen_saturation", "blood_oxygen_saturation"])
+                # Strip trailing percent sign if present in the value
+                mask_pct = mask_o2 & dfm["metric_value"].astype(str).str.contains("%", na = False)
+                dfm.loc[mask_pct, "metric_value"] = (
+                    dfm.loc[mask_pct, "metric_value"].astype(str).str.replace("%", "", regex = False)
+                )
+            # Coerce to numeric (non-numeric → NaN so buckets with no numeric samples are skipped)
+            dfm["metric_value"] = pd.to_numeric(dfm["metric_value"], errors = "coerce")
+            # Metrics for which sum over time makes sense
+            ADD_METRICS = {
+                "steps",
+                "active_energy_burned",
+                "dietary_water",
+                "mindfulness_minutes",
+                "sleep_hours",
+                "active_time_minutes",
+            }
+            # Hourly (last 14 days)
+            t_cut_h = now_ts - pd.Timedelta(days = 14)
             dfh = dfm[dfm["timestamp"] >= t_cut_h].copy()
             if not dfh.empty:
                 dfh.set_index("timestamp", inplace = True)
@@ -417,7 +380,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> Dict:
                                 "bucket_ts": row["bucket_ts"].to_pydatetime(),
                                 "metric_type": row["metric_type"],
                                 "avg_value": float(row["mean"]) if pd.notna(row["mean"]) else None,
-                                "sum_value": float(row["sum"]) if pd.notna(row["sum"]) else None,
+                                "sum_value": float(row["sum"]) if (pd.notna(row["sum"]) and row["metric_type"] in ADD_METRICS) else None,
                                 "min_value": float(row["min"]) if pd.notna(row["min"]) else None,
                                 "max_value": float(row["max"]) if pd.notna(row["max"]) else None,
                                 "n": int(row["count"]) if pd.notna(row["count"]) else None,
@@ -470,7 +433,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> Dict:
                             "bucket_ts": row["bucket_ts"].to_pydatetime(),
                             "metric_type": row["metric_type"],
                             "avg_value": float(row["mean"]) if pd.notna(row["mean"]) else None,
-                            "sum_value": float(row["sum"]) if pd.notna(row["sum"]) else None,
+                            "sum_value": float(row["sum"]) if (pd.notna(row["sum"]) and row["metric_type"] in ADD_METRICS) else None,
                             "min_value": float(row["min"]) if pd.notna(row["min"]) else None,
                             "max_value": float(row["max"]) if pd.notna(row["max"]) else None,
                             "n": int(row["count"]) if pd.notna(row["count"]) else None,
@@ -634,14 +597,17 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> Dict:
                     res = s_chk.execute(
                         text(
                             """
-                            SELECT start_ts, session_type
+                            SELECT start_ts, end_ts, session_type
                             FROM health_sessions
                             WHERE user_id = :user_id AND source = 'workout'
                             """
                         ),
                         {"user_id": user_id},
                     )
-                    existing_workout_starts = {(r[0], r[1]) for r in res.fetchall()}
+                    rows_chk = res.fetchall()
+                    # Keep both start markers and full windows for overlap checks
+                    existing_workout_starts = {(r[0], r[2]) for r in rows_chk}
+                    existing_workout_windows = [(r[0], r[1]) for r in rows_chk]
                 inferred_sessions = []
                 inferred_slices = []
                 for _, row in df_p.iterrows():
@@ -678,6 +644,16 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> Dict:
                         v_swim = ((dsw_km / atm) * (1000.0 / 60.0)) if atm > 0 else 0.0
                         if v_swim >= 0.3:
                             session_type = "swimming"
+                    # Strength detection: low distance/steps with elevated HR or kcal intensity
+                    if session_type is None:
+                        total_distance_km = (dwr_km if dwr_km > 0 else 0.0) + (dcy_km if dcy_km > 0 else 0.0) + (dsw_km if dsw_km > 0 else 0.0)
+                        kcal_per_min = (kcal_v / atm) if atm > 0 else 0.0
+                        elevated_hr = avg_hr is not None and avg_hr >= 105.0
+                        elevated_intensity = kcal_per_min >= 4.0
+                        low_motion = total_distance_km <= 0.2 and steps < 800
+                        if low_motion and (elevated_hr or elevated_intensity):
+                            session_type = "strength"
+                    # Speed/steps-based fallback
                     if session_type is None:
                         if speed >= 1.8:
                             session_type = "running"
@@ -688,7 +664,14 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> Dict:
                     # Avoid creating inferred when a workout of same type starts at the same ts
                     if (ts, session_type) in existing_workout_starts:
                         continue
+                    # Respect workouts as source of truth: skip if any workout overlaps this window
                     end_ts = ts + pd.to_timedelta(atm, unit="m")
+                    try:
+                        has_overlap = any((ws_start <= end_ts and ws_end >= ts) for (ws_start, ws_end) in existing_workout_windows)
+                    except Exception:
+                        has_overlap = False
+                    if has_overlap:
+                        continue
                     # Prefer actual distance metrics; otherwise approximate from walking speed
                     distance_km = None
                     for dv in (dwr_km, dcy_km, dsw_km):
@@ -774,13 +757,6 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> Dict:
     except Exception:
         logger.exception("Failed to infer sessions from metrics for user_id=%s", user_id)
     logger.info("process_csv_upload: done user_id=%s metrics=%s events=%s summaries=%s", user_id, len(df_metrics), len(df_events), len(summaries))
-    # Refresh overview cache
-    try:
-        overview = compute_overview(user_id)
-        logger.info("process_csv_upload: overview refreshed keys=%s", list(overview.keys()))
-    except Exception:
-        logger.exception("Failed to compute overview for user_id=%s", user_id)
-        overview = None
-    return {"inserted": len(summaries), "overview": bool(overview)}  # for monitoring
+    return {"inserted": len(summaries)}
 
 

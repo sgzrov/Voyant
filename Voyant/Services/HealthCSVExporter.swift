@@ -28,6 +28,18 @@ struct HealthCSVExporter {
         let encounteredError: Error? = nil
 
         for spec in specs {
+            // Choose intervals per metric:
+            // - heart_rate, oxygen_saturation: 1m (last 14), 30m (prev 150)
+            // - additive metrics (sum): 5m (last 14), 60m (prev 150)
+            // - other continuous: 5m (last 14), 30m (prev 150)
+            let isHighFreq = (spec.name == "heart_rate" || spec.name == "oxygen_saturation")
+            let isAdditive = (spec.aggregation == .sum)
+            let interval14: DateComponents = isHighFreq
+                ? DateComponents(minute: 1)
+                : (isAdditive ? DateComponents(minute: 5) : DateComponents(minute: 5))
+            let interval150: DateComponents = isHighFreq
+                ? DateComponents(minute: 30)
+                : (isAdditive ? DateComponents(hour: 1) : DateComponents(minute: 30))
             // Hourly for last 14 days
             group.enter()
             queryQuantityOrCategory(
@@ -35,7 +47,7 @@ struct HealthCSVExporter {
                 spec: spec,
                 start: start14,
                 end: now,
-                interval: DateComponents(hour: 1),
+                interval: interval14,
                 aggregation: spec.aggregation
             ) { result in
                 switch result {
@@ -58,7 +70,7 @@ struct HealthCSVExporter {
                 spec: spec,
                 start: start164,
                 end: start14,
-                interval: DateComponents(hour: 4),
+                interval: interval150,
                 aggregation: spec.aggregation
             ) { result in
                 switch result {

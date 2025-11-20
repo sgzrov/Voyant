@@ -18,7 +18,6 @@ from Backend.auth import verify_clerk_jwt
 from Backend.background_tasks.csv_ingest import process_csv_upload
 from Backend.services.ai.vector import vector_search
 from Backend.services.ai.sql_gen import execute_generated_sql
-from Backend.services.ai.overview import compute_overview, get_cached_overview
 from Backend.database import SessionLocal
 from Backend.crud.chat import get_chat_history, create_chat_message
 from Backend.models.chat_data_model import ChatsDB
@@ -382,31 +381,6 @@ async def query_stream(payload: dict, request: Request):
         yield f"data: {json.dumps({'content': '', 'done': True})}\n\n"
 
     return StreamingResponse(generator(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
-
-
-@router.get("/health/overview")
-def get_health_overview(request: Request):
-    user = verify_clerk_jwt(request)
-    user_id = user["sub"]
-    ov = get_cached_overview(user_id)
-    if not ov:
-        try:
-            summary = compute_overview(user_id)
-            return {"summary_json": summary, "generated": True}
-        except Exception as e:
-            raise HTTPException(status_code = 500, detail = f"Failed to compute overview: {e}")
-    return ov
-
-
-@router.post("/health/overview/refresh")
-def refresh_health_overview(request: Request):
-    user = verify_clerk_jwt(request)
-    user_id = user["sub"]
-    try:
-        summary = compute_overview(user_id)
-        return {"summary_json": summary, "generated": True}
-    except Exception as e:
-        raise HTTPException(status_code = 500, detail = f"Failed to compute overview: {e}")
 
 
 @router.get("/chat/retrieve-chat-sessions/")
