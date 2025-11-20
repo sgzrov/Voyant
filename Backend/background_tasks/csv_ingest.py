@@ -9,6 +9,7 @@ import math
 from sqlalchemy import text
 import time
 import random
+from collections import defaultdict
 
 from Backend.celery import celery
 from Backend.database import SessionLocal
@@ -49,6 +50,41 @@ def _summarize(df: pd.DataFrame) -> List[Dict]:
         "workout_duration_min",
         "workout_energy_kcal",
     }
+    # Units for embedding-friendly facts strings; keep labels concise and canonical
+    UNIT_LABELS: Dict[str, str] = {
+        "heart_rate": "bpm",
+        "resting_heart_rate": "bpm",
+        "walking_hr_avg": "bpm",
+        "hr_variability_sdnn": "ms",
+        "steps": "steps",
+        "walking_speed": "m/s",
+        "vo2_max": "ml/kg/min",
+        "active_energy_burned": "kcal",
+        "distance_walking_running_km": "km",
+        "distance_cycling_km": "km",
+        "distance_swimming_km": "km",
+        "dietary_water": "L",
+        "body_mass": "kg",
+        "body_mass_index": "bmi",
+        "blood_glucose": "mg/dL",
+        "oxygen_saturation": "%",
+        "blood_pressure_systolic": "mmHg",
+        "blood_pressure_diastolic": "mmHg",
+        "respiratory_rate": "breaths/min",
+        "body_temperature": "°C",
+        "mindfulness_minutes": "min",
+        "sleep_hours": "hours",
+        "active_time_minutes": "min",
+        # Workout rollups for completeness
+        "workout_distance_km": "km",
+        "workout_duration_min": "min",
+        "workout_energy_kcal": "kcal",
+    }
+    def _fmt(k: str, v: float) -> str:
+        unit = UNIT_LABELS.get(k)
+        if unit:
+            return f"{k}={round(v, 2)} {unit}"
+        return f"{k}={round(v, 2)}"
 
     # Build a per-metric dict, choosing to use sum or average based on metric type
     def pivot_metrics(frame: pd.DataFrame) -> Dict:
@@ -71,10 +107,8 @@ def _summarize(df: pd.DataFrame) -> List[Dict]:
     if not df_last14.empty:
         for day, frame in df_last14.groupby("date"):
             metrics = pivot_metrics(frame)
-            text_summary = (
-                f"Daily summary for {day}: "
-                + ", ".join(f"{k}={round(v,2)}" for k, v in metrics.items())
-            )
+            # Compact, fact-centric string with explicit date, labels, and units for reliable retrieval
+            text_summary = f"{day}: " + ", ".join(_fmt(k, v) for k, v in metrics.items())
             rows.append(
                 {
                     "summary_type": "daily",
@@ -91,10 +125,7 @@ def _summarize(df: pd.DataFrame) -> List[Dict]:
         for week, frame in df_prev150.groupby("week_start"):
             end = max(frame["timestamp"]).date()
             metrics = pivot_metrics(frame)
-            text_summary = (
-                f"Weekly summary {week}-{end}: "
-                + ", ".join(f"{k}={round(v,2)}" for k, v in metrics.items())
-            )
+            text_summary = f"{week}-{end}: " + ", ".join(_fmt(k, v) for k, v in metrics.items())
             rows.append(
                 {
                     "summary_type": "weekly",
@@ -108,10 +139,7 @@ def _summarize(df: pd.DataFrame) -> List[Dict]:
     start = min(df["timestamp"]).date()
     end = max(df["timestamp"]).date()
     metrics = pivot_metrics(df)
-    text_summary = (
-        f"Global summary {start}–{end}: "
-        + ", ".join(f"{k} = {round(v,2)}" for k, v in metrics.items())
-    )
+    text_summary = f"{start}–{end}: " + ", ".join(_fmt(k, v) for k, v in metrics.items())
     rows.append(
         {
             "summary_type": "global",
@@ -520,6 +548,44 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> Dict:
                         continue
                     session_id = row[0]
                     created_sessions += 1
+                    # Upsert basic session features (drift metrics require fine-grain slices; set to NULL for now)
+                    try:
+                        flags = {}
+                        try:
+                            flags["fueling_gap"] = bool(duration_min is not None and duration_min >= 90 and (energy_kcal or 0.0) / max(duration_min, 1e-9) < 6.0)
+                        except Exception:
+                            flags["fueling_gap"] = None
+                        session2.execute(
+                            text(
+                                """
+                                INSERT INTO health_session_features
+                                  (session_id, user_id, modality, duration_min, distance_km, avg_hr, pace_drift_pct, hr_drift_slope, decoupling_pct, time_to_fatigue_min, kcal, flags)
+                                VALUES
+                                  (:session_id, :user_id, :modality, :duration_min, :distance_km, :avg_hr, NULL, NULL, NULL, NULL, :kcal, CAST(:flags AS JSONB))
+                                ON CONFLICT (session_id) DO UPDATE
+                                SET
+                                  user_id = EXCLUDED.user_id,
+                                  modality = EXCLUDED.modality,
+                                  duration_min = EXCLUDED.duration_min,
+                                  distance_km = EXCLUDED.distance_km,
+                                  avg_hr = COALESCE(EXCLUDED.avg_hr, health_session_features.avg_hr),
+                                  kcal = COALESCE(EXCLUDED.kcal, health_session_features.kcal),
+                                  flags = COALESCE(EXCLUDED.flags, health_session_features.flags)
+                                """
+                            ),
+                            {
+                                "session_id": session_id,
+                                "user_id": user_id,
+                                "modality": session_type,
+                                "duration_min": duration_min if duration_min > 0 else None,
+                                "distance_km": distance_km if distance_km > 0 else None,
+                                "avg_hr": avg_hr,
+                                "kcal": energy_kcal if energy_kcal > 0 else None,
+                                "flags": pd.Series(flags).to_json(),
+                            },
+                        )
+                    except Exception:
+                        logger.exception("Failed upserting session features for session_id=%s", session_id)
                     # Create a single aggregate slice (km if distance present, else a time slice)
                     slice_type = "km" if distance_km > 0 else "min"
                     # Determine slice duration; ensure NOT NULL for partitioned table
@@ -714,6 +780,44 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> Dict:
                         if not row_id:
                             continue
                         session_id = row_id[0]
+                        # Upsert basic session features for inferred session
+                        try:
+                            flags = {}
+                            try:
+                                flags["fueling_gap"] = bool(atm is not None and atm >= 90 and (kcal_v or 0.0) / max(atm, 1e-9) < 6.0)
+                            except Exception:
+                                flags["fueling_gap"] = None
+                            si.execute(
+                                text(
+                                    """
+                                    INSERT INTO health_session_features
+                                      (session_id, user_id, modality, duration_min, distance_km, avg_hr, pace_drift_pct, hr_drift_slope, decoupling_pct, time_to_fatigue_min, kcal, flags)
+                                    VALUES
+                                      (:session_id, :user_id, :modality, :duration_min, :distance_km, :avg_hr, NULL, NULL, NULL, NULL, :kcal, CAST(:flags AS JSONB))
+                                    ON CONFLICT (session_id) DO UPDATE
+                                    SET
+                                      user_id = EXCLUDED.user_id,
+                                      modality = EXCLUDED.modality,
+                                      duration_min = EXCLUDED.duration_min,
+                                      distance_km = EXCLUDED.distance_km,
+                                      avg_hr = COALESCE(EXCLUDED.avg_hr, health_session_features.avg_hr),
+                                      kcal = COALESCE(EXCLUDED.kcal, health_session_features.kcal),
+                                      flags = COALESCE(EXCLUDED.flags, health_session_features.flags)
+                                    """
+                                ),
+                                {
+                                    "session_id": session_id,
+                                    "user_id": user_id,
+                                    "modality": session_type,
+                                    "duration_min": float(atm) if atm and atm > 0 else None,
+                                    "distance_km": float(distance_km) if distance_km and distance_km > 0 else None,
+                                    "avg_hr": avg_hr,
+                                    "kcal": float(kcal_v) if kcal_v and kcal_v > 0 else None,
+                                    "flags": pd.Series(flags).to_json(),
+                                },
+                            )
+                        except Exception:
+                            logger.exception("Failed upserting session features for session_id=%s", session_id)
                         # Single aggregate slice (time-based if distance unknown)
                         slice_type = "km" if distance_km and distance_km > 0 else "min"
                         pace_s_per_km = None
@@ -756,7 +860,198 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> Dict:
                 logger.info("process_csv_upload: inferred sessions created=%s", len(inferred_sessions) if inferred_sessions else 0)
     except Exception:
         logger.exception("Failed to infer sessions from metrics for user_id=%s", user_id)
+    # Compute daily features for affected days
+    try:
+        affected_days = set()
+        try:
+            if not df.empty:
+                affected_days.add(min(df["timestamp"]).date())
+                affected_days.add(max(df["timestamp"]).date())
+        except Exception:
+            pass
+        try:
+            affected_days.add(pd.Timestamp.utcnow().date())
+        except Exception:
+            pass
+        if affected_days:
+            _upsert_daily_features(user_id, sorted(affected_days))
+    except Exception:
+        logger.exception("Failed computing daily features for user_id=%s", user_id)
     logger.info("process_csv_upload: done user_id=%s metrics=%s events=%s summaries=%s", user_id, len(df_metrics), len(df_events), len(summaries))
     return {"inserted": len(summaries)}
 
 
+def _upsert_daily_features(user_id: str, days: List[pd.Timestamp]) -> None:
+    """
+    Compute per-day features from health_rollup_daily for the provided days and upsert into health_daily_features.
+    """
+    if not days:
+        return
+    day_min = min(days)
+    day_max = max(days)
+    with SessionLocal() as s:
+        # Fetch rollups for prior 90 days window used for medians/MAD
+        start_window = pd.to_datetime(day_min) - pd.Timedelta(days = 90)
+        rows = s.execute(
+            text(
+                """
+                SELECT bucket_ts::date AS day, metric_type, avg_value, sum_value, n
+                FROM health_rollup_daily
+                WHERE user_id = :user_id
+                  AND bucket_ts::date >= :start_day
+                  AND bucket_ts::date <= :end_day
+                """
+            ),
+            {"user_id": user_id, "start_day": start_window.date(), "end_day": day_max},
+        ).fetchall()
+        by_day = defaultdict(dict)
+        additive = {
+            "steps",
+            "active_energy_burned",
+            "dietary_water",
+            "mindfulness_minutes",
+            "sleep_hours",
+            "active_time_minutes",
+        }
+        for d, mtype, avg_v, sum_v, _ in rows:
+            if mtype in additive:
+                val = float(sum_v) if sum_v is not None else None
+            else:
+                val = float(avg_v) if avg_v is not None else None
+            by_day[d][mtype] = val
+
+        def gv(day, key):
+            try:
+                v = by_day.get(day, {}).get(key)
+                return float(v) if v is not None and math.isfinite(float(v)) else None
+            except Exception:
+                return None
+
+        def series_for(day, metric, back_days):
+            vals = []
+            for i in range(1, back_days + 1):
+                d_prev = day - pd.Timedelta(days = i)
+                v = gv(d_prev, metric)
+                if v is not None:
+                    vals.append(float(v))
+            return vals
+
+        def median(vals):
+            if not vals:
+                return None
+            return float(pd.Series(vals).median())
+
+        def mad(vals, med):
+            if not vals:
+                return None
+            return float(pd.Series([abs(x - med) for x in vals]).median())
+
+        for day in days:
+            tv = {
+                "hr_avg": gv(day, "heart_rate"),
+                "rhr": gv(day, "resting_heart_rate"),
+                "hrv_ms": gv(day, "hr_variability_sdnn"),
+                "steps": gv(day, "steps"),
+                "energy_kcal": gv(day, "active_energy_burned"),
+                "sleep_hours": gv(day, "sleep_hours"),
+                "active_min": gv(day, "active_time_minutes"),
+            }
+            keys = {
+                "hr_avg": "heart_rate",
+                "rhr": "resting_heart_rate",
+                "hrv_ms": "hr_variability_sdnn",
+                "steps": "steps",
+                "energy_kcal": "active_energy_burned",
+                "sleep_hours": "sleep_hours",
+                "active_min": "active_time_minutes",
+            }
+            medians_obj = {}
+            deltas_obj = {}
+            zscores_obj = {}
+            for label, mname in keys.items():
+                vals30 = series_for(day, mname, 30)
+                vals7 = vals30[:7]
+                vals90 = series_for(day, mname, 90)
+                m7 = median(vals7)
+                m30 = median(vals30)
+                m90 = median(vals90)
+                medians_obj[f"{label}_7"] = m7
+                medians_obj[f"{label}_30"] = m30
+                medians_obj[f"{label}_90"] = m90
+                today_v = tv.get(label)
+                deltas_obj[f"{label}_vs_30"] = float(today_v - m30) if (today_v is not None and m30 is not None) else None
+                if today_v is not None and m30 is not None and vals30:
+                    mad30 = mad(vals30, m30)
+                    z = float((today_v - m30) / (1.4826 * mad30)) if (mad30 is not None and mad30 > 0) else None
+                else:
+                    z = None
+                zscores_obj[f"{label}_z"] = z
+
+            flags_obj = {}
+            try:
+                flags_obj["low_sleep"] = bool(tv.get("sleep_hours") is not None and medians_obj.get("sleep_hours_30") is not None and tv["sleep_hours"] < (medians_obj["sleep_hours_30"] - 1.0))
+            except Exception:
+                flags_obj["low_sleep"] = None
+            try:
+                flags_obj["high_rhr"] = bool(tv.get("rhr") is not None and medians_obj.get("rhr_30") is not None and tv["rhr"] > (medians_obj["rhr_30"] + 3.0))
+            except Exception:
+                flags_obj["high_rhr"] = None
+            try:
+                flags_obj["low_hrv"] = bool(tv.get("hrv_ms") is not None and medians_obj.get("hrv_ms_30") is not None and tv["hrv_ms"] < (medians_obj["hrv_ms_30"] - 10.0))
+            except Exception:
+                flags_obj["low_hrv"] = None
+            try:
+                flags_obj["low_activity"] = bool(tv.get("steps") is not None and medians_obj.get("steps_30") is not None and tv["steps"] < (0.7 * medians_obj["steps_30"]))
+            except Exception:
+                flags_obj["low_activity"] = None
+            try:
+                flags_obj["strain_alert"] = bool(zscores_obj.get("energy_kcal_z") is not None and abs(zscores_obj["energy_kcal_z"]) >= 2.0)
+            except Exception:
+                flags_obj["strain_alert"] = None
+
+            s.execute(
+                text(
+                    """
+                    INSERT INTO health_daily_features (user_id, day, today_values, medians, deltas, zscores, flags)
+                    VALUES (:user_id, :day, CAST(:tv AS JSONB), CAST(:med AS JSONB), CAST(:del AS JSONB), CAST(:zs AS JSONB), CAST(:fl AS JSONB))
+                    ON CONFLICT (user_id, day) DO UPDATE
+                    SET
+                      today_values = EXCLUDED.today_values,
+                      medians = EXCLUDED.medians,
+                      deltas = EXCLUDED.deltas,
+                      zscores = EXCLUDED.zscores,
+                      flags = EXCLUDED.flags
+                    """
+                ),
+                {
+                    "user_id": user_id,
+                    "day": day,
+                    "tv": pd.Series(tv).to_json(),
+                    "med": pd.Series(medians_obj).to_json(),
+                    "del": pd.Series(deltas_obj).to_json(),
+                    "zs": pd.Series(zscores_obj).to_json(),
+                    "fl": pd.Series(flags_obj).to_json(),
+                },
+            )
+        s.commit()
+
+
+@celery.task(name = "refresh_daily_features")
+def refresh_daily_features(user_id: str, days_back: int = 90) -> dict:
+    """
+    Nightly refresh: recompute health_daily_features for the last N days.
+    Safe to run multiple times; uses upsert semantics.
+    """
+    try:
+        end_day = pd.Timestamp.utcnow().date()
+        start_day = (pd.Timestamp.utcnow() - pd.Timedelta(days = days_back)).date()
+        days: List[pd.Timestamp] = []
+        d = start_day
+        while d <= end_day:
+            days.append(d)
+            d = (pd.Timestamp(d) + pd.Timedelta(days = 1)).date()
+        _upsert_daily_features(user_id, days)
+        return {"ok": True, "days": len(days)}
+    except Exception:
+        logger.exception("refresh_daily_features failed for user_id=%s", user_id)
+        return {"ok": False}

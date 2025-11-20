@@ -49,6 +49,9 @@ Constraints:
   reasonable LIMIT unless the user explicitly asks for a different ordering.
 - Prefer the smallest rollup that satisfies the requested range; use AVG/SUM appropriately and avoid returning excessively granular rows unless asked.
 - When querying rollups (hourly/daily), exclude empty buckets by adding AND n > 0; zero sum_value with n > 0 is a valid zero (e.g., zero steps), while n = 0 means no data recorded.
+- Numbers must come from SQL rows only (rollups/metrics/sessions). Do NOT compute numbers from vector text.
+- Use sum_value ONLY for additive metrics (steps, active_energy_burned, active_time_minutes, dietary_water, sleep_hours, mindfulness_minutes). Use avg_value for continuous metrics (heart_rate, oxygen_saturation, walking_speed, etc.).
+- For “now” values or instantaneous readings, use health_metrics (ORDER BY timestamp DESC LIMIT 1).
 - health_sessions: session_type is the modality ('running','walking','cycling',...), while source is 'workout' or 'inferred'. To fetch inferred sessions, filter source = 'inferred' (not session_type).
 
 Anomaly queries (when the user asks for "anomaly/anomalies/outlier/outliers"):
