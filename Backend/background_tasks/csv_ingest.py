@@ -4,18 +4,16 @@ import io
 import logging
 import pandas as pd
 import base64
-from typing import Dict, List
+from typing import Dict
 import math
 from sqlalchemy import text
 import time
 import random
 from Backend.celery import celery
 from Backend.database import SessionLocal
-# Overview feature removed; embeddings not used
 
-# Module logger
+
 logger = logging.getLogger(__name__)
-
 
 # Parse uploaded CSV bytes into a DataFrame for normalization and bulk inserts
 def _parse_csv_bytes(data: bytes) -> pd.DataFrame:
@@ -23,15 +21,12 @@ def _parse_csv_bytes(data: bytes) -> pd.DataFrame:
     return pd.read_csv(buffer, parse_dates = ["timestamp", "created_at"])
 
 
-
-
-
 @celery.task(name = "process_csv_upload")
 def process_csv_upload(user_id: str, csv_bytes_b4: str) -> Dict:
     logger.info("process_csv_upload: start user_id=%s bytes=%s", user_id, len(csv_bytes_b4) if isinstance(csv_bytes_b4, (bytes, bytearray)) else "unknown")
     raw = base64.b64decode(csv_bytes_b4)
     df = _parse_csv_bytes(raw)
-    # Normalize timestamps to tz-aware UTC once up-front
+
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc = True, errors = "coerce")
     if "created_at" in df.columns:
         df["created_at"] = pd.to_datetime(df["created_at"], utc = True, errors = "coerce")

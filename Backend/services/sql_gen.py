@@ -13,8 +13,6 @@ from Backend.database import SessionLocal
 
 logger = logging.getLogger(__name__)
 
-# Cap the number of rows returned from generated SQL (keeps responses concise).
-MAX_SQL_ROWS = 60
 
 def _extract_sql_from_text(text: str) -> str:
     """
@@ -48,11 +46,6 @@ def _extract_sql_from_text(text: str) -> str:
 load_dotenv()
 
 
-def _load_schema_prompt() -> str:
-    prompt_path = Path(__file__).resolve().parents[2] / "resources" / "sql_schema_prompt.txt"
-    return prompt_path.read_text(encoding = "utf-8")
-
-# Make generated SQL safe and scoped: require top-level SELECT, user_id = :user_id, and LIMIT MAX_SQL_ROWS
 def _sanitize_sql(sql: str) -> str:
     original = sql.strip()
     if original.endswith(";"):
@@ -225,25 +218,7 @@ def _sanitize_sql(sql: str) -> str:
                 # Add a trailing space so the next token (e.g., ORDER) doesn't merge into :user_id
                 s = s[:insert_pos] + " WHERE user_id = :user_id " + s[insert_pos:]
 
-    # Ensure top-level LIMIT present
-    if limit_idx < 0:
-        s = s + f" LIMIT {MAX_SQL_ROWS}"
-    else:
-        # Clamp an existing top-level LIMIT to MAX_SQL_ROWS (best-effort, only if a simple numeric follows)
-        try:
-            # Only look at the suffix from the detected top-level LIMIT onwards
-            suffix = s[limit_idx:]
-            m = re.search(r"(?is)\blimit\s+(\d+)\b", suffix)
-            if m:
-                current_limit = int(m.group(1))
-                if current_limit > MAX_SQL_ROWS:
-                    start, end = m.span(1)
-                    # Replace the numeric part only within the suffix, then reassemble
-                    new_suffix = suffix[:start] + str(MAX_SQL_ROWS) + suffix[end:]
-                    s = s[:limit_idx] + new_suffix
-        except Exception:
-            # If clamping fails, leave as-is; post-exec trimming will still enforce MAX_SQL_ROWS in memory
-            pass
+    # No default LIMIT injection; prompts should include an explicit LIMIT if desired.
 
     # Prefer real measurements from rollups by excluding empty buckets by default.
     # We only add "AND n > 0" when the query touches a health_rollup_* table AND
@@ -354,10 +329,12 @@ def _sanitize_sql(sql: str) -> str:
 def execute_generated_sql(user_id: str, question: str) -> Dict[str, Any]:
     client = OpenAI(api_key = os.getenv("OPENAI_API_KEY"))
     prompt = f"Question: {question}\nReturn only SQL."
+    prompt_path = Path(__file__).resolve().parents[2] / "resources" / "chat_prompt.txt"
+    system_prompt = prompt_path.read_text(encoding = "utf-8")
     resp = client.chat.completions.create(
         model = "gpt-5-mini",
         messages = [
-            {"role": "system", "content": _load_schema_prompt()},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ]
     )
@@ -387,8 +364,7 @@ def execute_generated_sql(user_id: str, question: str) -> Dict[str, Any]:
     with SessionLocal() as session:
         try:
             result = session.execute(text(safe_sql), {"user_id": user_id}).mappings().all()
-            # Convert to dictionaries and trim to MAX_SQL_ROWS to keep downstream output concise
-            rows = [dict(r) for r in result][:MAX_SQL_ROWS]
+            rows = [dict(r) for r in result]
             try:
                 logger.info("sql.exec: user_id=%s rows=%d", user_id, len(rows))
             except Exception:
