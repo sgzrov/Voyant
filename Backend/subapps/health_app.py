@@ -449,10 +449,9 @@ async def query_stream(payload: dict, request: Request):
                     except asyncio.CancelledError:
                         pass
 
-                # Stream the response we collected
                 full_response = assistant_content or ""
-                streamed_chars = len(full_response)
-                if full_response:
+                if streamed_chars == 0 and full_response:
+                    streamed_chars = len(full_response)
                     yield f"data: {json.dumps({'content': full_response, 'done': False})}\n\n"
 
             try:
