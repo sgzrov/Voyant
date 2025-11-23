@@ -22,7 +22,7 @@ struct HealthCSVExporter {
             "distance_cycling_km",
             "distance_swimming_km",
             "active_time_minutes"
-        ]s
+        ]
         let dailyNames: Set<String> = [
             "sleep_hours",
             "resting_heart_rate",
