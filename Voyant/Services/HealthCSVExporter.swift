@@ -12,6 +12,22 @@ struct HealthCSVExporter {
         let tz = TimeZone.current.identifier
         let createdAt = ISO8601DateFormatter().string(from: Date())
         let iso = ISO8601DateFormatter()
+        // Decide cadence per metric: minute for fast-changing, daily for daily metrics, hourly otherwise
+        let minutelyNames: Set<String> = [
+            "heart_rate",
+            "steps",
+            "active_energy_burned",
+            "walking_speed",
+            "distance_walking_running_km",
+            "distance_cycling_km",
+            "distance_swimming_km",
+            "active_time_minutes"
+        ]s
+        let dailyNames: Set<String> = [
+            "sleep_hours",
+            "resting_heart_rate",
+            "hr_variability_sdnn"
+        ]
 
         let now = Date()
         guard let start60 = Calendar.current.date(byAdding: .day, value: -60, to: now) else {
@@ -27,9 +43,16 @@ struct HealthCSVExporter {
         let encounteredError: Error? = nil
 
         for spec in specs {
-            // Decide bucket size: daily for sleep/rhr/hrv, hourly for others
-            let isDaily = (spec.name == "sleep_hours" || spec.name == "resting_heart_rate" || spec.name == "hr_variability_sdnn")
-            let interval = isDaily ? DateComponents(day: 1) : DateComponents(hour: 1)
+            // Decide bucket size per metric
+            let interval: DateComponents = {
+                if dailyNames.contains(spec.name) {
+                    return DateComponents(day: 1)
+                }
+                if minutelyNames.contains(spec.name) {
+                    return DateComponents(minute: 1)
+                }
+                return DateComponents(hour: 1)
+            }()
 
             // Single window: last 60 days
             group.enter()
@@ -114,6 +137,22 @@ struct HealthCSVExporter {
         let tz = TimeZone.current.identifier
         let createdAt = ISO8601DateFormatter().string(from: Date())
         let iso = ISO8601DateFormatter()
+        // Same cadence sets as initial export
+        let minutelyNames: Set<String> = [
+            "heart_rate",
+            "steps",
+            "active_energy_burned",
+            "walking_speed",
+            "distance_walking_running_km",
+            "distance_cycling_km",
+            "distance_swimming_km",
+            "active_time_minutes"
+        ]
+        let dailyNames: Set<String> = [
+            "sleep_hours",
+            "resting_heart_rate",
+            "hr_variability_sdnn"
+        ]
 
         var rows: [String] = ["user_id,timestamp,metric_type,metric_value,unit,source,timezone,created_at"]
 
@@ -124,12 +163,22 @@ struct HealthCSVExporter {
 
         for spec in specs {
             group.enter()
+            // Choose interval per metric; allow minuteResolution to force minute for short windows
+            let interval: DateComponents = {
+                if dailyNames.contains(spec.name) {
+                    return DateComponents(day: 1)
+                }
+                if minuteResolution || minutelyNames.contains(spec.name) {
+                    return DateComponents(minute: 1)
+                }
+                return DateComponents(hour: 1)
+            }()
             queryQuantityOrCategory(
                 healthStore: healthStore,
                 spec: spec,
                 start: start,
                 end: end,
-                interval: minuteResolution ? DateComponents(minute: 1) : DateComponents(hour: 1),
+                interval: interval,
                 aggregation: spec.aggregation
             ) { result in
                 switch result {

@@ -192,6 +192,85 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> Dict:
                             session.rollback()
                         except Exception:
                             logger.exception("Rollback failed after health_metrics error for user_id=%s", user_id)
+        # Build/refresh rollups for the affected window (based on metrics timestamps)
+        try:
+            if not df_metrics.empty:
+                t_min = pd.to_datetime(df_metrics["timestamp"].min())
+                t_max = pd.to_datetime(df_metrics["timestamp"].max())
+                # Guard against NaT
+                if pd.notna(t_min) and pd.notna(t_max):
+                    t0 = pd.Timestamp(t_min).floor("H").to_pydatetime()
+                    t1 = (pd.Timestamp(t_max).floor("H") + pd.Timedelta(hours = 1)).to_pydatetime()
+                    # Upsert HOURLY from raw metrics
+                    session.execute(
+                        text(
+                            """
+                            INSERT INTO health_rollup_hourly
+                                (user_id, bucket_ts, metric_type, avg_value, sum_value, min_value, max_value, n)
+                            SELECT
+                                :user_id AS user_id,
+                                date_trunc('hour', timestamp) AS bucket_ts,
+                                metric_type,
+                                AVG(CASE WHEN metric_type IN (
+                                    'heart_rate','resting_heart_rate','walking_hr_avg','hr_variability_sdnn',
+                                    'oxygen_saturation','walking_speed','vo2_max','body_mass','body_mass_index',
+                                    'blood_glucose','blood_pressure_systolic','blood_pressure_diastolic',
+                                    'respiratory_rate','body_temperature'
+                                ) THEN metric_value END) AS avg_value,
+                                SUM(CASE WHEN metric_type IN (
+                                    'steps','active_energy_burned','sleep_hours','active_time_minutes',
+                                    'distance_walking_running_km','distance_cycling_km','distance_swimming_km',
+                                    'dietary_water','mindfulness_minutes'
+                                ) THEN metric_value END) AS sum_value,
+                                MIN(metric_value) AS min_value,
+                                MAX(metric_value) AS max_value,
+                                COUNT(*) AS n
+                            FROM health_metrics
+                            WHERE user_id = :user_id
+                              AND timestamp >= :t0 AND timestamp < :t1
+                            GROUP BY 1,2,3
+                            ON CONFLICT (user_id, metric_type, bucket_ts) DO UPDATE SET
+                              avg_value = EXCLUDED.avg_value,
+                              sum_value = EXCLUDED.sum_value,
+                              min_value = EXCLUDED.min_value,
+                              max_value = EXCLUDED.max_value,
+                              n = EXCLUDED.n
+                            """
+                        ),
+                        {"user_id": user_id, "t0": t0, "t1": t1},
+                    )
+                    # Upsert DAILY from hourly rollups (weighted averages for continuous, sums for additive)
+                    session.execute(
+                        text(
+                            """
+                            INSERT INTO health_rollup_daily
+                                (user_id, bucket_ts, metric_type, avg_value, sum_value, min_value, max_value, n)
+                            SELECT
+                                user_id,
+                                date_trunc('day', bucket_ts) AS bucket_ts,
+                                metric_type,
+                                CASE WHEN SUM(n) > 0 THEN SUM(COALESCE(avg_value, 0) * n) / SUM(n) END AS avg_value,
+                                SUM(COALESCE(sum_value, 0)) AS sum_value,
+                                MIN(min_value) AS min_value,
+                                MAX(max_value) AS max_value,
+                                SUM(n) AS n
+                            FROM health_rollup_hourly
+                            WHERE user_id = :user_id
+                              AND bucket_ts >= date_trunc('day', :t0)
+                              AND bucket_ts <  date_trunc('day', :t1) + INTERVAL '1 day'
+                            GROUP BY user_id, date_trunc('day', bucket_ts), metric_type
+                            ON CONFLICT (user_id, metric_type, bucket_ts) DO UPDATE SET
+                              avg_value = EXCLUDED.avg_value,
+                              sum_value = EXCLUDED.sum_value,
+                              min_value = EXCLUDED.min_value,
+                              max_value = EXCLUDED.max_value,
+                              n = EXCLUDED.n
+                            """
+                        ),
+                        {"user_id": user_id, "t0": t0, "t1": t1},
+                    )
+        except Exception:
+            logger.exception("Failed to compute rollups for user_id=%s", user_id)
         session.commit()
     # Rollups are disabled in metrics-only mode
     # Derive health_sessions from workout events (one session per workout timestamp/type)
