@@ -41,6 +41,10 @@ class AgentBackendService {
         let boundary = "Boundary-\(UUID().uuidString)"
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         request.setValue(TimeZone.current.identifier, forHTTPHeaderField: "X-User-TZ")
+        
+        // Add idempotency key based on content hash to prevent duplicate processing
+        let contentHash = data.sha256Hash()
+        request.setValue(contentHash, forHTTPHeaderField: "X-Idempotency-Key")
 
         var body = Data()
         body.append("--\(boundary)\r\n".data(using: .utf8)!)
@@ -54,9 +58,19 @@ class AgentBackendService {
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             throw NSError(domain: "upload", code: -1, userInfo: [NSLocalizedDescriptionKey: "Upload failed"])
         }
-        struct UploadResponse: Decodable { let task_id: String? }
-        let taskId = (try? JSONDecoder().decode(UploadResponse.self, from: respData))?.task_id ?? ""
-        return taskId
+        struct UploadResponse: Decodable { 
+            let task_id: String?
+            let status: String?
+            let message: String?
+        }
+        let uploadResp = try? JSONDecoder().decode(UploadResponse.self, from: respData)
+        
+        // Log upload status for debugging
+        if let status = uploadResp?.status, let message = uploadResp?.message {
+            print("[Upload] Status: \(status), Message: \(message)")
+        }
+        
+        return uploadResp?.task_id ?? ""
     }
 
     struct HealthTaskStatus: Decodable {

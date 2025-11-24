@@ -5,12 +5,15 @@ import os
 import pathlib
 import logging
 import uuid
-from typing import Optional
-from fastapi import APIRouter, UploadFile, File, HTTPException, Request
+import hashlib
+from typing import Optional, Dict
+from datetime import datetime, timedelta, timezone
+from collections import defaultdict
+from fastapi import APIRouter, UploadFile, File, HTTPException, Request, Header
 from fastapi.responses import StreamingResponse
 from openai import OpenAI
-from sqlalchemy import func, text
-from datetime import timezone
+from sqlalchemy import func, text, Column, String, Integer, DateTime, Text
+from sqlalchemy.ext.declarative import declarative_base
 from zoneinfo import ZoneInfo
 import time
 import re
@@ -18,9 +21,27 @@ import re
 from Backend.auth import verify_clerk_jwt
 from Backend.background_tasks.csv_ingest import process_csv_upload
 from Backend.services.sql_gen import _extract_sql_from_text, _sanitize_sql
-from Backend.database import SessionLocal
+from Backend.database import SessionLocal, Base
 from Backend.crud.chat import get_chat_history, create_chat_message
 from Backend.models.chat_data_model import ChatsDB
+
+# Upload tracking model
+class HealthUploadTracking(Base):
+    __tablename__ = 'health_upload_tracking'
+    
+    id = Column(String(64), primary_key=True)  # SHA256 hash of content
+    user_id = Column(String(100), nullable=False)
+    task_id = Column(String(100), nullable=True)
+    file_size = Column(Integer, nullable=False)
+    file_name = Column(String(255), nullable=True)
+    status = Column(String(50), nullable=False, default='pending')
+    created_at = Column(DateTime, nullable=False, default=func.now())
+    updated_at = Column(DateTime, nullable=False, default=func.now(), onupdate=func.now())
+    completed_at = Column(DateTime, nullable=True)
+    error_message = Column(Text, nullable=True)
+    row_count = Column(Integer, nullable=True)
+    idempotency_key = Column(String(64), nullable=True)
+    request_count = Column(Integer, nullable=False, default=1)
 
 
 async def _fetch_health_context(user_id: str, question: str, client: OpenAI, system_prompt: str, model: str, tz_name: str):
@@ -109,6 +130,46 @@ async def _fetch_health_context(user_id: str, question: str, client: OpenAI, sys
 
 
 router = APIRouter()
+
+# Simple in-memory rate limiter for upload endpoints
+class UploadRateLimiter:
+    def __init__(self, max_requests_per_minute: int = 5):
+        self.max_requests = max_requests_per_minute
+        self.requests: Dict[str, list] = defaultdict(list)
+        self.lock = asyncio.Lock()
+    
+    async def check_rate_limit(self, user_id: str) -> bool:
+        """Check if user has exceeded rate limit. Returns True if allowed."""
+        async with self.lock:
+            now = datetime.utcnow()
+            minute_ago = now - timedelta(minutes=1)
+            
+            # Clean old requests
+            self.requests[user_id] = [
+                req_time for req_time in self.requests[user_id]
+                if req_time > minute_ago
+            ]
+            
+            # Check limit
+            if len(self.requests[user_id]) >= self.max_requests:
+                return False
+            
+            # Record new request
+            self.requests[user_id].append(now)
+            return True
+    
+    async def get_wait_time(self, user_id: str) -> int:
+        """Get seconds until next request is allowed."""
+        async with self.lock:
+            if not self.requests[user_id]:
+                return 0
+            
+            oldest_request = min(self.requests[user_id])
+            wait_until = oldest_request + timedelta(minutes=1)
+            wait_seconds = max(0, int((wait_until - datetime.utcnow()).total_seconds()))
+            return wait_seconds
+
+upload_rate_limiter = UploadRateLimiter(max_requests_per_minute=10)
 
 logger = logging.getLogger(__name__)
 # Ensure module logs are visible when running under gunicorn/uvicorn (which may keep root at WARNING)
@@ -202,26 +263,264 @@ def _json_dumps_safe(obj: object) -> str:
 
 
 @router.post("/health/upload-csv")
-async def upload_csv(file: UploadFile = File(...), request: Request = None):
+async def upload_csv(
+    file: UploadFile = File(...), 
+    request: Request = None,
+    x_idempotency_key: Optional[str] = Header(None)
+):
+    """Upload CSV with deduplication and idempotency support.
+    
+    Uses content hash to detect duplicate uploads and prevent reprocessing.
+    Supports optional idempotency key for client-side duplicate prevention.
+    Includes rate limiting to prevent abuse.
+    """
     user = verify_clerk_jwt(request)
     user_id = user["sub"]
+    
+    # Check rate limit
+    if not await upload_rate_limiter.check_rate_limit(user_id):
+        wait_time = await upload_rate_limiter.get_wait_time(user_id)
+        logger.warning("upload_csv: rate limit exceeded for user_id=%s, wait=%ds", user_id, wait_time)
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many upload requests. Please wait {wait_time} seconds before trying again."
+        )
+    
     content = await file.read()
-    try:
-        logger.info("upload_csv: user_id=%s filename=%s bytes=%s content_type=%s",
-                    user_id, getattr(file, 'filename', None), len(content), getattr(file, 'content_type', None))
-        b64 = base64.b64encode(content).decode("utf-8")
-        task = process_csv_upload.delay(user_id, b64)
-        logger.info("upload_csv: enqueued task_id=%s", task.id)
-        return {"task_id": task.id}
-    except Exception as e:
-        logger.exception("upload_csv: failed to enqueue task for user_id=%s", user_id)
-        raise HTTPException(status_code=500, detail=f"Failed to enqueue CSV ingest: {e}")
+    
+    # Generate content hash for deduplication
+    content_hash = hashlib.sha256(content).hexdigest()
+    file_size = len(content)
+    file_name = getattr(file, 'filename', 'health.csv')
+    
+    logger.info("upload_csv: user_id=%s filename=%s bytes=%d content_hash=%s idempotency_key=%s",
+                user_id, file_name, file_size, content_hash[:8], x_idempotency_key)
+    
+    # Use database session for atomic operations
+    with SessionLocal() as session:
+        try:
+            # Check for existing upload with same content hash
+            existing = session.query(HealthUploadTracking).filter(
+                HealthUploadTracking.user_id == user_id,
+                HealthUploadTracking.id == content_hash
+            ).first()
+            
+            if existing:
+                # Content already uploaded
+                now = datetime.utcnow()
+                
+                # Update request count
+                existing.request_count = (existing.request_count or 0) + 1
+                existing.updated_at = now
+                
+                # Check if still processing (less than 5 minutes old and not failed)
+                if existing.status in ['pending', 'processing']:
+                    time_since_creation = (now - existing.created_at).total_seconds()
+                    if time_since_creation < 300:  # 5 minutes timeout
+                        logger.info("upload_csv: duplicate detected, still processing task_id=%s age=%ds",
+                                   existing.task_id, time_since_creation)
+                        session.commit()
+                        return {
+                            "task_id": existing.task_id,
+                            "status": "processing",
+                            "message": "Upload already in progress"
+                        }
+                    else:
+                        # Timeout - mark as failed and reprocess
+                        logger.warning("upload_csv: task_id=%s timed out after %ds, reprocessing",
+                                      existing.task_id, time_since_creation)
+                        existing.status = 'timeout'
+                        existing.error_message = f"Timed out after {time_since_creation}s"
+                
+                elif existing.status == 'completed':
+                    # Already successfully processed
+                    logger.info("upload_csv: duplicate detected, already completed task_id=%s",
+                               existing.task_id)
+                    session.commit()
+                    return {
+                        "task_id": existing.task_id,
+                        "status": "completed",
+                        "message": "Data already uploaded and processed"
+                    }
+                
+                # Failed or timed out - allow reprocessing
+                logger.info("upload_csv: reprocessing failed/timeout upload, previous task_id=%s status=%s",
+                           existing.task_id, existing.status)
+                
+                # Enqueue new task
+                b64 = base64.b64encode(content).decode("utf-8")
+                task = process_csv_upload.delay(user_id, b64)
+                
+                # Update existing record with new task
+                existing.task_id = task.id
+                existing.status = 'pending'
+                existing.updated_at = now
+                existing.error_message = None
+                existing.idempotency_key = x_idempotency_key
+                
+                session.commit()
+                logger.info("upload_csv: reprocessing with new task_id=%s", task.id)
+                return {"task_id": task.id, "status": "reprocessing"}
+                
+            else:
+                # New upload - create tracking record
+                b64 = base64.b64encode(content).decode("utf-8")
+                task = process_csv_upload.delay(user_id, b64)
+                
+                tracking = HealthUploadTracking(
+                    id=content_hash,
+                    user_id=user_id,
+                    task_id=task.id,
+                    file_size=file_size,
+                    file_name=file_name,
+                    status='pending',
+                    idempotency_key=x_idempotency_key,
+                    request_count=1
+                )
+                session.add(tracking)
+                session.commit()
+                
+                logger.info("upload_csv: new upload enqueued task_id=%s content_hash=%s",
+                           task.id, content_hash[:8])
+                return {"task_id": task.id, "status": "new"}
+                
+        except Exception as e:
+            session.rollback()
+            logger.exception("upload_csv: database error for user_id=%s", user_id)
+            # Fall back to direct upload without tracking on DB error
+            try:
+                b64 = base64.b64encode(content).decode("utf-8")
+                task = process_csv_upload.delay(user_id, b64)
+                logger.warning("upload_csv: fallback mode, enqueued task_id=%s", task.id)
+                return {"task_id": task.id, "status": "fallback"}
+            except Exception as task_error:
+                logger.exception("upload_csv: failed to enqueue task for user_id=%s", user_id)
+                raise HTTPException(status_code=500, detail=f"Failed to enqueue CSV ingest: {task_error}")
 
 
 @router.get("/health/task-status/{task_id}")
-async def task_status(task_id: str):
+async def task_status(task_id: str, request: Request = None):
+    """Get task status with upload tracking integration."""
+    user = verify_clerk_jwt(request)
+    user_id = user["sub"]
+    
+    # Get Celery task status
     res = process_csv_upload.AsyncResult(task_id)
-    return {"id": task_id, "state": res.state, "result": res.result if res.ready() else None}
+    celery_state = res.state
+    
+    # Update tracking record if task completed
+    with SessionLocal() as session:
+        tracking = session.query(HealthUploadTracking).filter(
+            HealthUploadTracking.task_id == task_id,
+            HealthUploadTracking.user_id == user_id
+        ).first()
+        
+        if tracking:
+            if celery_state == 'SUCCESS' and tracking.status != 'completed':
+                tracking.status = 'completed'
+                tracking.completed_at = datetime.utcnow()
+                tracking.updated_at = datetime.utcnow()
+                if res.result and isinstance(res.result, dict):
+                    tracking.row_count = res.result.get('row_count')
+                session.commit()
+                logger.info("task_status: marked upload as completed task_id=%s", task_id)
+                
+            elif celery_state == 'FAILURE' and tracking.status not in ['failed', 'completed']:
+                tracking.status = 'failed'
+                tracking.error_message = str(res.info) if res.info else 'Unknown error'
+                tracking.updated_at = datetime.utcnow()
+                session.commit()
+                logger.warning("task_status: marked upload as failed task_id=%s error=%s",
+                             task_id, tracking.error_message)
+            
+            elif celery_state == 'PENDING' and tracking.status == 'pending':
+                # Check for timeout
+                time_since_creation = (datetime.utcnow() - tracking.created_at).total_seconds()
+                if time_since_creation > 300:  # 5 minutes
+                    tracking.status = 'timeout'
+                    tracking.error_message = f"Task timed out after {time_since_creation}s"
+                    tracking.updated_at = datetime.utcnow()
+                    session.commit()
+                    logger.warning("task_status: task timeout detected task_id=%s age=%ds",
+                                 task_id, time_since_creation)
+                    return {
+                        "id": task_id,
+                        "state": "TIMEOUT",
+                        "result": None,
+                        "message": "Task timed out"
+                    }
+            
+            elif celery_state in ['STARTED', 'RETRY'] and tracking.status == 'pending':
+                tracking.status = 'processing'
+                tracking.updated_at = datetime.utcnow()
+                session.commit()
+    
+    return {
+        "id": task_id,
+        "state": celery_state,
+        "result": res.result if res.ready() else None
+    }
+
+
+@router.get("/health/upload-history")
+async def get_upload_history(request: Request, limit: int = 10):
+    """Get recent upload history for the user."""
+    user = verify_clerk_jwt(request)
+    user_id = user["sub"]
+    
+    with SessionLocal() as session:
+        uploads = session.query(HealthUploadTracking).filter(
+            HealthUploadTracking.user_id == user_id
+        ).order_by(
+            HealthUploadTracking.created_at.desc()
+        ).limit(limit).all()
+        
+        history = []
+        for upload in uploads:
+            history.append({
+                "content_hash": upload.id[:8],  # First 8 chars of hash
+                "task_id": upload.task_id,
+                "file_name": upload.file_name,
+                "file_size": upload.file_size,
+                "status": upload.status,
+                "created_at": upload.created_at.isoformat() if upload.created_at else None,
+                "completed_at": upload.completed_at.isoformat() if upload.completed_at else None,
+                "row_count": upload.row_count,
+                "request_count": upload.request_count,
+                "error_message": upload.error_message
+            })
+        
+        return {"uploads": history}
+
+
+@router.delete("/health/cleanup-uploads")
+async def cleanup_old_uploads(request: Request, days_old: int = 7):
+    """Clean up old upload tracking records."""
+    user = verify_clerk_jwt(request)
+    user_id = user["sub"]
+    
+    if days_old < 1:
+        raise HTTPException(status_code=400, detail="days_old must be at least 1")
+    
+    cutoff_date = datetime.utcnow() - timedelta(days=days_old)
+    
+    with SessionLocal() as session:
+        # Delete old completed or failed uploads
+        deleted_count = session.query(HealthUploadTracking).filter(
+            HealthUploadTracking.user_id == user_id,
+            HealthUploadTracking.created_at < cutoff_date,
+            HealthUploadTracking.status.in_(['completed', 'failed', 'timeout'])
+        ).delete()
+        
+        session.commit()
+        
+        logger.info("cleanup_uploads: user_id=%s deleted=%d older_than=%s",
+                   user_id, deleted_count, cutoff_date.isoformat())
+        
+        return {
+            "deleted": deleted_count,
+            "cutoff_date": cutoff_date.isoformat()
+        }
 
 
 @router.post("/health/query/stream")
