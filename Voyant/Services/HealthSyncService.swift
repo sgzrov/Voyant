@@ -9,12 +9,32 @@ import HealthKit
 final class HealthSyncService {
 
 	static let shared = HealthSyncService()
-	private init() {}
+
+
+	private let healthStoreService: HealthStoreService
+	private let healthCSVExporter: HealthCSVExporter.Type
+	private let agentBackendService: AgentBackendService
+	private let authService: AuthService
+
+	private init() {
+		self.healthStoreService = HealthStoreService.shared
+		self.healthCSVExporter = HealthCSVExporter.self
+		self.agentBackendService = AgentBackendService.shared
+		self.authService = AuthService.shared
+	}
 
 	private let healthStore = HKHealthStore()
 	private let calendar = Calendar.current
 	private var currentUserId: String?
 	private let lookbackHours: Int = 6
+
+	// Flag to prevent observer uploads during initial seed
+	private var isPerformingInitialSeed = false
+
+	// Debouncing for delta uploads to prevent multiple simultaneous uploads
+	private var pendingDeltaWorkItem: DispatchWorkItem?
+	private let deltaDebounceInterval: TimeInterval = 5.0 // Increased to 5 seconds for better coalescing
+	private let deltaUploadQueue = DispatchQueue(label: "com.voyant.health.delta", qos: .background)
 
 	// Call on app launch after permissions are granted
 	func startBackgroundSync(userId: String) {
@@ -30,9 +50,15 @@ final class HealthSyncService {
 				return
 			}
 			print("[HealthSync] HealthKit authorized, starting observers and initial seed")
+
+			// Set flag to prevent observer uploads during initial seed
+			self.isPerformingInitialSeed = true
+
+			// Register observers first but they won't upload due to flag
 			self.registerObservers()
 			self.enableBackgroundDelivery()
-			// Give HealthKit a short moment to finalize auth state before heavy queries
+
+			// Delay initial seed to let observers settle and then do ONE comprehensive upload
 			let initialSeed = DispatchWorkItem {
 				// Initial full backfill (~164 days) to guarantee seed on first run
 				HealthCSVExporter.generateCSV(for: userId, metrics: []) { res in
@@ -57,16 +83,22 @@ final class HealthSyncService {
 								// Optionally poll for completion so we can log success
 								let status = try await AgentBackendService.shared.waitForHealthTask(taskId, timeout: 120)
 								print("[HealthSync] Initial seed completed with state=\(status.state)")
+
+								// Clear flag to allow observer uploads now
+								self.isPerformingInitialSeed = false
 							} catch {
 								print("[HealthSync] Initial upload failed: \(error)")
 							}
 						}
-					case .failure(let e):
-						print("[HealthSync] generateCSV failed: \(e.localizedDescription)")
+						case .failure(let e):
+							print("[HealthSync] generateCSV failed: \(e.localizedDescription)")
+							// Clear flag even on failure
+							self.isPerformingInitialSeed = false
 					}
 				}
 			}
-			DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: initialSeed)
+			// Increased delay to let observers fully register and settle
+			DispatchQueue.main.asyncAfter(deadline: .now() + 3.0, execute: initialSeed)
 		}
 	}
 
@@ -126,6 +158,29 @@ final class HealthSyncService {
 	}
 
 	private func handleObserverEvent(completionHandler: @escaping () -> Void) {
+		// Immediately complete the HealthKit callback to keep the system happy
+		completionHandler()
+
+		// Skip if we're doing initial seed
+		if isPerformingInitialSeed {
+			print("[HealthSync] Skipping observer event during initial seed")
+			return
+		}
+
+		// Cancel any pending delta upload
+		pendingDeltaWorkItem?.cancel()
+
+		// Create a new debounced work item
+		let workItem = DispatchWorkItem { [weak self] in
+			self?.performDeltaUpload()
+		}
+		pendingDeltaWorkItem = workItem
+
+		// Schedule the delta upload after debounce interval
+		deltaUploadQueue.asyncAfter(deadline: .now() + deltaDebounceInterval, execute: workItem)
+	}
+
+	private func performDeltaUpload() {
 		// Use anchored queries for tighter deltas; fallback to small lookback if no changes detected
 		let now = Date()
 		let group = DispatchGroup()
@@ -191,7 +246,7 @@ final class HealthSyncService {
 		}
 
 		group.notify(queue: .main) { [weak self] in
-			guard let self = self else { completionHandler(); return }
+			guard let self = self else { return }
 			let end = now
 			let start: Date = {
 				if let minChangedDate = minChangedDate {
@@ -200,17 +255,18 @@ final class HealthSyncService {
 				return now.addingTimeInterval(-Double(self.lookbackHours) * 3600.0)
 			}()
 
-			func finish() { completionHandler() }
-
 			Task {
 				var userId = self.currentUserId
 				if userId == nil {
 					userId = try? await AuthService.getUserId()
 					self.currentUserId = userId
 				}
-				guard let uid = userId else { finish(); return }
+				guard let uid = userId else { return }
 
 				let minuteResolution = end.timeIntervalSince(start) <= (90 * 60)
+
+				print("[HealthSync] Creating delta CSV for period: \(start) to \(end)")
+
 				HealthCSVExporter.generateDeltaCSV(for: uid, start: start, end: end, metrics: [], minuteResolution: minuteResolution) { result in
 					switch result {
 					case .success(let data):
@@ -220,17 +276,22 @@ final class HealthSyncService {
 							if let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
 								let url = docs.appendingPathComponent("HealthDelta-\(ts).csv")
 								try data.write(to: url, options: .atomic)
-								print("[HealthSync] Saved delta CSV to \(url.path)")
+								print("[HealthSync] Saved delta CSV to \(url.path) (\(data.count) bytes)")
 							}
 						} catch {
 							print("[HealthSync] Failed saving delta CSV: \(error)")
 						}
 						Task {
-							_ = try? await AgentBackendService.shared.uploadHealthCSV(data)
-							finish()
+							do {
+								print("[HealthSync] Uploading delta CSV (\(data.count) bytes)")
+								let taskId = try await AgentBackendService.shared.uploadHealthCSV(data)
+								print("[HealthSync] Delta upload enqueued with task_id=\(taskId)")
+							} catch {
+								print("[HealthSync] Delta upload failed: \(error)")
+							}
 						}
-					case .failure:
-						finish()
+					case .failure(let error):
+						print("[HealthSync] Failed to generate delta CSV: \(error)")
 					}
 				}
 			}

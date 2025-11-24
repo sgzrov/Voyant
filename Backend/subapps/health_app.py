@@ -366,7 +366,7 @@ async def upload_csv(
                 # New upload - create tracking record
                 b64 = base64.b64encode(content).decode("utf-8")
                 task = process_csv_upload.delay(user_id, b64)
-                
+
                 tracking = HealthUploadTracking(
                     id=content_hash,
                     user_id=user_id,
@@ -386,7 +386,7 @@ async def upload_csv(
                 except Exception as commit_error:
                     # Race condition - another request created the record first
                     session.rollback()
-                    
+
                     # Check if it was a duplicate key error
                     if "duplicate key" in str(commit_error).lower():
                         # Another request beat us - fetch the existing record
@@ -394,7 +394,7 @@ async def upload_csv(
                             HealthUploadTracking.user_id == user_id,
                             HealthUploadTracking.id == content_hash
                         ).first()
-                        
+
                         if existing:
                             existing.request_count = (existing.request_count or 0) + 1
                             session.commit()
@@ -405,7 +405,7 @@ async def upload_csv(
                                 "status": "processing",
                                 "message": "Upload already in progress (race condition handled)"
                             }
-                    
+
                     # Some other error - re-raise
                     raise commit_error
 
