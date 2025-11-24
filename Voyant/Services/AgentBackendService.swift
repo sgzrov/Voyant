@@ -40,6 +40,7 @@ class AgentBackendService {
         var request = try await authService.authenticatedRequest(for: "/health/upload-csv", method: "POST")
         let boundary = "Boundary-\(UUID().uuidString)"
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        request.setValue(TimeZone.current.identifier, forHTTPHeaderField: "X-User-TZ")
 
         var body = Data()
         body.append("--\(boundary)\r\n".data(using: .utf8)!)

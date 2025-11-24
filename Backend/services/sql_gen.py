@@ -1,15 +1,9 @@
 from __future__ import annotations
 
-import os
 import re
 from typing import Any, Dict
 import logging
-from dotenv import load_dotenv
-from openai import OpenAI
-from sqlalchemy import text
-from pathlib import Path
 
-from Backend.database import SessionLocal
 
 logger = logging.getLogger(__name__)
 
@@ -42,8 +36,6 @@ def _extract_sql_from_text(text: str) -> str:
         if m_select:
             s = s[m_select.start():]
     return s.strip()
-
-load_dotenv()
 
 
 def _sanitize_sql(sql: str) -> str:
@@ -299,6 +291,189 @@ def _sanitize_sql(sql: str) -> str:
     except Exception:
         pass
 
+    # Note: health_rollup_daily table has been dropped. Queries should target hourly only.
+
+    # Timezone-aware hourly rewrite:
+    # Any reference to health_rollup_hourly will be replaced by a derived table that normalizes
+    # bucket_ts to the request's local hour. This ensures queries that forget to convert to local time
+    # still return hour buckets aligned to :tz_name (handles DST fold/skip by aggregating as needed).
+    try:
+        if re.search(r"(?is)\b(from|join)\s+health_rollup_hourly\b", s):
+            hourly_subquery = (
+                "(SELECT\n"
+                "   user_id,\n"
+                "   (date_trunc('hour', bucket_ts AT TIME ZONE :tz_name) AT TIME ZONE :tz_name) AS bucket_ts,\n"
+                "   metric_type,\n"
+                "   CASE WHEN SUM(n) > 0 THEN SUM(COALESCE(avg_value, 0) * n) / SUM(n) END AS avg_value,\n"
+                "   SUM(COALESCE(sum_value, 0)) AS sum_value,\n"
+                "   MIN(min_value) AS min_value,\n"
+                "   MAX(max_value) AS max_value,\n"
+                "   SUM(n) AS n\n"
+                " FROM health_rollup_hourly\n"
+                " WHERE user_id = :user_id\n"
+                " GROUP BY 1,2,3)"
+            )
+            s = re.sub(r"(?is)\bfrom\s+health_rollup_hourly\b", f"FROM {hourly_subquery} AS health_rollup_hourly", s)
+            s = re.sub(r"(?is)\bjoin\s+health_rollup_hourly\b", f"JOIN {hourly_subquery} AS health_rollup_hourly", s)
+            try:
+                logging.getLogger(__name__).info("sql.rewrite.hourly: rewrote health_rollup_hourly to tz-localized derived table")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Normalize date comparisons to the user's timezone:
+    # - Replace CURRENT_DATE with (now() AT TIME ZONE :tz_name)::date
+    # - Replace DATE(bucket_ts[ ... ]) with DATE(bucket_ts AT TIME ZONE :tz_name)
+    try:
+        s_new = re.sub(r"(?is)\bcurrent_date\b", "(now() AT TIME ZONE :tz_name)::date", s)
+        # date(bucket_ts) or date(alias.bucket_ts)
+        s_new = re.sub(
+            r"(?is)\bdate\s*\(\s*((?:[a-zA-Z_][\w]*\.)?)bucket_ts\s*\)",
+            r"DATE(\1bucket_ts AT TIME ZONE :tz_name)",
+            s_new
+        )
+        # date(timestamp) or date(alias.timestamp) for raw metrics/events
+        s_new = re.sub(
+            r"(?is)\bdate\s*\(\s*((?:[a-zA-Z_][\w]*\.)?)timestamp\s*\)",
+            r"DATE(\1timestamp AT TIME ZONE :tz_name)",
+            s_new
+        )
+        # bucket_ts::date or alias.bucket_ts::date
+        s_new = re.sub(
+            r"(?is)\b((?:[a-zA-Z_][\w]*\.)?)bucket_ts\s*::\s*date\b",
+            r"( \1bucket_ts AT TIME ZONE :tz_name )::date",
+            s_new
+        )
+        # timestamp::date or alias.timestamp::date
+        s_new = re.sub(
+            r"(?is)\b((?:[a-zA-Z_][\w]*\.)?)timestamp\s*::\s*date\b",
+            r"( \1timestamp AT TIME ZONE :tz_name )::date",
+            s_new
+        )
+        # Rewrite equality on local-day to explicit range to avoid edge-case mismatches:
+        # (bucket_ts AT TIME ZONE :tz_name)::date = <expr>
+        def _rewrite_day_eq_to_range(match: re.Match) -> str:
+            expr = match.group(1).strip()
+            base = "(bucket_ts AT TIME ZONE :tz_name)"
+            return f"{base} >= ({expr})::timestamp AND {base} < (({expr})::timestamp + INTERVAL '1 day')"
+        # Special-case CURRENT_DATE and CURRENT_DATE - 1 to avoid nested rewrites
+        base = "(bucket_ts AT TIME ZONE :tz_name)"
+        s_new = re.sub(
+            r"(?is)\(\s*bucket_ts\s+at\s+time\s+zone\s*:tz_name\s*\)\s*::\s*date\s*=\s*\(\s*now\(\)\s+at\s+time\s+zone\s*:tz_name\s*\)\s*::\s*date\s*-\s*interval\s*'1\s*day'\b",
+            f"{base} >= (date_trunc('day', now() AT TIME ZONE :tz_name) - INTERVAL '1 day') AND {base} < date_trunc('day', now() AT TIME ZONE :tz_name)",
+            s_new
+        )
+        s_new = re.sub(
+            r"(?is)\(\s*bucket_ts\s+at\s+time\s+zone\s*:tz_name\s*\)\s*::\s*date\s*=\s*\(\s*now\(\)\s+at\s+time\s+zone\s*:tz_name\s*\)\s*::\s*date\b",
+            f"{base} >= date_trunc('day', now() AT TIME ZONE :tz_name) AND {base} < (date_trunc('day', now() AT TIME ZONE :tz_name) + INTERVAL '1 day')",
+            s_new
+        )
+        s_new = re.sub(
+            r"(?is)\(\s*bucket_ts\s+at\s+time\s+zone\s*:tz_name\s*\)\s*::\s*date\s*=\s*(.+?)(?=\s+\bAND\b|\s+\bOR\b|\s+\bGROUP\b|\s+\bORDER\b|\s+\bLIMIT\b|\)|$)",
+            _rewrite_day_eq_to_range,
+            s_new
+        )
+        # Also rewrite for timestamp on raw tables:
+        def _rewrite_ts_day_eq_to_range(match: re.Match) -> str:
+            expr = match.group(1).strip()
+            base = "(timestamp AT TIME ZONE :tz_name)"
+            return f"{base} >= ({expr})::timestamp AND {base} < (({expr})::timestamp + INTERVAL '1 day')"
+        s_new = re.sub(
+            r"(?is)\(\s*timestamp\s+at\s+time\s+zone\s*:tz_name\s*\)\s*::\s*date\s*=\s*(.+?)(?=\s+\bAND\b|\s+\bOR\b|\s+\bGROUP\b|\s+\bORDER\b|\s+\bLIMIT\b|\)|$)",
+            _rewrite_ts_day_eq_to_range,
+            s_new
+        )
+        # Normalize 'today' ranges that use date_trunc('day', now()) and now()
+        # Replace date_trunc('day', now()) with local midnight, and now() with local now
+        s_new = re.sub(
+            r"(?is)date_trunc\s*\(\s*'day'\s*,\s*now\s*\(\s*\)\s*\)",
+            "date_trunc('day', now() AT TIME ZONE :tz_name)",
+            s_new
+        )
+        s_new = re.sub(
+            r"(?is)\bnow\s*\(\s*\)\b",
+            "(now() AT TIME ZONE :tz_name)",
+            s_new
+        )
+        # Ensure comparisons are against localized bucket_ts
+        s_new = re.sub(
+            r"(?is)\bbucket_ts\s*(>=|>|<=|<)\s*",
+            r"(bucket_ts AT TIME ZONE :tz_name) \1 ",
+            s_new
+        )
+        # Replace string-literal placeholders for common day anchors with tz-safe expressions
+        # 'yesterday_start' => local midnight of the previous day
+        # 'yesterday_end'   => local midnight of today
+        # 'today_start'     => local midnight of today
+        # 'today_end'       => local midnight of tomorrow
+        s_new = re.sub(
+            r"(?is)'yesterday_start'",
+            "(date_trunc('day', now() AT TIME ZONE :tz_name) - INTERVAL '1 day')",
+            s_new,
+        )
+        s_new = re.sub(
+            r"(?is)'yesterday_end'",
+            "date_trunc('day', now() AT TIME ZONE :tz_name)",
+            s_new,
+        )
+        s_new = re.sub(
+            r"(?is)'today_start'",
+            "date_trunc('day', now() AT TIME ZONE :tz_name)",
+            s_new,
+        )
+        s_new = re.sub(
+            r"(?is)'today_end'",
+            "(date_trunc('day', now() AT TIME ZONE :tz_name) + INTERVAL '1 day')",
+            s_new,
+        )
+        # Neutralize unsupported bind parameters in time predicates to avoid execution errors.
+        # We only allow :user_id and :tz_name. Any predicate comparing time columns to other binds is dropped (replaced with TRUE).
+        def _drop_unknown_bind_time_predicates(sql_text: str) -> str:
+            # BETWEEN with unknown binds
+            sql_text = re.sub(
+                r"(?is)\(\s*bucket_ts\s+at\s+time\s+zone\s*:tz_name\s*\)\s+between\s*:\w+\s+and\s*:\w+",
+                "TRUE",
+                sql_text,
+            )
+            sql_text = re.sub(
+                r"(?is)\bbucket_ts\s+between\s*:\w+\s+and\s*:\w+",
+                "TRUE",
+                sql_text,
+            )
+            sql_text = re.sub(
+                r"(?is)\(\s*timestamp\s+at\s+time\s+zone\s*:tz_name\s*\)\s+between\s*:\w+\s+and\s*:\w+",
+                "TRUE",
+                sql_text,
+            )
+            sql_text = re.sub(
+                r"(?is)\btimestamp\s+between\s*:\w+\s+and\s*:\w+",
+                "TRUE",
+                sql_text,
+            )
+            # Comparisons with unknown binds (>=, >, <=, <)
+            for col_pattern in [
+                r"\(\s*bucket_ts\s+at\s+time\s+zone\s*:tz_name\s*\)",
+                r"\bbucket_ts\b",
+                r"\(\s*timestamp\s+at\s+time\s+zone\s*:tz_name\s*\)",
+                r"\btimestamp\b",
+            ]:
+                sql_text = re.sub(
+                    rf"(?is){col_pattern}\s*(>=|>|<=|<)\s*:\w+",
+                    "TRUE",
+                    sql_text,
+                )
+            return sql_text
+        s_new = _drop_unknown_bind_time_predicates(s_new)
+        if s_new != s:
+            s = s_new
+            try:
+                logging.getLogger(__name__).info("sql.rewrite.dates: normalized CURRENT_DATE and DATE(bucket_ts) to user tz")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     # If the query targets health_metrics but uses JSON metrics->>'...' syntax,
     # rewrite those JSON extracts to aggregate over rows by metric_type.
     # E.g., AVG((metrics->>'heart_rate')::float) -> AVG(CASE WHEN metric_type='heart_rate' THEN metric_value END)
@@ -324,57 +499,3 @@ def _sanitize_sql(sql: str) -> str:
         raise ValueError("Forbidden tokens in SQL")
 
     return s
-
-# Execute generated SQL command and return it and the result rows
-def execute_generated_sql(user_id: str, question: str) -> Dict[str, Any]:
-    client = OpenAI(api_key = os.getenv("OPENAI_API_KEY"))
-    prompt = f"Question: {question}\nReturn only SQL."
-    prompt_path = Path(__file__).resolve().parents[2] / "resources" / "chat_prompt.txt"
-    system_prompt = prompt_path.read_text(encoding = "utf-8")
-    resp = client.chat.completions.create(
-        model = "gpt-5-mini",
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt},
-        ]
-    )
-    sql = resp.choices[0].message.content if resp.choices else ""
-    try:
-        trunc = (sql[:500] + "...") if isinstance(sql, str) and len(sql) > 500 else sql
-        logger.info("sql.gen.raw: %s", trunc)
-    except Exception:
-        pass
-    if not isinstance(sql, str) or not sql.strip():
-        return {"sql": None, "rows": [], "error": "no-sql"}
-
-    try:
-        extracted = _extract_sql_from_text(sql)
-        try:
-            logger.info("sql.gen.extracted: %s", extracted)
-        except Exception:
-            pass
-        safe_sql = _sanitize_sql(extracted)
-        try:
-            logger.info("sql.safe: %s", safe_sql)
-        except Exception:
-            pass
-    except Exception as e:
-        return {"sql": sql, "rows": [], "error": f"invalid-sql: {e}"}
-
-    with SessionLocal() as session:
-        try:
-            result = session.execute(text(safe_sql), {"user_id": user_id}).mappings().all()
-            rows = [dict(r) for r in result]
-            try:
-                logger.info("sql.exec: user_id=%s rows=%d", user_id, len(rows))
-            except Exception:
-                pass
-            return {"sql": safe_sql, "rows": rows}
-        except Exception as e:
-            try:
-                logger.exception("sql.error: user_id=%s err=%s", user_id, str(e))
-            except Exception:
-                pass
-            return {"sql": safe_sql, "rows": [], "error": str(e)}
-
-

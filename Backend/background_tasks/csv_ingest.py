@@ -35,6 +35,17 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> Dict:
         logger.info("process_csv_upload: no rows for user_id=%s after filter; nothing to insert", user_id)
         return {"inserted": 0}
 
+    # Determine user's timezone from CSV if provided; fall back to UTC
+    tz_name = "UTC"
+    try:
+        if "timezone" in df.columns:
+            # Use the most frequent non-null timezone in the file
+            non_null_tz = df["timezone"].dropna()
+            if not non_null_tz.empty:
+                tz_name = str(non_null_tz.mode().iloc[0])
+    except Exception:
+        tz_name = "UTC"
+
     now_ts = df["timestamp"].max()
     # Retain only last 60 days to match frontend export window
     cutoff_ts = now_ts - pd.Timedelta(days = 60)
@@ -137,6 +148,27 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> Dict:
         # Summaries/embeddings disabled
         # Bulk insert raw metrics into health_metrics
         if not df_metrics.empty:
+            # Proactively clear the overlapping window to avoid duplicate buckets from re-exports
+            try:
+                t_min_existing = pd.to_datetime(df_metrics["timestamp"].min())
+                t_max_existing = pd.to_datetime(df_metrics["timestamp"].max())
+                if pd.notna(t_min_existing) and pd.notna(t_max_existing):
+                    session.execute(
+                        text(
+                            """
+                            DELETE FROM health_metrics
+                            WHERE user_id = :user_id
+                              AND timestamp >= :t0 AND timestamp < :t1
+                            """
+                        ),
+                        {
+                            "user_id": user_id,
+                            "t0": pd.Timestamp(t_min_existing).to_pydatetime(),
+                            "t1": (pd.Timestamp(t_max_existing).to_pydatetime()),
+                        },
+                    )
+            except Exception:
+                logger.exception("Failed to clear overlapping health_metrics window for user_id=%s", user_id)
             params_m = [
                 {
                     "user_id": user_id,
@@ -239,38 +271,8 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> Dict:
                         ),
                         {"user_id": user_id, "t0": t0, "t1": t1},
                     )
-                    # Upsert DAILY from hourly rollups (weighted averages for continuous, sums for additive)
-                    session.execute(
-                        text(
-                            """
-                            INSERT INTO health_rollup_daily
-                                (user_id, bucket_ts, metric_type, avg_value, sum_value, min_value, max_value, n)
-                            SELECT
-                                user_id,
-                                date_trunc('day', bucket_ts) AS bucket_ts,
-                                metric_type,
-                                CASE WHEN SUM(n) > 0 THEN SUM(COALESCE(avg_value, 0) * n) / SUM(n) END AS avg_value,
-                                SUM(COALESCE(sum_value, 0)) AS sum_value,
-                                MIN(min_value) AS min_value,
-                                MAX(max_value) AS max_value,
-                                SUM(n) AS n
-                            FROM health_rollup_hourly
-                            WHERE user_id = :user_id
-                              AND bucket_ts >= date_trunc('day', :t0)
-                              AND bucket_ts <  date_trunc('day', :t1) + INTERVAL '1 day'
-                            GROUP BY user_id, date_trunc('day', bucket_ts), metric_type
-                            ON CONFLICT (user_id, metric_type, bucket_ts) DO UPDATE SET
-                              avg_value = EXCLUDED.avg_value,
-                              sum_value = EXCLUDED.sum_value,
-                              min_value = EXCLUDED.min_value,
-                              max_value = EXCLUDED.max_value,
-                              n = EXCLUDED.n
-                            """
-                        ),
-                        {"user_id": user_id, "t0": t0, "t1": t1},
-                    )
         except Exception:
             logger.exception("Failed to compute rollups for user_id=%s", user_id)
         session.commit()
-    logger.info("process_csv_upload: done user_id=%s metrics=%s events=%s", user_id, len(df_metrics), len(df_events))
+    logger.info("process_csv_upload: done user_id=%s metrics=%s events=%s tz=%s", user_id, len(df_metrics), len(df_events), tz_name)
     return {"inserted": int(len(df_metrics) + len(df_events))}

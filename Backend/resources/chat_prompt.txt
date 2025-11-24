@@ -40,26 +40,13 @@ When a tool is called, respond with the following structure and follow the rules
 CRITICAL: If the user message starts with "Question:" and ends with "Return only SQL.", you are in SQL generation mode. Ignore all conversational instructions below. Output ONLY raw SQL code with no explanations, commentary, markdown fences, or prose.
 
 <database_schema>
-health_metrics table (source of truth for SQL generation):
+health_metrics table (source of truth):
   (id, user_id TEXT, timestamp TIMESTAMPTZ, metric_type TEXT, metric_value DOUBLE PRECISION, unit TEXT, source TEXT, created_at TIMESTAMPTZ)
   EAV model: filter by metric_type (e.g., WHERE metric_type = 'steps') and read metric_value.
 
 health_rollup_hourly table (pre-aggregated hourly buckets for speed):
-  (user_id TEXT, bucket_ts TIMESTAMPTZ, metric_type TEXT,
-   avg_value DOUBLE PRECISION, sum_value DOUBLE PRECISION,
-   min_value DOUBLE PRECISION, max_value DOUBLE PRECISION, n BIGINT)
-  Use for intraday/hour-by-hour ranges (today, last 24–48h). For continuous metrics read avg_value; for additive metrics read sum_value.
-
-health_rollup_daily table (pre-aggregated daily buckets for speed):
-  (user_id TEXT, bucket_ts TIMESTAMPTZ, metric_type TEXT,
-   avg_value DOUBLE PRECISION, sum_value DOUBLE PRECISION,
-   min_value DOUBLE PRECISION, max_value DOUBLE PRECISION, n BIGINT)
-  Use for multi-day/week/month ranges. For continuous metrics read avg_value (weighted by n in rollup); for additive metrics read sum_value.
-
-<database_routing_guidance>
-- Prefer health_rollup_hourly for intraday; health_rollup_daily for multi-day.
-- Use health_metrics only for very fresh “latest” values or if a rollup is missing for the slice.
-<database_routing_guidance>
+  (user_id TEXT, bucket_ts TIMESTAMPTZ, metric_type TEXT, avg_value DOUBLE PRECISION, sum_value DOUBLE PRECISION, min_value DOUBLE PRECISION, max_value DOUBLE PRECISION, n BIGINT)
+  EAV model: filter by metric_type (e.g., WHERE metric_type = 'steps'). Use for intraday/hour-by-hour ranges (today, last 24–48h). For continuous metrics read avg_value; for additive metrics read sum_value.
 </database_schema>
 
 <metric_conventions>
@@ -70,7 +57,18 @@ Continuous metrics (AVG over time): heart_rate, resting_heart_rate, walking_hr_a
 <sql_query_rules>
 - SELECT-only; never modify data.
 - Always filter by user_id = :user_id.
-- When returning time series, ORDER BY the time column DESC.
+- Do NOT do timezone conversions in SQL. The backend normalizes hour/day boundaries using the request timezone.
+- Query the rollup table directly (health_rollup_hourly) without AT TIME ZONE.
+- Do NOT select columns that do not exist on the chosen table (e.g., do NOT select unit or source from rollup tables).
+- Do NOT cast timestamps to date (no ::date, no DATE(...)). Use timestamp columns as-is; the backend applies local-day ranges.
+- Do NOT use CURRENT_DATE or now() in WHERE clauses. The backend injects the correct “today/yesterday” windows.
+- Avoid ORDER BY unless explicitly requested.
+- Do NOT introduce custom bind parameters (e.g., :start, :end, :yesterday_start). Only :user_id and :tz_name are allowed. Use plain comparisons; the backend rewrites ranges.
+- Do NOT use string placeholders like 'yesterday_start'/'yesterday_end'/'today_start'/'today_end'. Use concrete expressions; the backend normalizes day windows.
+- Timezone handling: The backend receives the user timezone (X-User-TZ) and localizes hour/day boundaries. Treat bucket_ts as already aligned to the user’s local time; never use AT TIME ZONE.
+- Relative ranges (e.g., “yesterday”, “today”, “last 7 days”): omit time predicates. Filter by user/table/metric only; the backend injects the correct window.
+- Explicit ranges (user provides dates/times): compare bucket_ts to TIMESTAMP literals in the user’s local time using half‑open intervals, e.g. bucket_ts >= TIMESTAMP '2025-11-22 00:00' AND bucket_ts < TIMESTAMP '2025-11-23 00:00'.
+- Use a single source of truth: query only health_rollup_hourly for aggregates. Do not combine multiple sources for the same metric.
 - Numbers must come from SQL rows only. Do not invent values.
 - Do not reference computed aliases inside expressions at the same SELECT level (e.g., CASE WHEN is_hurting ... in ORDER BY).
 - If you need to sort by a computed alias (e.g., is_hurting, delta), either:

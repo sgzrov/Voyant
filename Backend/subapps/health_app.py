@@ -13,6 +13,7 @@ from sqlalchemy import func, text
 from datetime import timezone
 from zoneinfo import ZoneInfo
 import time
+import re
 
 from Backend.auth import verify_clerk_jwt
 from Backend.background_tasks.csv_ingest import process_csv_upload
@@ -22,12 +23,13 @@ from Backend.crud.chat import get_chat_history, create_chat_message
 from Backend.models.chat_data_model import ChatsDB
 
 
-async def _fetch_health_context(user_id: str, question: str, client: OpenAI, system_prompt: str, model: str):
+async def _fetch_health_context(user_id: str, question: str, client: OpenAI, system_prompt: str, model: str, tz_name: str):
     """Generate SQL using chat prompt, then execute it."""
     # Ask the model to generate SQL for this question
     sql_prompt = f"Question: {question}\nReturn only SQL."
     logger.info("sql.gen.start: question='%s' model=%s", question, model)
 
+    t0_llm = time.perf_counter()
     sql_resp = client.chat.completions.create(
         model=model,
         messages=[
@@ -35,6 +37,11 @@ async def _fetch_health_context(user_id: str, question: str, client: OpenAI, sys
             {"role": "user", "content": sql_prompt},
         ]
     )
+    try:
+        dt_llm = time.perf_counter() - t0_llm
+        logger.info("sql.gen.llm: question='%s' llm_ms=%d", question, int(dt_llm * 1000))
+    except Exception:
+        pass
     sql_text = sql_resp.choices[0].message.content if sql_resp.choices else ""
     logger.info("sql.gen.raw: question='%s' raw_output='%s'", question, sql_text[:500] + "..." if len(sql_text) > 500 else sql_text)
 
@@ -58,19 +65,36 @@ async def _fetch_health_context(user_id: str, question: str, client: OpenAI, sys
     def execute_sql():
         with SessionLocal() as session:
             try:
-                logger.info("sql.exec.start: question='%s' user_id=%s", question, user_id)
-                result = session.execute(text(safe_sql), {"user_id": user_id}).mappings().all()
+                # Debug which tables are referenced by the query
+                try:
+                    lowered = safe_sql.lower()
+                    sources = []
+                    if "health_rollup_daily" in lowered:
+                        sources.append("health_rollup_daily")
+                    if "health_rollup_hourly" in lowered:
+                        sources.append("health_rollup_hourly")
+                    if "health_metrics" in lowered:
+                        sources.append("health_metrics")
+                    if "health_events" in lowered:
+                        sources.append("health_events")
+                    logger.info("sql.exec.start: question='%s' user_id=%s tables=%s", question, user_id, ",".join(sources) if sources else "unknown")
+                except Exception:
+                    logger.info("sql.exec.start: question='%s' user_id=%s tables=unknown", question, user_id)
+                t0_exec = time.time()
+                # Bind only user_id and tz_name; date windows are rewritten inside SQL
+                result = session.execute(text(safe_sql), {"user_id": user_id, "tz_name": tz_name}).mappings().all()
                 rows = [dict(r) for r in result]
+                dt_ms = int((time.time() - t0_exec) * 1000)
 
                 # Log sample of rows for debugging
                 if rows:
-                    logger.info("sql.exec.result: question='%s' row_count=%d sample_first_row=%s",
-                              question, len(rows), str(rows[0])[:300] if rows else "none")
+                    logger.info("sql.exec.result: question='%s' row_count=%d db_ms=%d sample_first_row=%s",
+                              question, len(rows), dt_ms, str(rows[0])[:300] if rows else "none")
                     if len(rows) > 1:
                         logger.info("sql.exec.result: question='%s' sample_last_row=%s",
                                   question, str(rows[-1])[:300])
                 else:
-                    logger.warning("sql.exec.empty: question='%s' sql='%s'", question, safe_sql[:500])
+                    logger.warning("sql.exec.empty: question='%s' db_ms=%d sql='%s'", question, dt_ms, safe_sql[:500])
 
                 return {"sql": safe_sql, "rows": rows}
             except Exception as e:
@@ -278,8 +302,10 @@ async def query_stream(payload: dict, request: Request):
         # Stream with tools - model decides if tool is needed
         try:
             try:
+                t0_stream = time.perf_counter()
                 logger.info("stream.start: conv=%s provider=%s model=%s", conversation_id, provider, answer_model)
             except Exception:
+                t0_stream = time.perf_counter()
                 pass
             stream = client.chat.completions.create(
                 model = answer_model,
@@ -298,7 +324,7 @@ async def query_stream(payload: dict, request: Request):
             sql_task = None
             if question:  # Only if we have a question to work with
                 sql_task = asyncio.create_task(
-                    _fetch_health_context(user_id, question, client, system, answer_model)
+                    _fetch_health_context(user_id, question, client, system, answer_model, user_tz)
                 )
 
             # Stream and collect tool calls if any
@@ -455,7 +481,8 @@ async def query_stream(payload: dict, request: Request):
                     yield f"data: {json.dumps({'content': full_response, 'done': False})}\n\n"
 
             try:
-                logger.info("stream.done: conv=%s chars=%d", conversation_id, streamed_chars)
+                dt_stream = time.perf_counter() - t0_stream
+                logger.info("stream.done: conv=%s chars=%d model_ms=%d", conversation_id, streamed_chars, int(dt_stream * 1000))
             except Exception:
                 pass
         except Exception as e:

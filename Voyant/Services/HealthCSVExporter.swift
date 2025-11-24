@@ -320,7 +320,8 @@ struct HealthCSVExporter {
                                       aggregation: MetricSpec.Aggregation,
                                       completion: @escaping (Result<[DataPoint], Error>) -> Void) {
         let predicate = HKQuery.predicateForSamples(withStart: start, end: end, options: .strictStartDate)
-        let anchorDate = start
+        // Use a stable anchor at local midnight to ensure bucket boundaries are identical across exports
+        let anchorDate = Calendar.current.startOfDay(for: Date())
         let statsOptions: HKStatisticsOptions = (aggregation == .sum) ? .cumulativeSum : .discreteAverage
 
         let query = HKStatisticsCollectionQuery(quantityType: quantityType, quantitySamplePredicate: predicate, options: statsOptions, anchorDate: anchorDate, intervalComponents: interval)
