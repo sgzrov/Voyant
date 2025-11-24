@@ -61,12 +61,22 @@ Continuous metrics (AVG over time): heart_rate, resting_heart_rate, walking_hr_a
 - Query the rollup table directly (health_rollup_hourly) without AT TIME ZONE.
 - Do NOT select columns that do not exist on the chosen table (e.g., do NOT select unit or source from rollup tables).
 - Do NOT cast timestamps to date (no ::date, no DATE(...)). Use timestamp columns as-is; the backend applies local-day ranges.
-- Do NOT use CURRENT_DATE or now() in WHERE clauses. The backend injects the correct “today/yesterday” windows.
+- For date calculations, you CAN use now() - the backend will automatically make it timezone-aware.
 - Avoid ORDER BY unless explicitly requested.
 - Do NOT introduce custom bind parameters (e.g., :start, :end, :yesterday_start). Only :user_id and :tz_name are allowed. Use plain comparisons; the backend rewrites ranges.
-- Do NOT use string placeholders like 'yesterday_start'/'yesterday_end'/'today_start'/'today_end'. Use concrete expressions; the backend normalizes day windows.
-- Timezone handling: The backend receives the user timezone (X-User-TZ) and localizes hour/day boundaries. Treat bucket_ts as already aligned to the user’s local time; never use AT TIME ZONE.
-- Relative ranges (e.g., “yesterday”, “today”, “last 7 days”): omit time predicates. Filter by user/table/metric only; the backend injects the correct window.
+- CRITICAL: ALWAYS include date filters when the user mentions ANY time period (specific or vague). Never omit date predicates.
+- Timezone handling: The backend receives the user timezone (X-User-TZ) and localizes hour/day boundaries. Treat bucket_ts as already aligned to the user's local time; never use AT TIME ZONE.
+- Date filtering: ALWAYS include date predicates when time is mentioned or implied:
+  * For "yesterday": bucket_ts >= 'yesterday_start' AND bucket_ts < 'yesterday_end' (note the QUOTES around placeholders!)
+  * For "today": bucket_ts >= 'today_start' AND bucket_ts < 'today_end' (must be quoted strings!)
+  * For other relative dates, use date_trunc('day', now() ± INTERVAL 'X days/weeks/months')
+  * For vague references, make reasonable assumptions:
+    - "recently" or "lately" → last 7 days
+    - "last few days" → last 3-5 days
+    - "this week" → last 7 days
+  * If NO time period is mentioned at all, default to last 7 days (don't fetch all historical data)
+  * Always use half-open intervals: bucket_ts >= start AND bucket_ts < end
+  * The backend will handle timezone conversion automatically
 - Explicit ranges (user provides dates/times): compare bucket_ts to TIMESTAMP literals in the user’s local time using half‑open intervals, e.g. bucket_ts >= TIMESTAMP '2025-11-22 00:00' AND bucket_ts < TIMESTAMP '2025-11-23 00:00'.
 - Use a single source of truth: query only health_rollup_hourly for aggregates. Do not combine multiple sources for the same metric.
 - Numbers must come from SQL rows only. Do not invent values.
