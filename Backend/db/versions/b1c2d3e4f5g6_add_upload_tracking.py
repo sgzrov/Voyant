@@ -33,14 +33,14 @@ def upgrade():
         sa.Column('idempotency_key', sa.String(length=64), nullable=True),
         sa.Column('request_count', sa.Integer(), nullable=False, default=1),
     )
-    
+
     # Create indexes for efficient lookups
     op.create_index('ix_health_upload_tracking_user_id', 'health_upload_tracking', ['user_id'])
     op.create_index('ix_health_upload_tracking_task_id', 'health_upload_tracking', ['task_id'])
     op.create_index('ix_health_upload_tracking_status', 'health_upload_tracking', ['status'])
     op.create_index('ix_health_upload_tracking_created_at', 'health_upload_tracking', ['created_at'])
     op.create_index('ix_health_upload_tracking_idempotency_key', 'health_upload_tracking', ['idempotency_key'])
-    
+
     # Unique constraint to prevent duplicate uploads with same content hash
     op.create_index('ix_health_upload_tracking_user_id_hash', 'health_upload_tracking', ['user_id', 'id'], unique=True)
 

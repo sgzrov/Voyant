@@ -215,34 +215,36 @@ def _sanitize_sql(sql: str) -> str:
     # Prefer real measurements from rollups by excluding empty buckets by default.
     # We only add "AND n > 0" when the query touches a health_rollup_* table AND
     # the SQL does NOT explicitly reason about missing data (n = 0 / n IS NULL / COALESCE(n,...) = 0).
-    try:
-        uses_rollup = bool(re.search(r"(?is)\bfrom\s+health_rollup_(5min|hourly|daily)\b", s))
-        mentions_missing_n = bool(re.search(r"(?is)\bn\s*=\s*0\b|\bn\s+is\s+null\b|coalesce\s*\([^)]*\bn[^)]*\)\s*=\s*0", s))
-        already_filters_n_pos = bool(re.search(r"(?is)\bn\s*>\s*0\b", s))
-        if uses_rollup and not mentions_missing_n and not already_filters_n_pos:
-            # Find the LAST WHERE (closest to end) to avoid matching WHEREs in earlier CTEs/subqueries
-            where_matches = list(re.finditer(r"(?is)\bwhere\b", s))
-            m_where_last = where_matches[-1] if where_matches else None
-            # Find clause boundaries that APPEAR AFTER the chosen WHERE (or from the start if no WHERE)
-            start_idx = m_where_last.end() if m_where_last else 0
-            m_order_after = re.search(r"(?is)\border\s+by\b", s[start_idx:])
-            m_group_after = re.search(r"(?is)\bgroup\s+by\b", s[start_idx:])
-            m_limit_after = re.search(r"(?is)\blimit\b", s[start_idx:])
-            # Compute absolute indices
-            clause_indices = []
-            for m in [m_group_after, m_order_after, m_limit_after]:
-                if m:
-                    clause_indices.append(start_idx + m.start())
-            insert_pos = min(clause_indices) if clause_indices else len(s)
-            if m_where_last:
-                # Append to existing WHERE just before the next clause (or end)
-                s = s[:insert_pos] + " AND n > 0 " + s[insert_pos:]
-            else:
-                # No WHERE: inject WHERE before LIMIT/ORDER/GROUP if present; otherwise at end
-                s = s[:insert_pos] + " WHERE n > 0 " + s[insert_pos:]
-    except Exception:
-        # Best-effort; if anything goes wrong, skip injection
-        pass
+    # NOTE: Disabled for now due to complexity with subqueries causing syntax errors
+    # TODO: Fix this logic to properly handle complex nested queries
+    # try:
+    #     uses_rollup = bool(re.search(r"(?is)\bfrom\s+health_rollup_(5min|hourly|daily)\b", s))
+    #     mentions_missing_n = bool(re.search(r"(?is)\bn\s*=\s*0\b|\bn\s+is\s+null\b|coalesce\s*\([^)]*\bn[^)]*\)\s*=\s*0", s))
+    #     already_filters_n_pos = bool(re.search(r"(?is)\bn\s*>\s*0\b", s))
+    #     if uses_rollup and not mentions_missing_n and not already_filters_n_pos:
+    #         # Find the LAST WHERE (closest to end) to avoid matching WHEREs in earlier CTEs/subqueries
+    #         where_matches = list(re.finditer(r"(?is)\bwhere\b", s))
+    #         m_where_last = where_matches[-1] if where_matches else None
+    #         # Find clause boundaries that APPEAR AFTER the chosen WHERE (or from the start if no WHERE)
+    #         start_idx = m_where_last.end() if m_where_last else 0
+    #         m_order_after = re.search(r"(?is)\border\s+by\b", s[start_idx:])
+    #         m_group_after = re.search(r"(?is)\bgroup\s+by\b", s[start_idx:])
+    #         m_limit_after = re.search(r"(?is)\blimit\b", s[start_idx:])
+    #         # Compute absolute indices
+    #         clause_indices = []
+    #         for m in [m_group_after, m_order_after, m_limit_after]:
+    #             if m:
+    #                 clause_indices.append(start_idx + m.start())
+    #         insert_pos = min(clause_indices) if clause_indices else len(s)
+    #         if m_where_last:
+    #             # Append to existing WHERE just before the next clause (or end)
+    #             s = s[:insert_pos] + " AND n > 0 " + s[insert_pos:]
+    #         else:
+    #             # No WHERE: inject WHERE before LIMIT/ORDER/GROUP if present; otherwise at end
+    #             s = s[:insert_pos] + " WHERE n > 0 " + s[insert_pos:]
+    # except Exception:
+    #     # Best-effort; if anything goes wrong, skip injection
+    #     pass
 
     # Rewrite improper HAVING without GROUP BY into an outer WHERE on a subquery,
     # so alias filters like HAVING prev_value ... become valid.
