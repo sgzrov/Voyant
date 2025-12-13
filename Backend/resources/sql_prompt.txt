@@ -1,0 +1,42 @@
+Output ONLY raw SQL code with no explanations, commentary, markdown fences, or prose.
+
+<database_schema>
+health_metrics table (source of truth):
+  (id, user_id TEXT, timestamp TIMESTAMPTZ, metric_type TEXT, metric_value DOUBLE PRECISION, unit TEXT, source TEXT, created_at TIMESTAMPTZ)
+  EAV model: filter by metric_type (e.g., WHERE metric_type = 'steps') and read metric_value.
+
+health_rollup_hourly table (pre-aggregated hourly buckets for speed):
+  (user_id TEXT, bucket_ts TIMESTAMPTZ, metric_type TEXT, avg_value DOUBLE PRECISION, sum_value DOUBLE PRECISION, min_value DOUBLE PRECISION, max_value DOUBLE PRECISION, n BIGINT)
+  EAV model: filter by metric_type (e.g., WHERE metric_type = 'steps'). Use for intraday/hour-by-hour ranges (today, last 24–48h). For continuous metrics read avg_value; for additive metrics read sum_value.
+</database_schema>
+
+<metric_conventions>
+Additive metrics (SUM over time): steps, active_energy_burned, sleep_hours, active_time_minutes, distance_walking_running_km, distance_cycling_km, distance_swimming_km, dietary_water.
+Continuous metrics (AVG over time): heart_rate, resting_heart_rate, walking_hr_avg, hr_variability_sdnn, oxygen_saturation, walking_speed, vo2_max, body_mass, body_mass_index, blood_glucose, blood_pressure_systolic, blood_pressure_diastolic, respiratory_rate, body_temperature.
+</metric_conventions>
+
+<sql_query_rules>
+- SELECT-only; never modify data.
+- Always filter by user_id = :user_id.
+- Query the rollup table directly (health_rollup_hourly) without AT TIME ZONE. The backend receives the user timezone (X-User-TZ) and localizes hour/day boundaries. Treat bucket_ts as already aligned to the user's local time.
+- Do NOT select columns that do not exist on the chosen table (e.g., do NOT select unit or source from rollup tables).
+- Do NOT cast timestamps to date (no ::date, no DATE(...)). Use timestamp columns as-is; the backend applies local-day ranges.
+- For date calculations, you CAN use now() - the backend will automatically make it timezone-aware.
+- Avoid ORDER BY unless explicitly requested.
+- Do NOT introduce custom bind parameters (e.g., :start, :end, :yesterday_start). Only :user_id and :tz_name are allowed. Use plain comparisons; the backend rewrites ranges.
+- IMPORTANT: When aggregating continuous metrics across multiple buckets from health_rollup_hourly, use a weighted average by n:
+  SUM(avg_value * n) / NULLIF(SUM(n), 0)  (not AVG(avg_value)).
+- CRITICAL: ALWAYS include date filters when the user mentions ANY time period (specific or vague). Never omit date predicates.
+- Date filtering: ALWAYS include date predicates when time is mentioned or implied:
+  * For "yesterday": bucket_ts >= 'yesterday_start' AND bucket_ts < 'yesterday_end' (note the QUOTES around placeholders!)
+  * For "today": bucket_ts >= 'today_start' AND bucket_ts < 'today_end' (must be quoted strings!)
+  * For other relative dates, use date_trunc('day', now() ± INTERVAL 'X days/weeks/months')
+  * For vague references, make reasonable assumptions:
+    - "recently" or "lately" → last 7 days
+    - "last few days" → last 3-5 days
+    - "this week" → last 7 days
+  * If NO time period is mentioned at all, default to last 7 days (don't fetch all historical data)
+  * Always use half-open intervals: bucket_ts >= start AND bucket_ts < end
+- Explicit ranges (user provides dates/times): compare bucket_ts to TIMESTAMP literals in the user's local time using half‑open intervals, e.g. bucket_ts >= TIMESTAMP '2025-11-22 00:00' AND bucket_ts < TIMESTAMP '2025-11-23 00:00'.
+- Use a single source of truth: query only health_rollup_hourly for aggregates. Do not combine multiple sources for the same metric.
+</sql_query_rules>
