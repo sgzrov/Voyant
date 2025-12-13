@@ -32,6 +32,13 @@ struct StreamingChunk: Codable {
     let content: String?
     let done: Bool
     let error: String?
+    let title: String?
+    let conversationId: String?
+
+    enum CodingKeys: String, CodingKey {
+        case content, done, error, title
+        case conversationId = "conversation_id"
+    }
 }
 
 class SSEService: NSObject, URLSessionDataDelegate {
@@ -179,8 +186,10 @@ class SSEStreamDelegate: NSObject, URLSessionDataDelegate {
         switch event.type {
         case .message:
             // If the server provides a conversation_id in the event payload, forward the raw JSON
-            // so the consumer can extract and persist it before streaming content arrives.
+            // so the consumer can extract metadata (conversation_id, title) before streaming content arrives.
             if event.data.contains("\"conversation_id\"") {
+                print("[SSEStreamDelegate] *** METADATA CHUNK DETECTED - forwarding raw JSON with conversation_id ***")
+                print("[SSEStreamDelegate] Raw metadata: \(event.data)")
                 continuation.yield(event.data)
                 return
             }

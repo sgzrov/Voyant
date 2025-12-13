@@ -53,7 +53,7 @@ struct ChatView: View {
                     }
                     if !hasSentFirstMessage && oldValue.isEmpty && !newValue.isEmpty {
                         // Only append to history once the conversation_id is known
-                        if session.conversationId != nil {
+                        if messageVM.conversationId != nil {
                             hasSentFirstMessage = true
                             newSessionHandler?(session)
                         }
@@ -71,7 +71,7 @@ struct ChatView: View {
             )
         }
         .background(Color(.systemGroupedBackground))
-        .navigationTitle(session.title)
+        .navigationTitle("")
         .navigationBarTitleDisplayMode(.inline)
 
     }

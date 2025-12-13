@@ -18,11 +18,62 @@ class ChatHistoryViewModel: ObservableObject {
 
     init(userToken: String) {
         self.userToken = userToken
+
+        // Listen for title updates
+        NotificationCenter.default.addObserver(
+            forName: .chatTitleUpdated,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            self?.handleTitleUpdate(notification)
+        }
+
+        // Listen for new chat creation
+        NotificationCenter.default.addObserver(
+            forName: .chatCreated,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            self?.handleChatCreated(notification)
+        }
+    }
+
+    private func handleTitleUpdate(_ notification: Notification) {
+        guard let userInfo = notification.userInfo,
+              let conversationId = userInfo["conversationId"] as? String,
+              let title = userInfo["title"] as? String else {
+            return
+        }
+
+        // Update the title in our local sessions array
+        if let index = chatSessions.firstIndex(where: { $0.conversationId == conversationId }) {
+            chatSessions[index].title = title
+            print("[DEBUG] ChatHistoryViewModel: Updated title for \(conversationId) to '\(title)'")
+        }
+    }
+
+    private func handleChatCreated(_ notification: Notification) {
+        guard let userInfo = notification.userInfo,
+              let session = userInfo["session"] as? ChatSession else {
+            return
+        }
+
+        // Add the new session at the top if it doesn't exist
+        if !chatSessions.contains(where: { $0.id == session.id }) {
+            chatSessions.insert(session, at: 0)
+            print("[DEBUG] ChatHistoryViewModel: Added new chat session instantly")
+        }
     }
 
     func appendSessionIfNeeded(_ session: ChatSession) {
         if !chatSessions.contains(where: { $0.id == session.id }) {
             chatSessions.insert(session, at: 0)
+        }
+    }
+
+    func updateSessionTitle(conversationId: String, title: String) {
+        if let index = chatSessions.firstIndex(where: { $0.conversationId == conversationId }) {
+            chatSessions[index].title = title
         }
     }
 
@@ -53,11 +104,11 @@ class ChatHistoryViewModel: ObservableObject {
                     let group = DispatchGroup()
                     var tempSessions: [ChatSession] = []
 
-                    for (conversationId, lastActiveDate) in sessionTuples {
+                    for (conversationId, title, lastActiveDate) in sessionTuples {
                         group.enter()
-                        print("[DEBUG] ChatHistoryViewModel: Fetching history for conversation \(conversationId), lastActiveDate = \(lastActiveDate?.description ?? "nil")")
+                        print("[DEBUG] ChatHistoryViewModel: Fetching history for conversation \(conversationId), title = \(title ?? "nil"), lastActiveDate = \(lastActiveDate?.description ?? "nil")")
                         BackendService.shared.fetchChatHistory(conversationId: conversationId, userToken: token) { messages in
-                            let session = ChatSession(conversationId: conversationId, messages: messages, lastActiveDate: lastActiveDate)
+                            let session = ChatSession(conversationId: conversationId, title: title ?? "New Chat", messages: messages, lastActiveDate: lastActiveDate)
                             tempSessions.append(session)
                             print("[DEBUG] ChatHistoryViewModel: Added session with \(messages.count) messages for \(conversationId), lastActiveDate = \(lastActiveDate?.description ?? "nil")")
                             group.leave()
@@ -104,10 +155,10 @@ class ChatHistoryViewModel: ObservableObject {
                     let group = DispatchGroup()
                     var tempSessions: [ChatSession] = []
 
-                    for (conversationId, lastActiveDate) in sessionTuples {
+                    for (conversationId, title, lastActiveDate) in sessionTuples {
                         group.enter()
                         BackendService.shared.fetchChatHistory(conversationId: conversationId, userToken: token) { messages in
-                            let session = ChatSession(conversationId: conversationId, messages: messages, lastActiveDate: lastActiveDate)
+                            let session = ChatSession(conversationId: conversationId, title: title ?? "New Chat", messages: messages, lastActiveDate: lastActiveDate)
                             tempSessions.append(session)
                             group.leave()
                         }

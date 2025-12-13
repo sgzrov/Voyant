@@ -15,6 +15,7 @@ class MessageViewModel: ObservableObject {
     @Published var inputMessage: String = ""
     @Published var messages: [ChatMessage]
     @Published var selectedModel: ModelOption = .openai_gpt5mini
+    @Published var chatTitle: String
 
     private var session: ChatSession
 
@@ -26,17 +27,35 @@ class MessageViewModel: ObservableObject {
         self.session = session
         self.userToken = userToken
         self.messages = session.messages
+        self.chatTitle = session.title
+    }
+
+    var conversationId: String? {
+        session.conversationId
     }
 
     func sendMessage() {
         guard !inputMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         guard !isLoading else { return }
 
-        let userMessage = ChatMessage(content: inputMessage, role: .user)
+        let isFirstMessage = messages.isEmpty
+
+        let trimmedInput = inputMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+        let userMessage = ChatMessage(content: trimmedInput, role: .user)
         messages.append(userMessage)
         session.messages = messages
+        session.lastActiveDate = Date()
 
-        let userInput = inputMessage
+        // Instantly add new chat to the list when first message is sent
+        if isFirstMessage {
+            NotificationCenter.default.post(
+                name: .chatCreated,
+                object: nil,
+                userInfo: ["session": session]
+            )
+        }
+
+        let userInput = trimmedInput
         inputMessage = ""
         isLoading = true
 
@@ -65,9 +84,17 @@ class MessageViewModel: ObservableObject {
 
             for await chunk in stream {
                 if isFirstChunk {
-                    if let id = extractConversationId(from: chunk) {
-                        session.conversationId = id
-                        // Skip appending this initial JSON chunk (conversation_id metadata)
+                    print("[MessageViewModel] First chunk received: '\(chunk.prefix(200))'")
+                    if let (id, title) = extractMetadata(from: chunk) {
+                        print("[MessageViewModel] Extracted metadata - id: \(id ?? "nil"), title: \(title ?? "nil")")
+                        if let id = id {
+                            session.conversationId = id
+                        }
+                        if let title = title {
+                            print("[MessageViewModel] Updating title to: '\(title)'")
+                            updateTitle(title)
+                        }
+                        // Skip appending this initial JSON chunk (metadata)
                         isFirstChunk = false
                         continue
                     }
@@ -94,11 +121,35 @@ class MessageViewModel: ObservableObject {
         isLoading = false
     }
 
-    private func extractConversationId(from chunk: String) -> String? {
+    private func updateTitle(_ title: String) {
+        print("[MessageViewModel] updateTitle called with: '\(title)'")
+        self.chatTitle = title
+        self.session.title = title
+
+        // Broadcast the title update
+        if let conversationId = session.conversationId {
+            print("[MessageViewModel] Broadcasting title update for conversation: \(conversationId)")
+            NotificationCenter.default.post(
+                name: .chatTitleUpdated,
+                object: nil,
+                userInfo: [
+                    "conversationId": conversationId,
+                    "title": title
+                ]
+            )
+        } else {
+            print("[MessageViewModel] WARNING: No conversationId yet, cannot broadcast title update")
+        }
+    }
+
+    private func extractMetadata(from chunk: String) -> (String?, String?)? {
         if let data = chunk.data(using: .utf8),
-           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let id = json["conversation_id"] as? String {
-            return id
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            let id = json["conversation_id"] as? String
+            let title = json["title"] as? String
+            if id != nil || title != nil {
+                return (id, title)
+            }
         }
         return nil
     }

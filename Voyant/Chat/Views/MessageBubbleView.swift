@@ -19,7 +19,7 @@ struct MessageBubbleView: View {
 
             VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 4) {
                 HStack(alignment: .top, spacing: 8) {
-                    Text(message.content.isEmpty && message.state == .streaming ? "Thinking..." : message.content)
+                    Text(message.content.isEmpty && message.state == .streaming ? "Thinking..." : message.content.trimmingCharacters(in: .newlines))
                         .padding(.horizontal, 16)
                         .padding(.vertical, 10)
                         .background(message.role == .user ? Color.accentColor : .secondary.opacity(0.3))

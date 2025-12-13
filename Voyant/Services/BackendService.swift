@@ -10,10 +10,12 @@ import Combine
 
 struct SessionDTO: Decodable {
     let conversationId: String
+    let title: String?
     let lastActiveDate: String?
 
     enum CodingKeys: String, CodingKey {
         case conversationId = "conversation_id"
+        case title
         case lastActiveDate = "last_active_date"
     }
 }
@@ -78,7 +80,8 @@ extension BackendService {
 
     // MARK: - Chat Operations
 
-    func fetchChatSessions(userToken: String, completion: @escaping ([(String, Date?)]) -> Void) {
+    /// Fetches chat sessions with (conversationId, title, lastActiveDate)
+    func fetchChatSessions(userToken: String, completion: @escaping ([(String, String?, Date?)]) -> Void) {
         guard let url = URL(string: "\(AuthService.backendBaseURL)/chat/retrieve-chat-sessions/") else {
             DispatchQueue.main.async { completion([]) }
             return
@@ -120,7 +123,7 @@ extension BackendService {
             }
 
             let sessions = result.sessions.map { session in
-                (session.conversationId, Self.parseBackendDate(session.lastActiveDate))
+                (session.conversationId, session.title, Self.parseBackendDate(session.lastActiveDate))
             }
             DispatchQueue.main.async { completion(sessions) }
         }.resume()

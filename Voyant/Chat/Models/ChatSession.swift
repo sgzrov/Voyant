@@ -23,6 +23,7 @@ struct ChatSession: Identifiable, Hashable, Codable {
 
     enum CodingKeys: String, CodingKey {
         case conversationId = "conversation_id"
+        case title
         case lastActiveDate = "last_active_date"
     }
 
@@ -30,7 +31,7 @@ struct ChatSession: Identifiable, Hashable, Codable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
 
         self.conversationId = try? container.decodeIfPresent(String.self, forKey: .conversationId)
-        self.title = "New Chat"
+        self.title = (try? container.decodeIfPresent(String.self, forKey: .title)) ?? "New Chat"
         self.messages = []
         self.lastActiveDate = try? container.decodeIfPresent(Date.self, forKey: .lastActiveDate)
     }

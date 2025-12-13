@@ -5,6 +5,9 @@
 
 import Foundation
 import HealthKit
+#if canImport(UIKit)
+import UIKit
+#endif
 
 final class HealthSyncService {
 
@@ -36,34 +39,55 @@ final class HealthSyncService {
 	private let deltaDebounceInterval: TimeInterval = 5.0 // Increased to 5 seconds for better coalescing
 	private let deltaUploadQueue = DispatchQueue(label: "com.voyant.health.delta", qos: .background)
 
-	// Call on app launch after permissions are granted
+	// MARK: - First-time seed persistence
+	private func initialSeedDoneKey(for userId: String) -> String {
+		return "health_initial_seed_done_\(userId)"
+	}
+
+	// MARK: - Background Observers Setup
+	// Call once after HealthKit authorization, independent of sign-in
+	func enableBackgroundObservers() {
+		// Check if already enabled
+		if UserDefaults.standard.bool(forKey: "hk_background_observers_enabled") {
+			print("[HealthSync] Background observers already enabled")
+			return
+		}
+
+		print("[HealthSync] Enabling background observers for automatic sync")
+		registerObservers()
+		enableBackgroundDelivery()
+
+		// Mark as enabled so we don't re-register
+		UserDefaults.standard.set(true, forKey: "hk_background_observers_enabled")
+		print("[HealthSync] Background observers enabled successfully")
+	}
+
+	// Call on sign-in to handle initial seed upload (one-time per user)
 	func startBackgroundSync(userId: String) {
-		// Avoid double‑starting
-		guard currentUserId == nil else { return }
+		// Store current user ID
 		self.currentUserId = userId
 		print("[HealthSync] startBackgroundSync for user=\(userId)")
-		// Ensure HK permission is granted before attempting queries
-        HealthStoreService.shared.requestAuthorization { [weak self] (ok: Bool, err: Error?) in
+
+		// Check if initial seed already done for this user
+		let seedKey = self.initialSeedDoneKey(for: userId)
+		if UserDefaults.standard.bool(forKey: seedKey) {
+			print("[HealthSync] Initial seed already completed for user=\(userId), skipping")
+			return
+		}
+
+		// Set flag to prevent observer uploads during initial seed
+		self.isPerformingInitialSeed = true
+
+		print("[HealthSync] Performing initial seed for user=\(userId)")
+
+		// Delay initial seed to let any ongoing operations settle
+		let initialSeed = DispatchWorkItem { [weak self] in
 			guard let self = self else { return }
-			if !ok {
-				print("[HealthSync] HealthKit authorization not granted: \(err?.localizedDescription ?? "unknown")")
-				return
-			}
-			print("[HealthSync] HealthKit authorized, starting observers and initial seed")
 
-			// Set flag to prevent observer uploads during initial seed
-			self.isPerformingInitialSeed = true
-
-			// Register observers first but they won't upload due to flag
-			self.registerObservers()
-			self.enableBackgroundDelivery()
-
-			// Delay initial seed to let observers settle and then do ONE comprehensive upload
-			let initialSeed = DispatchWorkItem {
-				// Initial full backfill (~164 days) to guarantee seed on first run
-				HealthCSVExporter.generateCSV(for: userId, metrics: []) { res in
-					switch res {
-					case .success(let data):
+			// Initial full backfill (~164 days) to guarantee seed on first run
+			HealthCSVExporter.generateCSV(for: userId, metrics: []) { res in
+				switch res {
+				case .success(let data):
 						// Write debug CSV to Documents so it can be inspected in Files
 						do {
 							let ts = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
@@ -86,20 +110,28 @@ final class HealthSyncService {
 
 								// Clear flag to allow observer uploads now
 								self.isPerformingInitialSeed = false
+
+								// Mark initial seed done for this user if succeeded
+								if status.state.uppercased() == "SUCCESS" || status.state.uppercased() == "SUCCESSFUL" || status.state.uppercased() == "SUCCESSFUL_RESULT" {
+									UserDefaults.standard.set(true, forKey: seedKey)
+								} else {
+									// Even if backend didn't report explicit SUCCESS text, we can still mark as done after wait,
+									// comment out if you prefer strict success-only marking.
+									UserDefaults.standard.set(true, forKey: seedKey)
+								}
 							} catch {
 								print("[HealthSync] Initial upload failed: \(error)")
 							}
 						}
-						case .failure(let e):
-							print("[HealthSync] generateCSV failed: \(e.localizedDescription)")
-							// Clear flag even on failure
-							self.isPerformingInitialSeed = false
-					}
+				case .failure(let e):
+					print("[HealthSync] generateCSV failed: \(e.localizedDescription)")
+					// Clear flag even on failure
+					self.isPerformingInitialSeed = false
 				}
 			}
-			// Increased delay to let observers fully register and settle
-			DispatchQueue.main.asyncAfter(deadline: .now() + 3.0, execute: initialSeed)
 		}
+		// Execute the initial seed work item after delay
+		DispatchQueue.main.asyncAfter(deadline: .now() + 3.0, execute: initialSeed)
 	}
 
 	private func registerObservers() {
@@ -166,6 +198,9 @@ final class HealthSyncService {
 			print("[HealthSync] Skipping observer event during initial seed")
 			return
 		}
+
+		// Process delta uploads whether app is foreground or background
+		// iOS will launch the app in background when health data changes
 
 		// Cancel any pending delta upload
 		pendingDeltaWorkItem?.cancel()

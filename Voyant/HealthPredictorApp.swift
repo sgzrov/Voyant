@@ -27,7 +27,14 @@ struct HealthPredictorApp: App {
 
     init() {
         HealthStoreService.shared.requestAuthorization { success, error in
-            print(success ? "HealthKit authorized." : "HealthKit failed: \(error?.localizedDescription ?? "Unknown error")")
+            if success {
+                print("HealthKit authorized.")
+                // Enable background observers immediately after authorization
+                // This allows health data to sync automatically without requiring app launch
+                HealthSyncService.shared.enableBackgroundObservers()
+            } else {
+                print("HealthKit failed: \(error?.localizedDescription ?? "Unknown error")")
+            }
         }
     }
 

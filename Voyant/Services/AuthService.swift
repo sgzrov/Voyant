@@ -86,6 +86,14 @@ class AuthService {
 
     // Decode the JWT and return the Clerk user id (sub)
     static func getUserId() async throws -> String {
+        // First try to get from persisted storage (for background launches)
+        if let persistedUserId = UserDefaults.standard.string(forKey: "clerk_user_id"),
+           !persistedUserId.isEmpty {
+            print("[DEBUG] AuthService: Using persisted user ID for background sync")
+            return persistedUserId
+        }
+
+        // Otherwise get from JWT and persist it
         let jwt = try await getValidToken()
         let parts = jwt.split(separator: ".")
         guard parts.count >= 2 else { throw AuthError.notAuthenticated }
@@ -98,6 +106,11 @@ class AuthService {
         else {
             throw AuthError.notAuthenticated
         }
+
+        // Persist for future background launches
+        UserDefaults.standard.set(sub, forKey: "clerk_user_id")
+        print("[DEBUG] AuthService: Persisted user ID for background sync")
+
         return sub
     }
 
@@ -110,6 +123,12 @@ class AuthService {
     static func clearCachedToken() {
         cachedToken = nil
         tokenExpiry = nil
+    }
+
+    // Call this on sign out to clear persisted user data
+    static func clearPersistedUserData() {
+        UserDefaults.standard.removeObject(forKey: "clerk_user_id")
+        print("[DEBUG] AuthService: Cleared persisted user data")
     }
 }
 

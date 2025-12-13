@@ -40,12 +40,6 @@ class AgentBackendService {
         var request = try await authService.authenticatedRequest(for: "/health/upload-csv", method: "POST")
         let boundary = "Boundary-\(UUID().uuidString)"
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-        request.setValue(TimeZone.current.identifier, forHTTPHeaderField: "X-User-TZ")
-
-        // Add idempotency key to prevent duplicate processing
-        // Using UUID for now - can be replaced with content hash later
-        let idempotencyKey = UUID().uuidString
-        request.setValue(idempotencyKey, forHTTPHeaderField: "X-Idempotency-Key")
 
         var body = Data()
         body.append("--\(boundary)\r\n".data(using: .utf8)!)
@@ -109,7 +103,6 @@ class AgentBackendService {
         let body = try JSONSerialization.data(withJSONObject: payload)
         var request = try await authService.authenticatedRequest(for: "/health/query/stream", method: "POST", body: body)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue(TimeZone.current.identifier, forHTTPHeaderField: "X-User-TZ")
         return try await sseService.streamSSE(request: request)
     }
 

@@ -173,6 +173,8 @@ struct MainChatView: View {
 
 extension Notification.Name {
     static let chatUpdated = Notification.Name("chatUpdated")
+    static let chatTitleUpdated = Notification.Name("chatTitleUpdated")
+    static let chatCreated = Notification.Name("chatCreated")
 }
 
 #Preview {
