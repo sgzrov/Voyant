@@ -1,56 +1,96 @@
 from __future__ import annotations
 
-import re
-from typing import Any, Dict
 import logging
+import re
 
 
 logger = logging.getLogger(__name__)
 
 
-def _extract_sql_from_text(text: str) -> str:
-    """
-    Extract a bare SQL statement from LLM output.
-    - Strips ```sql ... ``` fences if present
-    - Trims any prose before the first WITH or SELECT (preserve CTEs)
-    """
-    if not isinstance(text, str):
+# Return SQL with string literals and comments replaced by whitespace
+def _strip_sql_strings_and_comments(sql: object) -> str:
+    if not isinstance(sql, str):
         return ""
-    s = text.strip()
-    # Remove fenced blocks
-    if s.startswith("```"):
-        lines = s.splitlines()
-        # Drop the opening fence (``` or ```sql)
-        if lines:
-            lines = lines[1:]
-        # Drop the closing fence if present
-        if lines and lines[-1].strip().startswith("```"):
-            lines = lines[:-1]
-        s = "\n".join(lines).strip()
-    # Keep from the first top-level keyword start: WITH or SELECT
-    m_with = re.search(r"(?is)^\s*with\b", s)
-    if m_with:
-        s = s[m_with.start():]
-    else:
-        m_select = re.search(r"(?is)\bselect\b", s)
-        if m_select:
-            s = s[m_select.start():]
-    return s.strip()
 
-
-def _sanitize_sql(sql: str) -> str:
-    original = sql.strip()
-    if original.endswith(";"):
-        original = original[:-1].rstrip()
-
-    s = original
+    s = sql
     n = len(s)
+    out: list[str] = []
     i = 0
-    depth = 0
     in_line_comment = False
     in_block_comment = False
     in_string = False
-    first_token = None
+
+    while i < n:
+        ch = s[i]
+        nxt = s[i + 1] if i + 1 < n else ""
+
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+                out.append("\n")
+            else:
+                out.append(" ")
+            i += 1
+            continue
+
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                out.append(" ")
+                out.append(" ")
+                i += 2
+            else:
+                out.append("\n" if ch == "\n" else " ")
+                i += 1
+            continue
+
+        if not in_string and ch == "-" and nxt == "-":
+            in_line_comment = True
+            out.append(" ")
+            out.append(" ")
+            i += 2
+            continue
+        if not in_string and ch == "/" and nxt == "*":
+            in_block_comment = True
+            out.append(" ")
+            out.append(" ")
+            i += 2
+            continue
+
+        if in_string:
+            if ch == "'":
+                if nxt == "'":
+                    out.append("'")
+                    out.append("'")
+                    i += 2
+                    continue
+                in_string = False
+                out.append("'")
+                i += 1
+                continue
+            out.append("\n" if ch == "\n" else " ")
+            i += 1
+            continue
+        else:
+            if ch == "'":
+                in_string = True
+                out.append("'")
+                i += 1
+                continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
+
+
+# Scan the top-level SQL for guardrail flags (UNION, semicolons, etc)
+def _scan_top_level_sql(sql_stripped: str) -> dict[str, object]:
+    s = sql_stripped or ""
+    n = len(s)
+    i = 0
+    depth = 0
+    first_token: str | None = None
     where_idx = -1
     group_idx = -1
     order_idx = -1
@@ -77,57 +117,12 @@ def _sanitize_sql(sql: str) -> str:
 
     while i < n:
         ch = s[i]
-        nxt = s[i + 1] if i + 1 < n else ""
 
-        # Handle end of line comment
-        if in_line_comment:
-            if ch == "\n":
-                in_line_comment = False
-            i += 1
-            continue
-
-        # Handle end of block comment
-        if in_block_comment:
-            if ch == "*" and nxt == "/":
-                in_block_comment = False
-                i += 2
-            else:
-                i += 1
-            continue
-
-        # Detect start of comments
-        if ch == "-" and nxt == "-":
-            in_line_comment = True
-            i += 2
-            continue
-        if ch == "/" and nxt == "*":
-            in_block_comment = True
-            i += 2
-            continue
-
-        # Handle string literal (single quotes)
-        if in_string:
-            if ch == "'":
-                # Handle escaped single quote by doubling ''
-                if nxt == "'":
-                    i += 2
-                    continue
-                in_string = False
-            i += 1
-            continue
-        else:
-            if ch == "'":
-                in_string = True
-                i += 1
-                continue
-
-        # Dangerous: additional semicolons outside strings/comments
         if ch == ";":
             has_semicolon_outside = True
             i += 1
             continue
 
-        # Track parentheses depth
         if ch == "(":
             depth += 1
             i += 1
@@ -137,7 +132,6 @@ def _sanitize_sql(sql: str) -> str:
             i += 1
             continue
 
-        # Top-level keyword detection
         if depth == 0 and ch.isalpha():
             j = i
             while j < n and s[j].isalpha():
@@ -168,93 +162,315 @@ def _sanitize_sql(sql: str) -> str:
 
         i += 1
 
+    return {
+        "first_token": first_token,
+        "where_idx": where_idx,
+        "group_idx": group_idx,
+        "order_idx": order_idx,
+        "limit_idx": limit_idx,
+        "has_union_top": has_union_top,
+        "has_with_top": has_with_top,
+        "has_semicolon_outside": has_semicolon_outside,
+    }
+
+
+# Apply a sequence of rewrite steps to SQL
+def _apply_rewrite_pipeline(sql: str, steps: list[tuple[str, callable]]) -> tuple[str, bool]:
+    cur = sql
+    changed = False
+    for _name, fn in steps:
+        nxt = fn(cur)
+        if nxt != cur:
+            changed = True
+            cur = nxt
+    return cur, changed
+
+
+def _parse_cte_names(sql_stripped: object) -> set[str]:
+    if not isinstance(sql_stripped, str):
+        return set()
+
+    s = sql_stripped
+    n = len(s)
+
+    def _skip_ws(pos: int) -> int:
+        while pos < n and s[pos].isspace():
+            pos += 1
+        return pos
+
+    def _match_word_at(pos: int, word: str) -> int:
+        end = pos + len(word)
+        if end > n:
+            return -1
+        if s[pos:end].lower() != word:
+            return -1
+        before_ok = pos == 0 or not s[pos - 1].isalnum()
+        after_ok = end == n or not s[end:end + 1].isalnum()
+        return end if before_ok and after_ok else -1
+
+    def _parse_identifier(pos: int) -> tuple[str | None, int]:
+        pos = _skip_ws(pos)
+        if pos >= n:
+            return None, pos
+        if s[pos] == '"':
+            pos += 1
+            start = pos
+            while pos < n:
+                if s[pos] == '"':
+                    name = s[start:pos]
+                    return name, pos + 1
+                pos += 1
+            return None, pos
+
+        m = re.match(r"[a-zA-Z_]\w*", s[pos:])
+        if not m:
+            return None, pos
+        name = m.group(0)
+        return name, pos + len(name)
+
+    def _skip_balanced_parens(pos: int) -> int:
+        pos = _skip_ws(pos)
+        if pos >= n or s[pos] != "(":
+            return pos
+        depth = 0
+        while pos < n:
+            if s[pos] == "(":
+                depth += 1
+            elif s[pos] == ")":
+                depth = max(0, depth - 1)
+                if depth == 0:
+                    return pos + 1
+            pos += 1
+        return pos
+
+    i = _skip_ws(0)
+    end_with = _match_word_at(i, "with")
+    if end_with < 0:
+        return set()
+    i = _skip_ws(end_with)
+    end_recursive = _match_word_at(i, "recursive")
+    if end_recursive >= 0:
+        i = _skip_ws(end_recursive)
+
+    names: set[str] = set()
+    while i < n:
+        name, i2 = _parse_identifier(i)
+        if not name:
+            break
+        names.add(name.lower())
+        i = _skip_ws(i2)
+        if i < n and s[i] == "(":
+            i = _skip_ws(_skip_balanced_parens(i))
+        end_as = _match_word_at(i, "as")
+        if end_as < 0:
+            break
+        i = _skip_ws(end_as)
+        if i >= n or s[i] != "(":
+            break
+        i = _skip_ws(_skip_balanced_parens(i))
+        if i < n and s[i] == ",":
+            i = _skip_ws(i + 1)
+            continue
+        break
+
+    return names
+
+
+# Validate SQL sources (FROM/JOIN) against an allowlist; return which health tables are referenced
+def _validate_sql_sources(sql: str, allowed_sources: set[str], health_sources: set[str]) -> set[str]:
+    stripped = _strip_sql_strings_and_comments(sql)
+    cte_names = _parse_cte_names(stripped)
+
+    disallowed: set[str] = set()
+    seen: set[str] = set()
+
+    # Regex is a bit fussy: avoid treating "JOIN LATERAL" as a table named "lateral".
+    for m in re.finditer(r"(?is)\b(from|join)\s+(?:lateral\s+)?(?!lateral\b)([a-zA-Z_][\w\.]*)\b", stripped):
+        src = m.group(2)
+        base = src.split(".")[-1].lower()
+        if base in cte_names:
+            continue
+        seen.add(base)
+        if base in allowed_sources:
+            continue
+        disallowed.add(base)
+
+    if disallowed:
+        raise ValueError(f"Disallowed SQL sources: {', '.join(sorted(disallowed))}")
+
+    used_health = seen & {s.lower() for s in health_sources}
+    # Require that the query references at least one health data source
+    if not used_health:
+        raise ValueError("Query must reference a health table (health_metrics, health_rollup_hourly, or health_events)")
+    return used_health
+
+
+# Replace references to health_rollup_hourly table with a tz-normalized derived table
+def _rewrite_rollup_hourly_to_tz_derived(sql: str) -> str:
+    try:
+        stripped = _strip_sql_strings_and_comments(sql)
+        if not re.search(r"(?is)\b(from|join)\s+health_rollup_hourly\b", stripped):
+            return sql
+
+        hourly_subquery = (
+            "(SELECT\n"
+            "   user_id,\n"
+            "   (date_trunc('hour', bucket_ts AT TIME ZONE :tz_name) AT TIME ZONE :tz_name) AS bucket_ts,\n"
+            "   metric_type,\n"
+            "   CASE WHEN SUM(n) > 0 THEN SUM(COALESCE(avg_value, 0) * n) / SUM(n) END AS avg_value,\n"
+            "   SUM(COALESCE(sum_value, 0)) AS sum_value,\n"
+            "   MIN(min_value) AS min_value,\n"
+            "   MAX(max_value) AS max_value,\n"
+            "   SUM(n) AS n\n"
+            " FROM health_rollup_hourly\n"
+            " WHERE user_id = :user_id\n"
+            " GROUP BY 1,2,3)"
+        )
+
+        def _rewrite_from(m: re.Match) -> str:
+            alias = m.group("alias")
+            alias_out = alias if alias else "health_rollup_hourly"
+            return f"FROM {hourly_subquery} AS {alias_out}"
+
+        def _rewrite_join(m: re.Match) -> str:
+            alias = m.group("alias")
+            alias_out = alias if alias else "health_rollup_hourly"
+            return f"JOIN {hourly_subquery} AS {alias_out}"
+
+        # Avoid treating SQL keywords as aliases (e.g. "FROM health_rollup_hourly WHERE ...")
+        _no_alias_keywords = (
+            r"where|group|order|limit|join|on|inner|left|right|full|cross|union|having|"
+            r"window|offset|fetch|for|into|values|select|from"
+        )
+
+        out = re.sub(
+            rf"(?is)\bfrom\s+health_rollup_hourly(?:\s+(?:as\s+)?(?P<alias>(?!({_no_alias_keywords})\b)[a-zA-Z_]\w*))?\b",
+            _rewrite_from,
+            sql,
+        )
+        out = re.sub(
+            rf"(?is)\bjoin\s+health_rollup_hourly(?:\s+(?:as\s+)?(?P<alias>(?!({_no_alias_keywords})\b)[a-zA-Z_]\w*))?\b",
+            _rewrite_join,
+            out,
+        )
+        if out != sql:
+            logger.info("sql.rewrite.hourly: rewrote health_rollup_hourly to tz-localized derived table (alias-preserving)")
+        return out
+    except Exception:
+        logger.exception("sql.rewrite.hourly.failed")
+        return sql
+
+
+# Extract a bare SQL statement from LLM output
+def _extract_sql_from_text(text: object) -> str:
+    if not isinstance(text, str):
+        return ""
+
+    # Drop fenced blocks
+    s = text.strip()
+    if s.startswith("```"):
+        lines = s.splitlines()
+        if lines:
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        s = "\n".join(lines).strip()
+
+    # Keep from the first top-level keyword start: WITH or SELECT
+    m_with = re.search(r"(?is)^\s*with\b", s)
+    if m_with:
+        s = s[m_with.start():]
+    else:
+        m_select = re.search(r"(?is)\bselect\b", s)
+        if m_select:
+            s = s[m_select.start():]
+    return s.strip()
+
+
+# Sanitize a SQL statement to enforce guardrails and enforce allowed sources
+def _sanitize_sql(sql: str) -> str:
+    original = sql.strip()
+    if original.endswith(";"):
+        original = original[:-1].rstrip()
+
+    s = original
+    stripped = _strip_sql_strings_and_comments(s)
+
+    # Only allow :user_id and :tz_name binds (avoid matching PG casts like ::date)
+    bind_names = set(re.findall(r"(?is)(?<!:):([a-zA-Z_]\w*)\b", stripped))
+    unknown_binds = sorted([b for b in bind_names if b.lower() not in {"user_id", "tz_name"}])
+    if unknown_binds:
+        raise ValueError(f"Unsupported bind parameters: {', '.join(unknown_binds)}")
+
+    used_health_sources = _validate_sql_sources(
+        s,
+        allowed_sources={
+            "health_metrics",
+            "health_rollup_hourly",
+            "health_events",
+            "generate_series",
+            "unnest",
+        },
+        health_sources={"health_metrics", "health_rollup_hourly", "health_events"},
+    )
+
+    if len(used_health_sources) > 1:
+        raise ValueError("Query must use exactly one health table (health_metrics OR health_rollup_hourly OR health_events)")
+
+    if "health_rollup_hourly" in used_health_sources:
+        s = _rewrite_rollup_hourly_to_tz_derived(s)
+        stripped = _strip_sql_strings_and_comments(s)
+
+    scan = _scan_top_level_sql(stripped)
+    first_token = scan["first_token"]
+    where_idx = int(scan["where_idx"])
+    group_idx = int(scan["group_idx"])
+    order_idx = int(scan["order_idx"])
+    limit_idx = int(scan["limit_idx"])
+    has_union_top = bool(scan["has_union_top"])
+    has_with_top = bool(scan["has_with_top"])
+    has_semicolon_outside = bool(scan["has_semicolon_outside"])
+
     if first_token != "select" and not has_with_top:
-        # Allow CTEs starting with WITH, but we will not rewrite those safely
         raise ValueError("Only SELECT is allowed")
 
     if has_union_top:
-        # Safer to reject UNION at top level for now
         raise ValueError("Complex queries (UNION) are not allowed")
 
     if has_semicolon_outside:
         raise ValueError("Multiple statements are not allowed")
 
-    # Determine where top-level WHERE ends (before GROUP/ORDER/LIMIT or end)
     clause_starts = [pos for pos in [group_idx, order_idx, limit_idx] if pos >= 0]
     next_clause_start = min(clause_starts) if clause_starts else len(s)
 
-    # Detect if the query already scopes by user_id in a JOIN condition
+    stripped = _strip_sql_strings_and_comments(s)
+
     has_join_scoped_user = bool(re.search(
-        r"(?is)\bjoin\b[\s\S]*?\bon\b[\s\S]*?\b[a-zA-Z_][\w]*\.user_id\s*=\s*:user_id\b", s
+        r"(?is)\bjoin\b[\s\S]*?\bon\b[\s\S]*?\b[a-zA-Z_][\w]*\.user_id\s*=\s*:user_id\b", stripped
+    ))
+    has_user_predicate_anywhere = bool(re.search(
+        r"(?is)\b([a-zA-Z_][\w]*\.)?user_id\s*=\s*:user_id\b", stripped
     ))
 
-    # Skip injecting a top-level predicate if :user_id appears anywhere (e.g., inside CTEs)
-    references_user_param_anywhere = bool(re.search(r":user_id\b", s, flags=re.IGNORECASE))
-
-    # If WHERE exists, ensure user_id predicate present in top-level WHERE span,
-    # unless the query is already scoped via JOIN ... ON alias.user_id = :user_id, or
-    # :user_id appears elsewhere (e.g., inside CTEs).
-    if not references_user_param_anywhere:
+    # Ensure queries are scoped to the authenticated user (unless already scoped elsewhere).
+    if not has_user_predicate_anywhere:
         if where_idx >= 0:
             where_body = s[where_idx:next_clause_start]
-            has_where_user = bool(re.search(r"(?is)\buser_id\s*=\s*:user_id\b", where_body))
+            where_body_stripped = _strip_sql_strings_and_comments(where_body)
+            has_where_user = bool(re.search(r"(?is)\b([a-zA-Z_][\w]*\.)?user_id\s*=\s*:user_id\b", where_body_stripped))
             if not has_where_user and not has_join_scoped_user:
                 where_keyword_end = where_idx + len("where")
-                # Ensure a space after AND to avoid token merging with the following predicate
                 s = s[:where_keyword_end] + " user_id = :user_id AND " + s[where_keyword_end:]
         else:
-            # No WHERE: insert before the earliest of GROUP/ORDER/LIMIT or at end
-            # Skip insertion if already appropriately scoped in a JOIN condition
             if not has_join_scoped_user:
                 insert_pos = next_clause_start
-                # Add a trailing space so the next token (e.g., ORDER) doesn't merge into :user_id
                 s = s[:insert_pos] + " WHERE user_id = :user_id " + s[insert_pos:]
 
-    # No default LIMIT injection; prompts should include an explicit LIMIT if desired.
-
-    # Prefer real measurements from rollups by excluding empty buckets by default.
-    # We only add "AND n > 0" when the query touches a health_rollup_* table AND
-    # the SQL does NOT explicitly reason about missing data (n = 0 / n IS NULL / COALESCE(n,...) = 0).
-    # NOTE: Disabled for now due to complexity with subqueries causing syntax errors
-    # TODO: Fix this logic to properly handle complex nested queries
-    # try:
-    #     uses_rollup = bool(re.search(r"(?is)\bfrom\s+health_rollup_(5min|hourly|daily)\b", s))
-    #     mentions_missing_n = bool(re.search(r"(?is)\bn\s*=\s*0\b|\bn\s+is\s+null\b|coalesce\s*\([^)]*\bn[^)]*\)\s*=\s*0", s))
-    #     already_filters_n_pos = bool(re.search(r"(?is)\bn\s*>\s*0\b", s))
-    #     if uses_rollup and not mentions_missing_n and not already_filters_n_pos:
-    #         # Find the LAST WHERE (closest to end) to avoid matching WHEREs in earlier CTEs/subqueries
-    #         where_matches = list(re.finditer(r"(?is)\bwhere\b", s))
-    #         m_where_last = where_matches[-1] if where_matches else None
-    #         # Find clause boundaries that APPEAR AFTER the chosen WHERE (or from the start if no WHERE)
-    #         start_idx = m_where_last.end() if m_where_last else 0
-    #         m_order_after = re.search(r"(?is)\border\s+by\b", s[start_idx:])
-    #         m_group_after = re.search(r"(?is)\bgroup\s+by\b", s[start_idx:])
-    #         m_limit_after = re.search(r"(?is)\blimit\b", s[start_idx:])
-    #         # Compute absolute indices
-    #         clause_indices = []
-    #         for m in [m_group_after, m_order_after, m_limit_after]:
-    #             if m:
-    #                 clause_indices.append(start_idx + m.start())
-    #         insert_pos = min(clause_indices) if clause_indices else len(s)
-    #         if m_where_last:
-    #             # Append to existing WHERE just before the next clause (or end)
-    #             s = s[:insert_pos] + " AND n > 0 " + s[insert_pos:]
-    #         else:
-    #             # No WHERE: inject WHERE before LIMIT/ORDER/GROUP if present; otherwise at end
-    #             s = s[:insert_pos] + " WHERE n > 0 " + s[insert_pos:]
-    # except Exception:
-    #     # Best-effort; if anything goes wrong, skip injection
-    #     pass
-
-    # Rewrite improper HAVING without GROUP BY into an outer WHERE on a subquery,
-    # so alias filters like HAVING prev_value ... become valid.
     try:
         m_having = re.search(r"(?is)\bhaving\b", s)
         if m_having:
-            # Check if there's a GROUP BY at top-level (rough check: presence of ' group by ' before ORDER/LIMIT)
             m_group_any = re.search(r"(?is)\bgroup\s+by\b", s)
             if not m_group_any:
-                # Extract the HAVING condition up to ORDER BY / LIMIT or end
                 start_cond = m_having.end()
                 m_order_after = re.search(r"(?is)\border\s+by\b", s[start_cond:])
                 m_limit_after = re.search(r"(?is)\blimit\b", s[start_cond:])
@@ -267,237 +483,130 @@ def _sanitize_sql(sql: str) -> str:
                 having_condition = s[start_cond:end_cond].strip()
                 base_sql = s[:m_having.start()].rstrip()
                 trailing_clauses = s[end_cond:]
-                # Build the wrapped query
                 s = f"SELECT * FROM ({base_sql}) AS sub WHERE {having_condition} {trailing_clauses}"
     except Exception:
-        # If the rewrite fails, keep original SQL (the executor may still reject invalid forms)
         pass
 
-    # Normalize risky numeric casts produced by the model:
-    # JSON values may contain decimals (e.g., "1465.0691") which fail for ::int.
-    # Prefer ::float for aggregates; callers can round if needed.
+    # JSON numeric strings may include decimals; ::int can fail in generated SQL.
     s = re.sub(r"::\s*(int|integer)\b", "::float", s, flags=re.IGNORECASE)
 
-    # Guardrail: some queries mistakenly filter inferred sessions via session_type='inferred'.
-    # Our schema uses session_type for modality (running/walking/...) and source='inferred'|'workout'.
-    # When the query touches health_sessions, rewrite that specific predicate.
+    # Normalize day-level comparisons to the user's timezone (best-effort rewrites).
     try:
-        if re.search(r"(?is)\bfrom\s+health_sessions\b", s):
-            s_new = re.sub(r"(?is)\bsession_type\s*=\s*'inferred'\b", "source = 'inferred'", s)
-            if s_new != s:
-                s = s_new
-                try:
-                    logging.getLogger(__name__).info("sql.rewrite.sessions: replaced session_type='inferred' with source='inferred'")
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-    # Note: health_rollup_daily table has been dropped. Queries should target hourly only.
-
-    # Timezone-aware hourly rewrite:
-    # Any reference to health_rollup_hourly will be replaced by a derived table that normalizes
-    # bucket_ts to the request's local hour. This ensures queries that forget to convert to local time
-    # still return hour buckets aligned to :tz_name (handles DST fold/skip by aggregating as needed).
-    try:
-        if re.search(r"(?is)\b(from|join)\s+health_rollup_hourly\b", s):
-            hourly_subquery = (
-                "(SELECT\n"
-                "   user_id,\n"
-                "   (date_trunc('hour', bucket_ts AT TIME ZONE :tz_name) AT TIME ZONE :tz_name) AS bucket_ts,\n"
-                "   metric_type,\n"
-                "   CASE WHEN SUM(n) > 0 THEN SUM(COALESCE(avg_value, 0) * n) / SUM(n) END AS avg_value,\n"
-                "   SUM(COALESCE(sum_value, 0)) AS sum_value,\n"
-                "   MIN(min_value) AS min_value,\n"
-                "   MAX(max_value) AS max_value,\n"
-                "   SUM(n) AS n\n"
-                " FROM health_rollup_hourly\n"
-                " WHERE user_id = :user_id\n"
-                " GROUP BY 1,2,3)"
-            )
-            s = re.sub(r"(?is)\bfrom\s+health_rollup_hourly\b", f"FROM {hourly_subquery} AS health_rollup_hourly", s)
-            s = re.sub(r"(?is)\bjoin\s+health_rollup_hourly\b", f"JOIN {hourly_subquery} AS health_rollup_hourly", s)
-            try:
-                logging.getLogger(__name__).info("sql.rewrite.hourly: rewrote health_rollup_hourly to tz-localized derived table")
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    # Normalize date comparisons to the user's timezone:
-    # - Replace CURRENT_DATE with (now() AT TIME ZONE :tz_name)::date
-    # - Replace DATE(bucket_ts[ ... ]) with DATE(bucket_ts AT TIME ZONE :tz_name)
-    try:
-        s_new = re.sub(r"(?is)\bcurrent_date\b", "(now() AT TIME ZONE :tz_name)::date", s)
-        # date(bucket_ts) or date(alias.bucket_ts)
-        s_new = re.sub(
-            r"(?is)\bdate\s*\(\s*((?:[a-zA-Z_][\w]*\.)?)bucket_ts\s*\)",
-            r"DATE(\1bucket_ts AT TIME ZONE :tz_name)",
-            s_new
-        )
-        # date(timestamp) or date(alias.timestamp) for raw metrics/events
-        s_new = re.sub(
-            r"(?is)\bdate\s*\(\s*((?:[a-zA-Z_][\w]*\.)?)timestamp\s*\)",
-            r"DATE(\1timestamp AT TIME ZONE :tz_name)",
-            s_new
-        )
-        # bucket_ts::date or alias.bucket_ts::date
-        s_new = re.sub(
-            r"(?is)\b((?:[a-zA-Z_][\w]*\.)?)bucket_ts\s*::\s*date\b",
-            r"( \1bucket_ts AT TIME ZONE :tz_name )::date",
-            s_new
-        )
-        # timestamp::date or alias.timestamp::date
-        s_new = re.sub(
-            r"(?is)\b((?:[a-zA-Z_][\w]*\.)?)timestamp\s*::\s*date\b",
-            r"( \1timestamp AT TIME ZONE :tz_name )::date",
-            s_new
-        )
-        # Rewrite equality on local-day to explicit range to avoid edge-case mismatches:
-        # (bucket_ts AT TIME ZONE :tz_name)::date = <expr>
         def _rewrite_day_eq_to_range(match: re.Match) -> str:
             expr = match.group(1).strip()
             base = "(bucket_ts AT TIME ZONE :tz_name)"
             return f"{base} >= ({expr})::timestamp AND {base} < (({expr})::timestamp + INTERVAL '1 day')"
-        # Special-case CURRENT_DATE and CURRENT_DATE - 1 to avoid nested rewrites
         base = "(bucket_ts AT TIME ZONE :tz_name)"
-        s_new = re.sub(
-            r"(?is)\(\s*bucket_ts\s+at\s+time\s+zone\s*:tz_name\s*\)\s*::\s*date\s*=\s*\(\s*now\(\)\s+at\s+time\s+zone\s*:tz_name\s*\)\s*::\s*date\s*-\s*interval\s*'1\s*day'\b",
-            f"{base} >= (date_trunc('day', now() AT TIME ZONE :tz_name) - INTERVAL '1 day') AND {base} < date_trunc('day', now() AT TIME ZONE :tz_name)",
-            s_new
-        )
-        s_new = re.sub(
-            r"(?is)\(\s*bucket_ts\s+at\s+time\s+zone\s*:tz_name\s*\)\s*::\s*date\s*=\s*\(\s*now\(\)\s+at\s+time\s+zone\s*:tz_name\s*\)\s*::\s*date\b",
-            f"{base} >= date_trunc('day', now() AT TIME ZONE :tz_name) AND {base} < (date_trunc('day', now() AT TIME ZONE :tz_name) + INTERVAL '1 day')",
-            s_new
-        )
-        s_new = re.sub(
-            r"(?is)\(\s*bucket_ts\s+at\s+time\s+zone\s*:tz_name\s*\)\s*::\s*date\s*=\s*(.+?)(?=\s+\bAND\b|\s+\bOR\b|\s+\bGROUP\b|\s+\bORDER\b|\s+\bLIMIT\b|\)|$)",
-            _rewrite_day_eq_to_range,
-            s_new
-        )
-        # Also rewrite for timestamp on raw tables:
         def _rewrite_ts_day_eq_to_range(match: re.Match) -> str:
             expr = match.group(1).strip()
             base = "(timestamp AT TIME ZONE :tz_name)"
             return f"{base} >= ({expr})::timestamp AND {base} < (({expr})::timestamp + INTERVAL '1 day')"
-        s_new = re.sub(
-            r"(?is)\(\s*timestamp\s+at\s+time\s+zone\s*:tz_name\s*\)\s*::\s*date\s*=\s*(.+?)(?=\s+\bAND\b|\s+\bOR\b|\s+\bGROUP\b|\s+\bORDER\b|\s+\bLIMIT\b|\)|$)",
-            _rewrite_ts_day_eq_to_range,
-            s_new
-        )
-        # Normalize 'today' ranges that use date_trunc('day', now()) and now()
-        # Replace date_trunc('day', now()) with local midnight, and now() with local now
-        s_new = re.sub(
-            r"(?is)date_trunc\s*\(\s*'day'\s*,\s*now\s*\(\s*\)\s*\)",
-            "date_trunc('day', now() AT TIME ZONE :tz_name)",
-            s_new
-        )
-        s_new = re.sub(
-            r"(?is)\bnow\s*\(\s*\)\b",
-            "(now() AT TIME ZONE :tz_name)",
-            s_new
-        )
-        # Ensure comparisons are against localized bucket_ts
-        s_new = re.sub(
-            r"(?is)\bbucket_ts\s*(>=|>|<=|<)\s*",
-            r"(bucket_ts AT TIME ZONE :tz_name) \1 ",
-            s_new
-        )
-        # Replace string-literal placeholders for common day anchors with tz-safe expressions
-        # 'yesterday_start' => local midnight of the previous day
-        # 'yesterday_end'   => local midnight of today
-        # 'today_start'     => local midnight of today
-        # 'today_end'       => local midnight of tomorrow
-        s_new = re.sub(
-            r"(?is)'yesterday_start'",
-            "(date_trunc('day', now() AT TIME ZONE :tz_name) - INTERVAL '1 day')",
-            s_new,
-        )
-        s_new = re.sub(
-            r"(?is)'yesterday_end'",
-            "date_trunc('day', now() AT TIME ZONE :tz_name)",
-            s_new,
-        )
-        s_new = re.sub(
-            r"(?is)'today_start'",
-            "date_trunc('day', now() AT TIME ZONE :tz_name)",
-            s_new,
-        )
-        s_new = re.sub(
-            r"(?is)'today_end'",
-            "(date_trunc('day', now() AT TIME ZONE :tz_name) + INTERVAL '1 day')",
-            s_new,
-        )
-        # Neutralize unsupported bind parameters in time predicates to avoid execution errors.
-        # We only allow :user_id and :tz_name. Any predicate comparing time columns to other binds is dropped (replaced with TRUE).
-        def _drop_unknown_bind_time_predicates(sql_text: str) -> str:
-            # BETWEEN with unknown binds
-            sql_text = re.sub(
-                r"(?is)\(\s*bucket_ts\s+at\s+time\s+zone\s*:tz_name\s*\)\s+between\s*:\w+\s+and\s*:\w+",
-                "TRUE",
-                sql_text,
-            )
-            sql_text = re.sub(
-                r"(?is)\bbucket_ts\s+between\s*:\w+\s+and\s*:\w+",
-                "TRUE",
-                sql_text,
-            )
-            sql_text = re.sub(
-                r"(?is)\(\s*timestamp\s+at\s+time\s+zone\s*:tz_name\s*\)\s+between\s*:\w+\s+and\s*:\w+",
-                "TRUE",
-                sql_text,
-            )
-            sql_text = re.sub(
-                r"(?is)\btimestamp\s+between\s*:\w+\s+and\s*:\w+",
-                "TRUE",
-                sql_text,
-            )
-            # Comparisons with unknown binds (>=, >, <=, <)
-            for col_pattern in [
-                r"\(\s*bucket_ts\s+at\s+time\s+zone\s*:tz_name\s*\)",
-                r"\bbucket_ts\b",
-                r"\(\s*timestamp\s+at\s+time\s+zone\s*:tz_name\s*\)",
-                r"\btimestamp\b",
-            ]:
-                sql_text = re.sub(
-                    rf"(?is){col_pattern}\s*(>=|>|<=|<)\s*:\w+",
-                    "TRUE",
-                    sql_text,
-                )
-            return sql_text
-        s_new = _drop_unknown_bind_time_predicates(s_new)
+        def _rewrite_dates(sql_in: str) -> str:
+            steps: list[tuple[str, callable]] = [
+                ("current_date", lambda x: re.sub(r"(?is)\bcurrent_date\b", "(now() AT TIME ZONE :tz_name)::date", x)),
+                ("date_bucket_ts", lambda x: re.sub(
+                    r"(?is)\bdate\s*\(\s*((?:[a-zA-Z_][\w]*\.)?)bucket_ts\s*\)",
+                    r"DATE(\1bucket_ts AT TIME ZONE :tz_name)",
+                    x,
+                )),
+                ("date_timestamp", lambda x: re.sub(
+                    r"(?is)\bdate\s*\(\s*((?:[a-zA-Z_][\w]*\.)?)timestamp\s*\)",
+                    r"DATE(\1timestamp AT TIME ZONE :tz_name)",
+                    x,
+                )),
+                ("bucket_ts_cast_date", lambda x: re.sub(
+                    r"(?is)\b((?:[a-zA-Z_][\w]*\.)?)bucket_ts\s*::\s*date\b",
+                    r"( \1bucket_ts AT TIME ZONE :tz_name )::date",
+                    x,
+                )),
+                ("timestamp_cast_date", lambda x: re.sub(
+                    r"(?is)\b((?:[a-zA-Z_][\w]*\.)?)timestamp\s*::\s*date\b",
+                    r"( \1timestamp AT TIME ZONE :tz_name )::date",
+                    x,
+                )),
+                ("bucket_ts_day_eq_yesterday", lambda x: re.sub(
+                    r"(?is)\(\s*bucket_ts\s+at\s+time\s+zone\s*:tz_name\s*\)\s*::\s*date\s*=\s*\(\s*now\(\)\s+at\s+time\s+zone\s*:tz_name\s*\)\s*::\s*date\s*-\s*interval\s*'1\s*day'\b",
+                    f"{base} >= (date_trunc('day', now() AT TIME ZONE :tz_name) - INTERVAL '1 day') AND {base} < date_trunc('day', now() AT TIME ZONE :tz_name)",
+                    x,
+                )),
+                ("bucket_ts_day_eq_today", lambda x: re.sub(
+                    r"(?is)\(\s*bucket_ts\s+at\s+time\s+zone\s*:tz_name\s*\)\s*::\s*date\s*=\s*\(\s*now\(\)\s+at\s+time\s+zone\s*:tz_name\s*\)\s*::\s*date\b",
+                    f"{base} >= date_trunc('day', now() AT TIME ZONE :tz_name) AND {base} < (date_trunc('day', now() AT TIME ZONE :tz_name) + INTERVAL '1 day')",
+                    x,
+                )),
+                ("bucket_ts_day_eq_generic", lambda x: re.sub(
+                    r"(?is)\(\s*bucket_ts\s+at\s+time\s+zone\s*:tz_name\s*\)\s*::\s*date\s*=\s*(.+?)(?=\s+\bAND\b|\s+\bOR\b|\s+\bGROUP\b|\s+\bORDER\b|\s+\bLIMIT\b|\)|$)",
+                    _rewrite_day_eq_to_range,
+                    x,
+                )),
+                ("timestamp_day_eq_generic", lambda x: re.sub(
+                    r"(?is)\(\s*timestamp\s+at\s+time\s+zone\s*:tz_name\s*\)\s*::\s*date\s*=\s*(.+?)(?=\s+\bAND\b|\s+\bOR\b|\s+\bGROUP\b|\s+\bORDER\b|\s+\bLIMIT\b|\)|$)",
+                    _rewrite_ts_day_eq_to_range,
+                    x,
+                )),
+                ("date_trunc_day_now", lambda x: re.sub(
+                    r"(?is)date_trunc\s*\(\s*'day'\s*,\s*now\s*\(\s*\)\s*\)",
+                    "date_trunc('day', now() AT TIME ZONE :tz_name)",
+                    x,
+                )),
+                ("now", lambda x: re.sub(
+                    r"(?is)\bnow\s*\(\s*\)\b(?!\s+at\s+time\s+zone\b)",
+                    "(now() AT TIME ZONE :tz_name)",
+                    x,
+                )),
+                ("bucket_ts_comparisons", lambda x: re.sub(
+                    r"(?is)\b((?:[a-zA-Z_][\w]*\.)?)bucket_ts\s*(>=|>|<=|<)\s*",
+                    r"(\1bucket_ts AT TIME ZONE :tz_name) \2 ",
+                    x,
+                )),
+                ("timestamp_comparisons", lambda x: re.sub(
+                    r"(?is)\b((?:[a-zA-Z_][\w]*\.)?)timestamp\s*(>=|>|<=|<)\s*",
+                    r"(\1timestamp AT TIME ZONE :tz_name) \2 ",
+                    x,
+                )),
+                ("placeholder_yesterday_start", lambda x: re.sub(
+                    r"(?is)'yesterday_start'",
+                    "(date_trunc('day', now() AT TIME ZONE :tz_name) - INTERVAL '1 day')",
+                    x,
+                )),
+                ("placeholder_yesterday_end", lambda x: re.sub(
+                    r"(?is)'yesterday_end'",
+                    "date_trunc('day', now() AT TIME ZONE :tz_name)",
+                    x,
+                )),
+                ("placeholder_today_start", lambda x: re.sub(
+                    r"(?is)'today_start'",
+                    "date_trunc('day', now() AT TIME ZONE :tz_name)",
+                    x,
+                )),
+                ("placeholder_today_end", lambda x: re.sub(
+                    r"(?is)'today_end'",
+                    "(date_trunc('day', now() AT TIME ZONE :tz_name) + INTERVAL '1 day')",
+                    x,
+                )),
+            ]
+            out, _changed = _apply_rewrite_pipeline(sql_in, steps)
+            return out
+
+        s_new = _rewrite_dates(s)
         if s_new != s:
             s = s_new
-            try:
-                logging.getLogger(__name__).info("sql.rewrite.dates: normalized CURRENT_DATE and DATE(bucket_ts) to user tz")
-            except Exception:
-                pass
+            logger.info("sql.rewrite.dates: normalized CURRENT_DATE and DATE(bucket_ts) to user tz")
     except Exception:
         pass
 
-    # If the query targets health_metrics but uses JSON metrics->>'...' syntax,
-    # rewrite those JSON extracts to aggregate over rows by metric_type.
-    # E.g., AVG((metrics->>'heart_rate')::float) -> AVG(CASE WHEN metric_type='heart_rate' THEN metric_value END)
     if re.search(r"\bfrom\s+health_metrics\b", s, flags=re.IGNORECASE):
         def _rewrite_json_extract(match: re.Match) -> str:
             metric = match.group(1)
-            # Preserve any surrounding casts by replacing inner expression only
             return f"(CASE WHEN metric_type = '{metric}' THEN metric_value END)"
 
-        # Replace metrics->>'name'
         s_new = re.sub(r"metrics\s*->>\s*'([a-zA-Z0-9_]+)'", _rewrite_json_extract, s, flags=re.IGNORECASE)
         if s_new != s:
             s = s_new
-            try:
-                logging.getLogger(__name__).info("sql.rewrite.metrics: applied CASE WHEN metric_type rewrite")
-            except Exception:
-                pass
+            logger.info("sql.rewrite.metrics: applied CASE WHEN metric_type rewrite")
 
-    # Final forbidden tokens check (case-insensitive)
-    lowered = s.lower()
-    forbidden_words = [" insert ", " update ", " delete ", " drop ", " alter "]
-    if any(tok in lowered for tok in forbidden_words):
+    stripped_final = _strip_sql_strings_and_comments(s)
+    if re.search(r"(?is)\b(insert|update|delete|drop|alter|create|truncate|grant|revoke)\b", stripped_final):
         raise ValueError("Forbidden tokens in SQL")
 
     return s

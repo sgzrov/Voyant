@@ -2,8 +2,8 @@ from sqlalchemy import Column, Integer, String, Text, DateTime, func
 
 from Backend.database import Base
 
-
-class ChatsDB(Base):
+# Stores individual chat messages
+class ChatData(Base):
     __tablename__ = 'user_chats_data'
     id = Column(Integer, primary_key = True, autoincrement = True)
     conversation_id = Column(String(64), index = True, nullable = False)
