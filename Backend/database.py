@@ -7,12 +7,8 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 
 _ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(_ROOT / ".env", override=False)
-load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
-
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL must be set.")
 

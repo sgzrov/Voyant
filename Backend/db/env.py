@@ -1,6 +1,8 @@
 from logging.config import fileConfig
 import os
 import sys
+from pathlib import Path
+
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, pool
 from alembic import context
@@ -10,18 +12,26 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from Backend.database import Base  # type: ignore  # After sys.path adjustment
+try:
+    load_dotenv(Path(PROJECT_ROOT) / ".env", override=False)
+except Exception:
+    pass
 
-# Load environment variables from .env
-load_dotenv()
+from Backend.database import Base  # type: ignore  # After sys.path adjustment
 
 # Alembic Config object
 config = context.config
 
-# Load DATABASE_URL dynamically (no hardcoding)
-db_url = os.getenv("DATABASE_URL")
-if db_url:
-    config.set_main_option("sqlalchemy.url", db_url)
+# Prefer explicit alembic.ini URL, otherwise fall back to DATABASE_URL from env
+def _get_migration_url() -> str:
+    url = config.get_main_option("sqlalchemy.url")
+    if url:
+        return url
+
+    db_url = os.getenv("DATABASE_URL") or ""
+    if db_url:
+        return db_url
+    raise RuntimeError("DATABASE_URL is not configured for Alembic migrations.")
 
 # Configure logging
 if config.config_file_name is not None:
@@ -31,9 +41,9 @@ if config.config_file_name is not None:
 target_metadata = Base.metadata
 
 
+# Runs migrations in "offline" mode (generates SQL without a live DB connection)
 def run_migrations_offline() -> None:
-    """Run migrations in 'offline' mode."""
-    url = config.get_main_option("sqlalchemy.url")
+    url = _get_migration_url()
     context.configure(
         url=url,
         target_metadata=target_metadata,
@@ -45,9 +55,11 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
+# Runs migrations in "online" mode (executes against a live DB connection).
 def run_migrations_online() -> None:
-    """Run migrations in 'online' mode."""
-    connectable = create_engine(db_url, poolclass=pool.NullPool)
+    url = _get_migration_url()
+
+    connectable = create_engine(url, poolclass=pool.NullPool)
 
     with connectable.connect() as connection:
         context.configure(connection=connection, target_metadata=target_metadata)

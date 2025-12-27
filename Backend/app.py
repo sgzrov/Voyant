@@ -10,7 +10,6 @@ from Backend.subapps.upload_routes import router as uploads_router
 
 _ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(_ROOT / ".env", override=False)
-load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
 
 def _configure_logging() -> None:
     root_logger = logging.getLogger()

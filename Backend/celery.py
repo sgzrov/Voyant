@@ -5,7 +5,6 @@ from dotenv import load_dotenv
 
 _ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(_ROOT / ".env", override=False)
-load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
 
 def make_celery() -> Celery:
     broker = os.getenv("CELERY_BROKER_URL") or os.getenv("REDIS_URL")
