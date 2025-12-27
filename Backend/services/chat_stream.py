@@ -4,15 +4,15 @@ import logging
 import pathlib
 import re
 import time
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 from fastapi.responses import StreamingResponse
+from sqlalchemy.orm import Session
 
 from Backend.crud.chat import (create_chat_message, get_chat_history, get_or_create_conversation, update_conversation_title)
 from Backend.database import SessionLocal
-from Backend.services.openai_compatible_client import get_openai_compatible_client
+from Backend.services.openai_compatible_client import get_async_openai_compatible_client
 
 logger = logging.getLogger(__name__)
-
 _BACKEND_DIR = pathlib.Path(__file__).resolve().parents[1]
 
 
@@ -23,13 +23,24 @@ DEFAULT_MODEL = {
     "anthropic": "claude-sonnet-4-5",
 }
 
-
 # Streams assistant tokens over SSE and persists chat history to DB + calls tools if provided
-def build_agent_stream_response(*, user_id: str, conversation_id: str, question: str, provider: str, answer_model: str, tools: list[dict], tool_handlers: dict[str, Callable[[dict], Awaitable[dict]]], tool_prefetch: Optional[Callable[[], Awaitable[dict]]] = None) -> StreamingResponse:
-    final_client = get_openai_compatible_client(provider)
+def build_agent_stream_response(
+    *,
+    user_id: str,
+    conversation_id: str,
+    question: str,
+    provider: str,
+    answer_model: str,
+    tools: list[dict],
+    tool_handlers: dict[str, Callable[[dict], Awaitable[dict]]],
+    tool_prefetch: Optional[Callable[[], Awaitable[dict]]] = None,
+    db_session: Optional[Session] = None,
+) -> StreamingResponse:
+    final_client = get_async_openai_compatible_client(provider)
 
     async def generator():
-        session = None
+        session: Optional[Session] = db_session
+        owns_session = False
         sql_task: Optional[asyncio.Task] = None
 
         def _sse(payload: dict) -> str:
@@ -56,7 +67,7 @@ def build_agent_stream_response(*, user_id: str, conversation_id: str, question:
 
         def _safe_close_session() -> None:
             nonlocal session
-            if session is None:
+            if session is None or not owns_session:
                 return
             try:
                 session.close()
@@ -83,7 +94,12 @@ def build_agent_stream_response(*, user_id: str, conversation_id: str, question:
                 return
             try:
                 create_chat_message(session, conversation_id, user_id, "user", question)
+                session.commit()
             except Exception:
+                try:
+                    session.rollback()
+                except Exception:
+                    pass
                 pass
 
         async def _maybe_generate_title(is_new_conversation: bool) -> Optional[str]:
@@ -91,13 +107,18 @@ def build_agent_stream_response(*, user_id: str, conversation_id: str, question:
                 return None
             try:
                 conv = get_or_create_conversation(session, conversation_id, user_id)
-                if conv and not conv.title:
-                    title = await generate_chat_title(question)
-                    update_conversation_title(session, conversation_id, user_id, title)
-                    return title
+                if not conv or conv.title:
+                    return None
+                title = await generate_chat_title(question)
+                update_conversation_title(session, conversation_id, user_id, title)
+                session.commit()
+                return title
             except Exception:
-                pass
-            return None
+                try:
+                    session.rollback()
+                except Exception:
+                    pass
+                return None
 
         async def _resolve_tool_ctx(tool_name: Optional[str], args: dict) -> dict:
             handler = tool_handlers.get(tool_name or "")
@@ -119,7 +140,9 @@ def build_agent_stream_response(*, user_id: str, conversation_id: str, question:
 
             history_msgs: list[dict] = []
             try:
-                session = SessionLocal()
+                if session is None:
+                    session = SessionLocal()
+                    owns_session = True
                 history_msgs = _load_history_msgs()
                 _persist_user_message()
             except Exception:
@@ -161,33 +184,26 @@ def build_agent_stream_response(*, user_id: str, conversation_id: str, question:
                 stream_kwargs["tools"] = tools
                 stream_kwargs["tool_choice"] = "auto"
 
-            stream = final_client.chat.completions.create(**stream_kwargs)
-            for chunk in stream:
-                choice = chunk.choices[0]
-                fr = getattr(choice, "finish_reason", None)
+            # Stream the first pass and accumulate any tool-call fragments.
+            async for chunk in _iter_chat_completion_chunks(final_client, **stream_kwargs):
+                try:
+                    choice = chunk.choices[0]
+                except Exception:
+                    continue
+
+                pieces, fr = _extract_text_pieces_and_finish_reason(choice, tool_calls_acc)
                 if fr:
                     finish_reason = fr
 
-                delta = getattr(choice, "delta", None)
-                if delta is not None:
-                    _parse_tool_calls_from_delta(delta, tool_calls_acc)
-                    content = getattr(delta, "content", None)
-                    if isinstance(content, str) and content:
-                        assistant_content += content
-                        full_response += content
-                        streamed_chars += len(content)
-                        yield _sse({"content": content, "done": False})
-
-                text_piece = getattr(choice, "text", None)
-                if isinstance(text_piece, str) and text_piece:
-                    assistant_content += text_piece
-                    full_response += text_piece
-                    streamed_chars += len(text_piece)
-                    yield _sse({"content": text_piece, "done": False})
+                for piece in pieces:
+                    assistant_content += piece
+                    full_response += piece
+                    streamed_chars += len(piece)
+                    yield _sse({"content": piece, "done": False})
 
             if finish_reason == "tool_calls" and tool_calls_acc:
                 tool_calls_for_msg = _tool_calls_for_messages(tool_calls_acc)
-                tool_call = tool_calls_for_msg[0]  # keep existing behavior: run first tool call only
+                tool_call = tool_calls_for_msg[0]  # run first tool call only
                 tool_name = tool_call.get("function", {}).get("name")
                 args_json = tool_call.get("function", {}).get("arguments") or "{}"
 
@@ -200,7 +216,7 @@ def build_agent_stream_response(*, user_id: str, conversation_id: str, question:
 
                 ctx = await _resolve_tool_ctx(tool_name, args)
 
-                # If we prefetched but ended up using a different tool, don't let that task leak.
+                # If we prefetched but ended up using a different tool, don't let that task leak
                 if sql_task is not None and tool_name != "fetch_health_context":
                     await _cancel_task(sql_task)
 
@@ -213,40 +229,42 @@ def build_agent_stream_response(*, user_id: str, conversation_id: str, question:
                     }
                 )
 
-                stream2 = final_client.chat.completions.create(model=answer_model, messages=messages, stream=True)
-                for chunk in stream2:
-                    choice = chunk.choices[0]
-                    delta = getattr(choice, "delta", None)
-                    if delta is not None:
-                        content = getattr(delta, "content", None)
-                        if isinstance(content, str) and content:
-                            full_response += content
-                            streamed_chars += len(content)
-                            yield _sse({"content": content, "done": False})
+                async for chunk in _iter_chat_completion_chunks(
+                    final_client,
+                    model=answer_model,
+                    messages=messages,
+                    stream=True,
+                ):
+                    try:
+                        choice = chunk.choices[0]
+                    except Exception:
+                        continue
 
-                    text_piece = getattr(choice, "text", None)
-                    if isinstance(text_piece, str) and text_piece:
-                        full_response += text_piece
-                        streamed_chars += len(text_piece)
-                        yield _sse({"content": text_piece, "done": False})
+                    pieces, _fr = _extract_text_pieces_and_finish_reason(choice, None)
+                    for piece in pieces:
+                        full_response += piece
+                        streamed_chars += len(piece)
+                        yield _sse({"content": piece, "done": False})
             else:
                 await _cancel_task(sql_task)
 
-            try:
-                logger.info(
-                    "stream.done: conv=%s chars=%d ms=%d",
-                    conversation_id,
-                    streamed_chars,
-                    int((time.perf_counter() - t0_stream) * 1000),
-                )
-            except Exception:
-                pass
+            logger.info(
+                "stream.done: conv=%s chars=%d ms=%d",
+                conversation_id,
+                streamed_chars,
+                int((time.perf_counter() - t0_stream) * 1000),
+            )
 
-            try:
-                if session and full_response.strip():
-                    create_chat_message(session, conversation_id, user_id, "assistant", full_response.strip())
-            except Exception:
-                pass
+            final_text = full_response.strip()
+            if session and final_text:
+                try:
+                    create_chat_message(session, conversation_id, user_id, "assistant", final_text)
+                    session.commit()
+                except Exception:
+                    try:
+                        session.rollback()
+                    except Exception:
+                        pass
 
             yield _sse({"content": "", "done": True})
 
@@ -255,12 +273,54 @@ def build_agent_stream_response(*, user_id: str, conversation_id: str, question:
         finally:
             await _cancel_task(sql_task)
             _safe_close_session()
+            try:
+                # Close the underlying async HTTP client (matches OpenAI SDK guidance).
+                await final_client.close()
+            except Exception:
+                pass
 
     return StreamingResponse(
         generator(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
+
+
+# Yield streaming chat completion chunks and always close the upstream stream
+async def _iter_chat_completion_chunks(client: Any, **stream_kwargs: object) -> AsyncIterator[Any]:
+    stream = await client.chat.completions.create(**stream_kwargs)
+    try:
+        async for chunk in stream:
+            yield chunk
+    finally:
+        try:
+            await stream.close()
+        except Exception:
+            pass
+
+
+# Extract streamed text fragments and optionally accumulate tool call fragments
+def _extract_text_pieces_and_finish_reason(choice: Any, tool_calls_acc: Optional[dict[int, dict]] = None) -> tuple[list[str], Optional[str]]:
+    finish_reason = getattr(choice, "finish_reason", None)
+    pieces: list[str] = []
+
+    delta = getattr(choice, "delta", None)
+    if delta is not None:
+        if tool_calls_acc is not None:
+            try:
+                _parse_tool_calls_from_delta(delta, tool_calls_acc)
+            except Exception:
+                pass
+        content = getattr(delta, "content", None)
+        if isinstance(content, str) and content:
+            pieces.append(content)
+
+    # Some providers surface streaming text on choice.text
+    text_piece = getattr(choice, "text", None)
+    if isinstance(text_piece, str) and text_piece:
+        pieces.append(text_piece)
+
+    return pieces, finish_reason
 
 
 # JSON-serialize a value for message/tool payloads without raising
@@ -315,16 +375,16 @@ def _tool_calls_for_messages(tool_calls_acc: dict[int, dict]) -> list[dict]:
 
 
 # Generate a short conversation title for the current conversation
-def generate_chat_title_sync(first_user_message: str) -> str:
+async def generate_chat_title(first_user_message: str) -> str:
+    client = get_async_openai_compatible_client("openai")
     try:
-        client = get_openai_compatible_client("openai")
         title_prompt_path = _BACKEND_DIR / "resources" / "chat_title_prompt.txt"
         title_prompt = title_prompt_path.read_text(encoding="utf-8")
-        response = client.chat.completions.create(
+        response = await client.chat.completions.create(
             model="gpt-5-mini",
             messages=[{"role": "user", "content": f"{title_prompt}{first_user_message[:100]}"}],
         )
-        content = response.choices[0].message.content
+        content = response.choices[0].message.content if response.choices else None
         if not content:
             return "New Chat"
         title = content.strip().strip("\"'.:")
@@ -335,8 +395,8 @@ def generate_chat_title_sync(first_user_message: str) -> str:
     except Exception:
         logger.exception("chat.title.error")
         return "New Chat"
-
-# Async wrapper around 'generate_chat_title_sync' to keep event loop unblocked while generating titles
-async def generate_chat_title(first_user_message: str) -> str:
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, generate_chat_title_sync, first_user_message)
+    finally:
+        try:
+            await client.close()
+        except Exception:
+            pass

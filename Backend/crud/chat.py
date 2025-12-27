@@ -1,7 +1,9 @@
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 
 from Backend.models.chat_data_model import ChatData
 from Backend.models.chat_conversation_model import ChatConversation
+
 
 # Create a new chat message
 def create_chat_message(session, conversation_id, user_id, role, content):
@@ -12,9 +14,13 @@ def create_chat_message(session, conversation_id, user_id, role, content):
         content = content
     )
     session.add(msg)
-    session.commit()
-    session.refresh(msg)
+    session.flush()
+    try:
+        session.refresh(msg)
+    except Exception:
+        pass
     return msg
+
 
 # Get chat history for a conversation
 def get_chat_history(session, conversation_id, user_id):
@@ -25,6 +31,7 @@ def get_chat_history(session, conversation_id, user_id):
         .all()
     )
 
+
 # Get existing conversation or create a new one
 def get_or_create_conversation(session, conversation_id, user_id):
     conv = session.query(ChatConversation).filter_by(
@@ -34,18 +41,22 @@ def get_or_create_conversation(session, conversation_id, user_id):
 
     if not conv:
         conv = ChatConversation(conversation_id=conversation_id, user_id=user_id, title=None)
-        session.add(conv)
+        # Use a nested transaction so an IntegrityError here doesn't blow away the caller's transaction.
         try:
-            session.commit()
-            session.refresh(conv)
-        except IntegrityError:  # Another request likely created it concurrently OR the conversation_id already exists (potentially for another user). Roll back and re-query safely.
-            session.rollback()
-            existing = session.query(ChatConversation).filter_by(conversation_id=conversation_id).first()
-            if existing and existing.user_id == user_id:
-                return existing
-            return None
+            with session.begin_nested():
+                session.add(conv)
+                session.flush()
+                try:
+                    session.refresh(conv)
+                except Exception:
+                    pass
+        except IntegrityError:
+            # Another request likely created it concurrently for the same user_id.
+            existing = session.query(ChatConversation).filter_by(conversation_id=conversation_id, user_id=user_id).first()
+            return existing
 
     return conv
+
 
 # Update the title of a conversation
 def update_conversation_title(session, conversation_id, user_id, title):
@@ -55,21 +66,45 @@ def update_conversation_title(session, conversation_id, user_id, title):
         if not conv:
             return None
     conv.title = title
-    session.commit()
-    session.refresh(conv)
+    session.flush()
+    try:
+        session.refresh(conv)
+    except Exception:
+        pass
     return conv
 
-# Get the title of a conversation, or None if not set
-def get_conversation_title(session, conversation_id, user_id):
-    conv = session.query(ChatConversation).filter_by(
-        conversation_id=conversation_id,
-        user_id=user_id
-    ).first()
-    return conv.title if conv else None
 
-# Get all conversation titles for a user as a dict
-def get_all_conversation_titles(session, user_id):
+# Get chat sessions for a user with last-active timestamps + titles
+def get_chat_sessions(session, user_id):
+    subquery = (
+        session.query(
+            ChatData.conversation_id,
+            func.max(ChatData.timestamp).label("last_message_at"),
+        )
+        .filter(ChatData.user_id == user_id)
+        .group_by(ChatData.conversation_id)
+        .subquery()
+    )
+
+    latest_messages = (
+        session.query(ChatData)
+        .join(
+            subquery,
+            (ChatData.conversation_id == subquery.c.conversation_id) & (ChatData.timestamp == subquery.c.last_message_at),
+        )
+        .filter(ChatData.user_id == user_id)
+        .all()
+    )
+
     conversations = session.query(ChatConversation).filter_by(user_id=user_id).all()
-    return {conv.conversation_id: conv.title for conv in conversations}
+    titles = {conv.conversation_id: conv.title for conv in conversations}
+    return [
+        {
+            "conversation_id": msg.conversation_id,
+            "title": titles.get(msg.conversation_id),
+            "last_active_date": msg.timestamp.isoformat() if msg.timestamp else None,
+        }
+        for msg in latest_messages
+    ]
 
 
