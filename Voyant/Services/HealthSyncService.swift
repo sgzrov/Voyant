@@ -102,7 +102,7 @@ final class HealthSyncService {
 						Task {
 							do {
 								print("[HealthSync] Uploading initial CSV (\(data.count) bytes)")
-								let taskId = try await AgentBackendService.shared.uploadHealthCSV(data)
+								let taskId = try await AgentBackendService.shared.uploadHealthCSV(data, uploadMode: "seed")
 								print("[HealthSync] Enqueued process_csv_upload taskId=\(taskId)")
 								// Optionally poll for completion so we can log success
 								let status = try await AgentBackendService.shared.waitForHealthTask(taskId, timeout: 120)
@@ -319,7 +319,7 @@ final class HealthSyncService {
 						Task {
 							do {
 								print("[HealthSync] Uploading delta CSV (\(data.count) bytes)")
-								let taskId = try await AgentBackendService.shared.uploadHealthCSV(data)
+								let taskId = try await AgentBackendService.shared.uploadHealthCSV(data, uploadMode: "delta")
 								print("[HealthSync] Delta upload enqueued with task_id=\(taskId)")
 							} catch {
 								print("[HealthSync] Delta upload failed: \(error)")

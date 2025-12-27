@@ -20,7 +20,7 @@ class AgentBackendService {
     }
 
     func chatStream(userInput: String, conversationId: String?, provider: String?, model: String?) async throws -> AsyncStream<String> {
-        var body: [String: Any] = ["user_input": userInput]
+        var body: [String: Any] = ["question": userInput]
         if let conversationId = conversationId {
             body["conversation_id"] = conversationId
         }
@@ -28,7 +28,7 @@ class AgentBackendService {
         if let model = model { body["model"] = model }
         let jsonData = try JSONSerialization.data(withJSONObject: body)
         var request = try await authService.authenticatedRequest(
-            for: "/chat/stream/",
+            for: "/chat/tool-sql/stream",
             method: "POST",
             body: jsonData
         )
@@ -36,10 +36,13 @@ class AgentBackendService {
         return try await sseService.streamSSE(request: request)
     }
 
-    func uploadHealthCSV(_ data: Data) async throws -> (String) {
+    func uploadHealthCSV(_ data: Data, uploadMode: String? = nil) async throws -> (String) {
         var request = try await authService.authenticatedRequest(for: "/health/upload-csv", method: "POST")
         let boundary = "Boundary-\(UUID().uuidString)"
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        if let uploadMode = uploadMode {
+            request.setValue(uploadMode, forHTTPHeaderField: "x-upload-mode")
+        }
 
         var body = Data()
         body.append("--\(boundary)\r\n".data(using: .utf8)!)
@@ -101,7 +104,7 @@ class AgentBackendService {
         if let model = model { payload["model"] = model }
         if let decisionModel = decisionModel { payload["decision_model"] = decisionModel }
         let body = try JSONSerialization.data(withJSONObject: payload)
-        var request = try await authService.authenticatedRequest(for: "/health/query/stream", method: "POST", body: body)
+        var request = try await authService.authenticatedRequest(for: "/chat/tool-sql/stream", method: "POST", body: body)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         return try await sseService.streamSSE(request: request)
     }
