@@ -79,26 +79,20 @@ class MessageViewModel: ObservableObject {
             )
 
             let messageIndex = messages.count - 1
-            var isFirstChunk = true
             var fullContent = ""
 
             for await chunk in stream {
-                if isFirstChunk {
-                    print("[MessageViewModel] First chunk received: '\(chunk.prefix(200))'")
-                    if let (id, title) = extractMetadata(from: chunk) {
-                        print("[MessageViewModel] Extracted metadata - id: \(id ?? "nil"), title: \(title ?? "nil")")
-                        if let id = id {
-                            session.conversationId = id
-                        }
-                        if let title = title {
-                            print("[MessageViewModel] Updating title to: '\(title)'")
-                            updateTitle(title)
-                        }
-                        // Skip appending this initial JSON chunk (metadata)
-                        isFirstChunk = false
-                        continue
+                // Metadata chunks (conversation_id/title) can arrive at any time; never append them to assistant text.
+                if chunk.first == "{", let (id, title) = extractMetadata(from: chunk) {
+                    print("[MessageViewModel] Extracted metadata - id: \(id ?? "nil"), title: \(title ?? "nil")")
+                    if let id = id {
+                        session.conversationId = id
                     }
-                    isFirstChunk = false
+                    if let title = title {
+                        print("[MessageViewModel] Updating title to: '\(title)'")
+                        updateTitle(title)
+                    }
+                    continue
                 }
 
                 if chunk.hasPrefix("Error: ") {

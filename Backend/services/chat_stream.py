@@ -42,6 +42,8 @@ def build_agent_stream_response(
         session: Optional[Session] = db_session
         owns_session = False
         sql_task: Optional[asyncio.Task] = None
+        title_task: Optional[asyncio.Task] = None
+        title_sent = False
 
         def _sse(payload: dict) -> str:
             return f"data: {json.dumps(payload)}\n\n"
@@ -102,23 +104,39 @@ def build_agent_stream_response(
                     pass
                 pass
 
-        async def _maybe_generate_title(is_new_conversation: bool) -> Optional[str]:
-            if not is_new_conversation or session is None:
+        # Generate & persist a title using an isolated DB session so it can't interfere with streaming.
+        async def _maybe_generate_title_isolated(is_new_conversation: bool) -> Optional[str]:
+            if not is_new_conversation:
                 return None
+            isolated: Optional[Session] = None
             try:
-                conv = get_or_create_conversation(session, conversation_id, user_id)
-                if not conv or conv.title:
+                isolated = SessionLocal()
+                conv = get_or_create_conversation(isolated, conversation_id, user_id)
+                if not conv or getattr(conv, "title", None):
                     return None
                 title = await generate_chat_title(question)
-                update_conversation_title(session, conversation_id, user_id, title)
-                session.commit()
+                update_conversation_title(isolated, conversation_id, user_id, title)
+                isolated.commit()
                 return title
             except Exception:
                 try:
-                    session.rollback()
+                    if isolated is not None:
+                        isolated.rollback()
                 except Exception:
                     pass
                 return None
+            finally:
+                try:
+                    if isolated is not None:
+                        isolated.close()
+                except Exception:
+                    pass
+
+        def _title_task_done(task: asyncio.Task) -> None:
+            try:
+                _ = task.result()
+            except Exception:
+                logger.exception("chat.title.bg.error")
 
         async def _resolve_tool_ctx(tool_name: Optional[str], args: dict) -> dict:
             handler = tool_handlers.get(tool_name or "")
@@ -149,15 +167,18 @@ def build_agent_stream_response(
                 session = None
                 history_msgs = []
 
-            generated_title = await _maybe_generate_title(is_new_conversation=(len(history_msgs) == 0))
-
             try:
                 initial_payload: dict[str, object] = {"conversation_id": conversation_id, "content": "", "done": False}
-                if generated_title:
-                    initial_payload["title"] = generated_title
                 yield _sse(initial_payload)
             except Exception:
                 pass
+
+            # Kick off title generation in the background (isolated from the streaming session).
+            try:
+                title_task = asyncio.create_task(_maybe_generate_title_isolated(is_new_conversation=(len(history_msgs) == 0)))
+                title_task.add_done_callback(_title_task_done)
+            except Exception:
+                title_task = None
 
             messages: list[dict] = [{"role": "system", "content": system}, *history_msgs, {"role": "user", "content": question}]
 
@@ -186,6 +207,15 @@ def build_agent_stream_response(
 
             # Stream the first pass and accumulate any tool-call fragments.
             async for chunk in _iter_chat_completion_chunks(final_client, **stream_kwargs):
+                # Emit title update as soon as it's ready (won't affect the model stream).
+                if title_task is not None and title_task.done() and not title_sent:
+                    try:
+                        title = title_task.result()
+                        if isinstance(title, str) and title.strip():
+                            yield _sse({"conversation_id": conversation_id, "title": title.strip(), "content": "", "done": False})
+                            title_sent = True
+                    except Exception:
+                        pass
                 try:
                     choice = chunk.choices[0]
                 except Exception:
@@ -235,6 +265,14 @@ def build_agent_stream_response(
                     messages=messages,
                     stream=True,
                 ):
+                    if title_task is not None and title_task.done() and not title_sent:
+                        try:
+                            title = title_task.result()
+                            if isinstance(title, str) and title.strip():
+                                yield _sse({"conversation_id": conversation_id, "title": title.strip(), "content": "", "done": False})
+                                title_sent = True
+                        except Exception:
+                            pass
                     try:
                         choice = chunk.choices[0]
                     except Exception:
