@@ -36,6 +36,24 @@ class ChatHistoryViewModel: ObservableObject {
         ) { [weak self] notification in
             self?.handleChatCreated(notification)
         }
+
+        // Listen for conversation_id assignment for newly created local sessions
+        NotificationCenter.default.addObserver(
+            forName: .chatConversationIdAssigned,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            self?.handleConversationIdAssigned(notification)
+        }
+
+        // Keep chat list/session state in sync with ongoing streaming updates.
+        NotificationCenter.default.addObserver(
+            forName: .chatSessionSnapshotUpdated,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            self?.handleSessionSnapshotUpdated(notification)
+        }
     }
 
     private func handleTitleUpdate(_ notification: Notification) {
@@ -63,6 +81,41 @@ class ChatHistoryViewModel: ObservableObject {
             chatSessions.insert(session, at: 0)
             print("[DEBUG] ChatHistoryViewModel: Added new chat session instantly")
         }
+    }
+
+    private func handleConversationIdAssigned(_ notification: Notification) {
+        guard let userInfo = notification.userInfo,
+              let localSessionId = userInfo["localSessionId"] as? String,
+              let conversationId = userInfo["conversationId"] as? String else {
+            return
+        }
+
+        if let index = chatSessions.firstIndex(where: { $0.id == localSessionId }) {
+            chatSessions[index].conversationId = conversationId
+            print("[DEBUG] ChatHistoryViewModel: Assigned conversationId \(conversationId) to local session \(localSessionId)")
+        }
+    }
+
+    private func handleSessionSnapshotUpdated(_ notification: Notification) {
+        guard let userInfo = notification.userInfo,
+              let session = userInfo["session"] as? ChatSession else {
+            return
+        }
+
+        // Prefer matching on conversationId when present; otherwise fall back to the current id (localId).
+        if let conversationId = session.conversationId,
+           let index = chatSessions.firstIndex(where: { $0.conversationId == conversationId }) {
+            chatSessions[index] = session
+            return
+        }
+
+        if let index = chatSessions.firstIndex(where: { $0.id == session.id }) {
+            chatSessions[index] = session
+            return
+        }
+
+        // If it's a brand new session snapshot, insert it so the list doesn't "lose" in-flight messages.
+        chatSessions.insert(session, at: 0)
     }
 
     func appendSessionIfNeeded(_ session: ChatSession) {

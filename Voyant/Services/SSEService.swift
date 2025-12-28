@@ -7,6 +7,9 @@
 
 import Foundation
 import Combine
+#if canImport(UIKit)
+import UIKit
+#endif
 
 // Import the protocol from the Extensions directory
 
@@ -59,10 +62,16 @@ class SSEService: NSObject, URLSessionDataDelegate {
         print("[SSEService] Starting SSE stream with URL: \(request.url?.absoluteString ?? "nil")")
         print("[SSEService] Request headers: \(request.allHTTPHeaderFields ?? [:])")
         return AsyncStream<String> { continuation in
+            BackgroundSSETaskCoordinator.shared.acquire()
             let delegate = SSEStreamDelegate(continuation: continuation)
             let config = URLSessionConfiguration.default
             config.timeoutIntervalForRequest = 120
             config.timeoutIntervalForResource = 600
+            #if canImport(UIKit)
+            if #available(iOS 11.0, *) {
+                config.shouldUseExtendedBackgroundIdleMode = true
+            }
+            #endif
             let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
 
             var modifiedRequest = request
@@ -100,10 +109,66 @@ class SSEService: NSObject, URLSessionDataDelegate {
                 print("[SSEService] Stream terminated by consumer.")
                 cancellable.cancel()
                 delegate.dataTask?.cancel()
+                BackgroundSSETaskCoordinator.shared.release()
             }
         }
     }
 }
+
+#if canImport(UIKit)
+/// Best-effort mechanism to keep streaming alive briefly when the app goes to background.
+/// iOS will still suspend networking after a short grace period; this just requests that grace period.
+final class BackgroundSSETaskCoordinator {
+    static let shared = BackgroundSSETaskCoordinator()
+
+    private let lock = DispatchQueue(label: "BackgroundSSETaskCoordinator.lock")
+    private var activeStreamCount: Int = 0
+    private var bgTaskId: UIBackgroundTaskIdentifier = .invalid
+
+    private init() {}
+
+    func acquire() {
+        lock.async {
+            self.activeStreamCount += 1
+            if self.bgTaskId == .invalid {
+                DispatchQueue.main.async {
+                    self.bgTaskId = UIApplication.shared.beginBackgroundTask(withName: "SSEStreaming") { [weak self] in
+                        // Time is up — iOS may suspend the app shortly after this.
+                        self?.endBackgroundTask()
+                    }
+                }
+            }
+        }
+    }
+
+    func release() {
+        lock.async {
+            self.activeStreamCount = max(0, self.activeStreamCount - 1)
+            if self.activeStreamCount == 0 {
+                DispatchQueue.main.async {
+                    self.endBackgroundTask()
+                }
+            }
+        }
+    }
+
+    private func endBackgroundTask() {
+        lock.async {
+            guard self.bgTaskId != .invalid else { return }
+            UIApplication.shared.endBackgroundTask(self.bgTaskId)
+            self.bgTaskId = .invalid
+        }
+    }
+}
+#else
+/// Non-iOS fallback (no background task support).
+final class BackgroundSSETaskCoordinator {
+    static let shared = BackgroundSSETaskCoordinator()
+    private init() {}
+    func acquire() {}
+    func release() {}
+}
+#endif
 
 // Helper delegate class for per-stream state
 class SSEStreamDelegate: NSObject, URLSessionDataDelegate {
