@@ -34,12 +34,12 @@ async def execute_sql_gen_tool(*, user_id: str, question: str, tz_name: str) -> 
     sql_system_prompt = sql_system_path.read_text(encoding="utf-8")
     question_text = question
 
-    logger.info("sql.gen.start: question='%s' model=%s", question, "gemini-2.5-flash")
+    logger.info("sql.gen.start: question='%s' model=%s", question, "gemini-2.5-flash-lite")
 
     client = get_async_openai_compatible_client("gemini")
     try:
         sql_resp = await client.chat.completions.create(
-            model="gemini-2.5-flash",
+            model="gemini-2.5-flash-lite",
             messages=[
                 {"role": "system", "content": sql_system_prompt},
                 {"role": "user", "content": question_text},

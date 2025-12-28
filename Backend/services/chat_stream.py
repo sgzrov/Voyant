@@ -19,7 +19,7 @@ _BACKEND_DIR = pathlib.Path(__file__).resolve().parents[1]
 DEFAULT_MODEL = {
     "openai": "gpt-5-mini",
     "grok": "grok-4-fast",
-    "gemini": "gemini-2.5-flash",
+    "gemini": "gemini-2.5-flash-lite",
     "anthropic": "claude-sonnet-4-5",
 }
 
