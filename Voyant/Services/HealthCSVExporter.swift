@@ -35,7 +35,12 @@ struct HealthCSVExporter {
             return
         }
 
+        // Rows are appended from many HealthKit callbacks concurrently; guard with a serial queue.
+        let rowsQueue = DispatchQueue(label: "HealthCSVExporter.rows")
         var rows: [String] = ["user_id,timestamp,metric_type,metric_value,unit,source,timezone,created_at"]
+        func appendRow(_ line: String) {
+            rowsQueue.sync { rows.append(line) }
+        }
 
         let specs = MetricSpec.defaultSpecs().filter { requestedMetrics.isEmpty ? true : requestedMetrics.contains($0.name) }
 
@@ -68,7 +73,7 @@ struct HealthCSVExporter {
                 case .success(let points):
                     points.forEach { p in
                         let line = "\(userId),\(iso.string(from: p.timestamp)),\(spec.name),\(formatValue(p.value)),\(spec.unitLabel),\(p.source),\(tz),\(createdAt)"
-                        rows.append(line)
+                        appendRow(line)
                     }
                 case .failure(let error):
                     // Non-fatal: ignore per-metric authorization or data errors
@@ -84,34 +89,38 @@ struct HealthCSVExporter {
         let workoutPredicate = HKQuery.predicateForSamples(withStart: start60, end: now, options: .strictStartDate)
         let sort = NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)
         let workoutQuery = HKSampleQuery(sampleType: workoutType, predicate: workoutPredicate, limit: HKObjectQueryNoLimit, sortDescriptors: [sort]) { _, samples, error in
-            defer { group.leave() }
             if let error = error {
                 // Non-fatal: skip workouts if unauthorized
                 print("[HealthCSVExporter] workouts query error: \(error.localizedDescription)")
+                group.leave()
                 return
             }
             guard let workouts = samples as? [HKWorkout] else { return }
+            let inner = DispatchGroup()
             for w in workouts {
-                let ts = iso.string(from: w.startDate)
-                let typeLabel = Self.workoutActivityName(w.workoutActivityType)
-                let distKm = (w.totalDistance?.doubleValue(for: HKUnit.meter()) ?? 0.0) / 1000.0
-                let durMin = w.duration / 60.0
-                var kcal: Double = 0.0
-                if let qt = HKQuantityType.quantityType(forIdentifier: .activeEnergyBurned) {
-                    kcal = w.statistics(for: qt)?.sumQuantity()?.doubleValue(for: .kilocalorie()) ?? 0.0
-                }
+                inner.enter()
+                Self.workoutKilocalories(healthStore: healthStore, workout: w) { kcal in
+                    let ts = iso.string(from: w.startDate)
+                    let typeLabel = Self.workoutActivityName(w.workoutActivityType)
+                    let distKm = (w.totalDistance?.doubleValue(for: HKUnit.meter()) ?? 0.0) / 1000.0
+                    let durMin = w.duration / 60.0
 
-                rows.append("\(userId),\(ts),workout_distance_km,\(formatValue(distKm)),km,\(typeLabel),\(tz),\(createdAt)")
-                rows.append("\(userId),\(ts),workout_duration_min,\(formatValue(durMin)),min,\(typeLabel),\(tz),\(createdAt)")
-                rows.append("\(userId),\(ts),workout_energy_kcal,\(formatValue(kcal)),kcal,\(typeLabel),\(tz),\(createdAt)")
+                    appendRow("\(userId),\(ts),workout_distance_km,\(formatValue(distKm)),km,\(typeLabel),\(tz),\(createdAt)")
+                    appendRow("\(userId),\(ts),workout_duration_min,\(formatValue(durMin)),min,\(typeLabel),\(tz),\(createdAt)")
+                    appendRow("\(userId),\(ts),workout_energy_kcal,\(formatValue(kcal)),kcal,\(typeLabel),\(tz),\(createdAt)")
 
-                // Simple events
-                if distKm >= 10.0 {
-                    rows.append("\(userId),\(ts),event_long_run_km,\(formatValue(distKm)),km,\(typeLabel),\(tz),\(createdAt)")
+                    // Simple events
+                    if distKm >= 10.0 {
+                        appendRow("\(userId),\(ts),event_long_run_km,\(formatValue(distKm)),km,\(typeLabel),\(tz),\(createdAt)")
+                    }
+                    if kcal >= 800.0 || durMin >= 60.0 {
+                        appendRow("\(userId),\(ts),event_hard_workout,1,count,\(typeLabel),\(tz),\(createdAt)")
+                    }
+                    inner.leave()
                 }
-                if kcal >= 800.0 || durMin >= 60.0 {
-                    rows.append("\(userId),\(ts),event_hard_workout,1,count,\(typeLabel),\(tz),\(createdAt)")
-                }
+            }
+            inner.notify(queue: .global(qos: .utility)) {
+                group.leave()
             }
         }
         healthStore.execute(workoutQuery)
@@ -121,7 +130,7 @@ struct HealthCSVExporter {
                 completion(.failure(error))
                 return
             }
-            let data = rows.joined(separator: "\n").data(using: .utf8) ?? Data()
+            let data = rowsQueue.sync { rows.joined(separator: "\n").data(using: .utf8) ?? Data() }
             completion(.success(data))
         }
     }
@@ -154,7 +163,11 @@ struct HealthCSVExporter {
             "hr_variability_sdnn"
         ]
 
+        let rowsQueue = DispatchQueue(label: "HealthCSVExporter.delta.rows")
         var rows: [String] = ["user_id,timestamp,metric_type,metric_value,unit,source,timezone,created_at"]
+        func appendRow(_ line: String) {
+            rowsQueue.sync { rows.append(line) }
+        }
 
         let specs = MetricSpec.defaultSpecs().filter { requestedMetrics.isEmpty ? true : requestedMetrics.contains($0.name) }
 
@@ -185,7 +198,7 @@ struct HealthCSVExporter {
                 case .success(let points):
                     points.forEach { p in
                         let line = "\(userId),\(iso.string(from: p.timestamp)),\(spec.name),\(formatValue(p.value)),\(spec.unitLabel),\(p.source),\(tz),\(createdAt)"
-                        rows.append(line)
+                        appendRow(line)
                     }
                 case .failure(let error):
                     // Non-fatal: ignore per-metric authorization or data errors
@@ -201,30 +214,34 @@ struct HealthCSVExporter {
         let workoutPredicate = HKQuery.predicateForSamples(withStart: start, end: end, options: .strictStartDate)
         let sort = NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)
         let workoutQuery = HKSampleQuery(sampleType: workoutType, predicate: workoutPredicate, limit: HKObjectQueryNoLimit, sortDescriptors: [sort]) { _, samples, error in
-            defer { group.leave() }
             if let error = error {
                 print("[HealthCSVExporter] delta workouts query error: \(error.localizedDescription)")
+                group.leave()
                 return
             }
             guard let workouts = samples as? [HKWorkout] else { return }
+            let inner = DispatchGroup()
             for w in workouts {
-                let ts = iso.string(from: w.startDate)
-                let typeLabel = Self.workoutActivityName(w.workoutActivityType)
-                let distKm = (w.totalDistance?.doubleValue(for: HKUnit.meter()) ?? 0.0) / 1000.0
-                let durMin = w.duration / 60.0
-                var kcal: Double = 0.0
-                if let qt = HKQuantityType.quantityType(forIdentifier: .activeEnergyBurned) {
-                    kcal = w.statistics(for: qt)?.sumQuantity()?.doubleValue(for: .kilocalorie()) ?? 0.0
+                inner.enter()
+                Self.workoutKilocalories(healthStore: healthStore, workout: w) { kcal in
+                    let ts = iso.string(from: w.startDate)
+                    let typeLabel = Self.workoutActivityName(w.workoutActivityType)
+                    let distKm = (w.totalDistance?.doubleValue(for: HKUnit.meter()) ?? 0.0) / 1000.0
+                    let durMin = w.duration / 60.0
+                    appendRow("\(userId),\(ts),workout_distance_km,\(formatValue(distKm)),km,\(typeLabel),\(tz),\(createdAt)")
+                    appendRow("\(userId),\(ts),workout_duration_min,\(formatValue(durMin)),min,\(typeLabel),\(tz),\(createdAt)")
+                    appendRow("\(userId),\(ts),workout_energy_kcal,\(formatValue(kcal)),kcal,\(typeLabel),\(tz),\(createdAt)")
+                    if distKm >= 10.0 {
+                        appendRow("\(userId),\(ts),event_long_run_km,\(formatValue(distKm)),km,\(typeLabel),\(tz),\(createdAt)")
+                    }
+                    if kcal >= 800.0 || durMin >= 60.0 {
+                        appendRow("\(userId),\(ts),event_hard_workout,1,count,\(typeLabel),\(tz),\(createdAt)")
+                    }
+                    inner.leave()
                 }
-                rows.append("\(userId),\(ts),workout_distance_km,\(formatValue(distKm)),km,\(typeLabel),\(tz),\(createdAt)")
-                rows.append("\(userId),\(ts),workout_duration_min,\(formatValue(durMin)),min,\(typeLabel),\(tz),\(createdAt)")
-                rows.append("\(userId),\(ts),workout_energy_kcal,\(formatValue(kcal)),kcal,\(typeLabel),\(tz),\(createdAt)")
-                if distKm >= 10.0 {
-                    rows.append("\(userId),\(ts),event_long_run_km,\(formatValue(distKm)),km,\(typeLabel),\(tz),\(createdAt)")
-                }
-                if kcal >= 800.0 || durMin >= 60.0 {
-                    rows.append("\(userId),\(ts),event_hard_workout,1,count,\(typeLabel),\(tz),\(createdAt)")
-                }
+            }
+            inner.notify(queue: .global(qos: .utility)) {
+                group.leave()
             }
         }
         healthStore.execute(workoutQuery)
@@ -234,9 +251,31 @@ struct HealthCSVExporter {
                 completion(.failure(error))
                 return
             }
-            let data = rows.joined(separator: "\n").data(using: .utf8) ?? Data()
+            let data = rowsQueue.sync { rows.joined(separator: "\n").data(using: .utf8) ?? Data() }
             completion(.success(data))
         }
+    }
+
+    // MARK: - Workout helpers
+    private static func workoutKilocalories(healthStore: HKHealthStore, workout: HKWorkout, completion: @escaping (Double) -> Void) {
+        // Preferred: workout-provided statistics (non-deprecated)
+        if let qt = HKQuantityType.quantityType(forIdentifier: .activeEnergyBurned),
+           let sum = workout.statistics(for: qt)?.sumQuantity() {
+            completion(sum.doubleValue(for: HKUnit.kilocalorie()))
+            return
+        }
+
+        // Fallback: sum activeEnergyBurned over the workout time window.
+        guard let qt = HKObjectType.quantityType(forIdentifier: .activeEnergyBurned) else {
+            completion(0.0)
+            return
+        }
+        let predicate = HKQuery.predicateForSamples(withStart: workout.startDate, end: workout.endDate, options: .strictStartDate)
+        let q = HKStatisticsQuery(quantityType: qt, quantitySamplePredicate: predicate, options: .cumulativeSum) { _, result, _ in
+            let kcal = result?.sumQuantity()?.doubleValue(for: HKUnit.kilocalorie()) ?? 0.0
+            completion(kcal)
+        }
+        healthStore.execute(q)
     }
 
 
