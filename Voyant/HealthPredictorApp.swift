@@ -26,6 +26,9 @@ struct HealthPredictorApp: App {
     @State private var clerk = Clerk.shared
 
     init() {
+        // Track timezone changes so historical events can be displayed in the timezone they occurred in.
+        TimezoneHistoryService.shared.start()
+
         HealthStoreService.shared.requestAuthorization { success, error in
             if success {
                 print("HealthKit authorized.")

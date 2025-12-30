@@ -1,5 +1,6 @@
 from logging.config import fileConfig
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -26,7 +27,17 @@ config = context.config
 def _get_migration_url() -> str:
     url = config.get_main_option("sqlalchemy.url")
     if url:
-        return url
+        url = url.strip()
+        # Support placeholder syntax like: sqlalchemy.url = ${DATABASE_URL}
+        m = re.fullmatch(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", url)
+        if m:
+            env_name = m.group(1)
+            env_val = os.getenv(env_name) or ""
+            if env_val:
+                return env_val
+            # Treat unresolved placeholder as missing and fall through to DATABASE_URL lookup.
+        else:
+            return url
 
     db_url = os.getenv("DATABASE_URL") or ""
     if db_url:

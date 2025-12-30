@@ -317,6 +317,7 @@ def _rewrite_rollup_hourly_to_tz_derived(sql: str) -> str:
             "   user_id,\n"
             "   (date_trunc('hour', bucket_ts AT TIME ZONE :tz_name) AT TIME ZONE :tz_name) AS bucket_ts,\n"
             "   metric_type,\n"
+            "   (ARRAY_AGG(meta) FILTER (WHERE meta IS NOT NULL))[1] AS meta,\n"
             "   CASE WHEN SUM(n) > 0 THEN SUM(COALESCE(avg_value, 0) * n) / SUM(n) END AS avg_value,\n"
             "   SUM(COALESCE(sum_value, 0)) AS sum_value,\n"
             "   MIN(min_value) AS min_value,\n"

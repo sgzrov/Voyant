@@ -4,6 +4,7 @@ import io
 import logging
 import pandas as pd
 import base64
+import json
 from sqlalchemy import text
 import time
 import random
@@ -110,6 +111,10 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
         if not df_events.empty:
             df_events["metric_value"] = pd.to_numeric(df_events["metric_value"], errors = "coerce")
             df_events = df_events[pd.notna(df_events["metric_value"])]
+
+            # Optional per-row timezone info from the CSV (used to display historical events in the tz they occurred in)
+            tz_series = df_events["timezone"] if "timezone" in df_events.columns else None
+            off_series = df_events["utc_offset_min"] if "utc_offset_min" in df_events.columns else None
             params = [
                 {
                     "user_id": user_id,
@@ -118,25 +123,52 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                     "value": float(val),
                     "unit": unit if unit is not None and pd.notna(unit) else None,
                     "source": source if source is not None and pd.notna(source) else None,
+                    "meta": meta,
                 }
-                for ts, etype, val, unit, source in zip(
+                for ts, etype, val, unit, source, meta in zip(
                     df_events["timestamp"],
                     df_events["metric_type"],
                     df_events["metric_value"],
                     df_events["unit"] if "unit" in df_events.columns else [None] * len(df_events),
                     df_events["source"] if "source" in df_events.columns else [None] * len(df_events),
+                    [
+                        (
+                            json.dumps(
+                                {
+                                    **(
+                                        {"tz_name": str(tz)} if tz_series is not None and tz is not None and pd.notna(tz) and str(tz).strip() else {}
+                                    ),
+                                    **(
+                                        {"utc_offset_min": int(float(off))}
+                                        if off_series is not None and off is not None and pd.notna(off)
+                                        else {}
+                                    ),
+                                }
+                            )
+                            if (
+                                (tz_series is not None and tz is not None and pd.notna(tz) and str(tz).strip())
+                                or (off_series is not None and off is not None and pd.notna(off))
+                            )
+                            else None
+                        )
+                        for tz, off in zip(
+                            tz_series if tz_series is not None else [None] * len(df_events),
+                            off_series if off_series is not None else [None] * len(df_events),
+                        )
+                    ],
                 )
             ]
             if params:
                 _execmany(
                     """
-                    INSERT INTO health_events (user_id, timestamp, event_type, value, unit, source)
-                    VALUES (:user_id, :timestamp, :event_type, :value, :unit, :source)
+                    INSERT INTO health_events (user_id, timestamp, event_type, value, unit, source, meta)
+                    VALUES (:user_id, :timestamp, :event_type, :value, :unit, :source, CAST(:meta AS jsonb))
                     ON CONFLICT (user_id, event_type, timestamp) DO UPDATE
                     SET
                         value = GREATEST(EXCLUDED.value, health_events.value),
                         unit = COALESCE(EXCLUDED.unit, health_events.unit),
-                        source = COALESCE(EXCLUDED.source, health_events.source)
+                        source = COALESCE(EXCLUDED.source, health_events.source),
+                        meta = COALESCE(EXCLUDED.meta, health_events.meta)
                     """,
                     params,
                     "bulk insert health_events",
@@ -147,6 +179,9 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
         if not df_metrics.empty:
             df_metrics["metric_value"] = pd.to_numeric(df_metrics["metric_value"], errors = "coerce")
             df_metrics = df_metrics[pd.notna(df_metrics["metric_value"])]
+            # Optional per-row timezone info from the CSV (used to display historical metrics in the tz they occurred in)
+            tz_series_m = df_metrics["timezone"] if "timezone" in df_metrics.columns else None
+            off_series_m = df_metrics["utc_offset_min"] if "utc_offset_min" in df_metrics.columns else None
             params_m = [
                 {
                     "user_id": user_id,
@@ -156,29 +191,56 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                     "unit": unit if unit is not None and pd.notna(unit) else None,
                     "source": source if source is not None and pd.notna(source) else None,
                     "created_at": _py_dt_or_none(cat),
+                    "meta": meta,
                 }
-                for ts, mtype, val, unit, source, cat in zip(
+                for ts, mtype, val, unit, source, cat, meta in zip(
                     df_metrics["timestamp"],
                     df_metrics["metric_type"],
                     df_metrics["metric_value"],
                     df_metrics["unit"] if "unit" in df_metrics.columns else [None] * len(df_metrics),
                     df_metrics["source"] if "source" in df_metrics.columns else [None] * len(df_metrics),
                     df_metrics["created_at"] if "created_at" in df_metrics.columns else [None] * len(df_metrics),
+                    [
+                        (
+                            json.dumps(
+                                {
+                                    **(
+                                        {"tz_name": str(tz)} if tz_series_m is not None and tz is not None and pd.notna(tz) and str(tz).strip() else {}
+                                    ),
+                                    **(
+                                        {"utc_offset_min": int(float(off))}
+                                        if off_series_m is not None and off is not None and pd.notna(off)
+                                        else {}
+                                    ),
+                                }
+                            )
+                            if (
+                                (tz_series_m is not None and tz is not None and pd.notna(tz) and str(tz).strip())
+                                or (off_series_m is not None and off is not None and pd.notna(off))
+                            )
+                            else None
+                        )
+                        for tz, off in zip(
+                            tz_series_m if tz_series_m is not None else [None] * len(df_metrics),
+                            off_series_m if off_series_m is not None else [None] * len(df_metrics),
+                        )
+                    ],
                 )
             ]
             if params_m:
                 _execmany(
                     """
                     INSERT INTO health_metrics
-                        (user_id, timestamp, metric_type, metric_value, unit, source, created_at)
+                        (user_id, timestamp, metric_type, metric_value, unit, source, created_at, meta)
                     VALUES
-                        (:user_id, :timestamp, :metric_type, :metric_value, :unit, :source, :created_at)
+                        (:user_id, :timestamp, :metric_type, :metric_value, :unit, :source, :created_at, CAST(:meta AS jsonb))
                     ON CONFLICT (user_id, metric_type, timestamp) DO UPDATE
                     SET
                         metric_value = EXCLUDED.metric_value,
                         unit = EXCLUDED.unit,
                         source = EXCLUDED.source,
-                        created_at = COALESCE(EXCLUDED.created_at, health_metrics.created_at)
+                        created_at = COALESCE(EXCLUDED.created_at, health_metrics.created_at),
+                        meta = COALESCE(EXCLUDED.meta, health_metrics.meta)
                     """,
                     params_m,
                     "bulk insert health_metrics",
@@ -197,7 +259,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                 _exec(
                     """
                     INSERT INTO health_rollup_hourly
-                        (user_id, bucket_ts, metric_type, avg_value, sum_value, min_value, max_value, n)
+                        (user_id, bucket_ts, metric_type, avg_value, sum_value, min_value, max_value, n, meta)
                     SELECT
                         :user_id AS user_id,
                         date_trunc('hour', timestamp) AS bucket_ts,
@@ -216,6 +278,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                         MIN(metric_value) AS min_value,
                         MAX(metric_value) AS max_value,
                         COUNT(*) AS n
+                        , (ARRAY_AGG(meta ORDER BY timestamp DESC) FILTER (WHERE meta IS NOT NULL))[1] AS meta
                     FROM health_metrics
                     WHERE user_id = :user_id
                       AND timestamp >= :t0 AND timestamp < :t1
@@ -225,7 +288,8 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                       sum_value = EXCLUDED.sum_value,
                       min_value = EXCLUDED.min_value,
                       max_value = EXCLUDED.max_value,
-                      n = EXCLUDED.n
+                      n = EXCLUDED.n,
+                      meta = COALESCE(EXCLUDED.meta, health_rollup_hourly.meta)
                     """,
                     {"user_id": user_id, "t0": t0, "t1": t1},
                     "upsert health_rollup_hourly",
