@@ -38,6 +38,8 @@ class AuthService {
 
         let token = try await Self.getValidToken()
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        // User timezone for backend date-boundary localization
+        request.setValue(TimeZone.current.identifier, forHTTPHeaderField: "X-User-TZ")
 
         if let body = body {
             if request.value(forHTTPHeaderField: "Content-Type") == nil {

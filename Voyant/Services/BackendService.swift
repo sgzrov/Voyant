@@ -69,6 +69,7 @@ extension BackendService {
     private func makeAuthenticatedRequest(url: URL, userToken: String) -> URLRequest {
         var request = URLRequest(url: url)
         request.setValue("Bearer \(userToken)", forHTTPHeaderField: "Authorization")
+        request.setValue(TimeZone.current.identifier, forHTTPHeaderField: "X-User-TZ")
         return request
     }
 

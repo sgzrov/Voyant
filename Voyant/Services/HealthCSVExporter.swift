@@ -3,13 +3,31 @@ import HealthKit
 
 struct HealthCSVExporter {
 
+    private static func csvField(_ s: String?) -> String {
+        // Keep it simple: we currently don't emit commas in tz identifiers; if we ever do, we'd need quoting.
+        return (s ?? "").replacingOccurrences(of: "\n", with: " ").replacingOccurrences(of: "\r", with: " ")
+    }
+
+    private static func bestTimezone(for date: Date, metadata: [String: Any]?) -> (tzName: String?, utcOffsetMin: Int?) {
+        // 1) Prefer HealthKit-provided timezone metadata if present (this is the most accurate for historical workouts).
+        if let md = metadata {
+            if let tz = md[HKMetadataKeyTimeZone] as? TimeZone {
+                return (tz.identifier, tz.secondsFromGMT(for: date) / 60)
+            }
+            if let tzId = md[HKMetadataKeyTimeZone] as? String, let tz = TimeZone(identifier: tzId) {
+                return (tz.identifier, tz.secondsFromGMT(for: date) / 60)
+            }
+        }
+        // Unknown: better to leave blank than to incorrectly stamp everything with the current timezone.
+        return (nil, nil)
+    }
+
     // MARK: - Public API
     // Generates CSV for a metrics-only backend:
     // - Last 60 days hourly: steps (SUM), active_energy_burned (SUM), heart_rate (AVG), oxygen_saturation (AVG optional), distances, active_time_minutes (SUM)
     // - Last 60 days daily: sleep_hours (SUM, attach to bucket start), resting_heart_rate (AVG), hr_variability_sdnn (AVG)
     static func generateCSV(for userId: String, metrics requestedMetrics: [String], completion: @escaping (Result<Data, Error>) -> Void) {
         let healthStore = HKHealthStore()
-        let tz = TimeZone.current.identifier
         let createdAt = ISO8601DateFormatter().string(from: Date())
         let iso = ISO8601DateFormatter()
         // Decide cadence per metric: minute for fast-changing, daily for daily metrics, hourly otherwise
@@ -37,7 +55,7 @@ struct HealthCSVExporter {
 
         // Rows are appended from many HealthKit callbacks concurrently; guard with a serial queue.
         let rowsQueue = DispatchQueue(label: "HealthCSVExporter.rows")
-        var rows: [String] = ["user_id,timestamp,metric_type,metric_value,unit,source,timezone,created_at"]
+        var rows: [String] = ["user_id,timestamp,metric_type,metric_value,unit,source,timezone,utc_offset_min,created_at"]
         func appendRow(_ line: String) {
             rowsQueue.sync { rows.append(line) }
         }
@@ -72,7 +90,11 @@ struct HealthCSVExporter {
                 switch result {
                 case .success(let points):
                     points.forEach { p in
-                        let line = "\(userId),\(iso.string(from: p.timestamp)),\(spec.name),\(formatValue(p.value)),\(spec.unitLabel),\(p.source),\(tz),\(createdAt)"
+                        // For metrics, use our on-device timezone history so timestamps are stamped in the tz
+                        // that was active when the sample occurred (travel-proof going forward).
+                        let tzName = csvField(TimezoneHistoryService.shared.tzName(for: p.timestamp))
+                        let offsetMin = String(TimezoneHistoryService.shared.utcOffsetMinutes(for: p.timestamp))
+                        let line = "\(userId),\(iso.string(from: p.timestamp)),\(spec.name),\(formatValue(p.value)),\(spec.unitLabel),\(p.source),\(tzName),\(offsetMin),\(createdAt)"
                         appendRow(line)
                     }
                 case .failure(let error):
@@ -105,16 +127,21 @@ struct HealthCSVExporter {
                     let distKm = (w.totalDistance?.doubleValue(for: HKUnit.meter()) ?? 0.0) / 1000.0
                     let durMin = w.duration / 60.0
 
-                    appendRow("\(userId),\(ts),workout_distance_km,\(formatValue(distKm)),km,\(typeLabel),\(tz),\(createdAt)")
-                    appendRow("\(userId),\(ts),workout_duration_min,\(formatValue(durMin)),min,\(typeLabel),\(tz),\(createdAt)")
-                    appendRow("\(userId),\(ts),workout_energy_kcal,\(formatValue(kcal)),kcal,\(typeLabel),\(tz),\(createdAt)")
+                    let workoutDate = w.startDate
+                    let tz = bestTimezone(for: workoutDate, metadata: w.metadata)
+                    let tzName = csvField(tz.tzName)
+                    let offsetMin = tz.utcOffsetMin.map(String.init) ?? ""
+
+                    appendRow("\(userId),\(ts),workout_distance_km,\(formatValue(distKm)),km,\(typeLabel),\(tzName),\(offsetMin),\(createdAt)")
+                    appendRow("\(userId),\(ts),workout_duration_min,\(formatValue(durMin)),min,\(typeLabel),\(tzName),\(offsetMin),\(createdAt)")
+                    appendRow("\(userId),\(ts),workout_energy_kcal,\(formatValue(kcal)),kcal,\(typeLabel),\(tzName),\(offsetMin),\(createdAt)")
 
                     // Simple events
                     if distKm >= 10.0 {
-                        appendRow("\(userId),\(ts),event_long_run_km,\(formatValue(distKm)),km,\(typeLabel),\(tz),\(createdAt)")
+                        appendRow("\(userId),\(ts),event_long_run_km,\(formatValue(distKm)),km,\(typeLabel),\(tzName),\(offsetMin),\(createdAt)")
                     }
                     if kcal >= 800.0 || durMin >= 60.0 {
-                        appendRow("\(userId),\(ts),event_hard_workout,1,count,\(typeLabel),\(tz),\(createdAt)")
+                        appendRow("\(userId),\(ts),event_hard_workout,1,count,\(typeLabel),\(tzName),\(offsetMin),\(createdAt)")
                     }
                     inner.leave()
                 }
@@ -143,7 +170,6 @@ struct HealthCSVExporter {
                                  minuteResolution: Bool = false,
                                  completion: @escaping (Result<Data, Error>) -> Void) {
         let healthStore = HKHealthStore()
-        let tz = TimeZone.current.identifier
         let createdAt = ISO8601DateFormatter().string(from: Date())
         let iso = ISO8601DateFormatter()
         // Same cadence sets as initial export
@@ -164,7 +190,7 @@ struct HealthCSVExporter {
         ]
 
         let rowsQueue = DispatchQueue(label: "HealthCSVExporter.delta.rows")
-        var rows: [String] = ["user_id,timestamp,metric_type,metric_value,unit,source,timezone,created_at"]
+        var rows: [String] = ["user_id,timestamp,metric_type,metric_value,unit,source,timezone,utc_offset_min,created_at"]
         func appendRow(_ line: String) {
             rowsQueue.sync { rows.append(line) }
         }
@@ -197,7 +223,9 @@ struct HealthCSVExporter {
                 switch result {
                 case .success(let points):
                     points.forEach { p in
-                        let line = "\(userId),\(iso.string(from: p.timestamp)),\(spec.name),\(formatValue(p.value)),\(spec.unitLabel),\(p.source),\(tz),\(createdAt)"
+                        let tzName = csvField(TimezoneHistoryService.shared.tzName(for: p.timestamp))
+                        let offsetMin = String(TimezoneHistoryService.shared.utcOffsetMinutes(for: p.timestamp))
+                        let line = "\(userId),\(iso.string(from: p.timestamp)),\(spec.name),\(formatValue(p.value)),\(spec.unitLabel),\(p.source),\(tzName),\(offsetMin),\(createdAt)"
                         appendRow(line)
                     }
                 case .failure(let error):
@@ -228,14 +256,19 @@ struct HealthCSVExporter {
                     let typeLabel = Self.workoutActivityName(w.workoutActivityType)
                     let distKm = (w.totalDistance?.doubleValue(for: HKUnit.meter()) ?? 0.0) / 1000.0
                     let durMin = w.duration / 60.0
-                    appendRow("\(userId),\(ts),workout_distance_km,\(formatValue(distKm)),km,\(typeLabel),\(tz),\(createdAt)")
-                    appendRow("\(userId),\(ts),workout_duration_min,\(formatValue(durMin)),min,\(typeLabel),\(tz),\(createdAt)")
-                    appendRow("\(userId),\(ts),workout_energy_kcal,\(formatValue(kcal)),kcal,\(typeLabel),\(tz),\(createdAt)")
+                    let workoutDate = w.startDate
+                    let tz = bestTimezone(for: workoutDate, metadata: w.metadata)
+                    let tzName = csvField(tz.tzName)
+                    let offsetMin = tz.utcOffsetMin.map(String.init) ?? ""
+
+                    appendRow("\(userId),\(ts),workout_distance_km,\(formatValue(distKm)),km,\(typeLabel),\(tzName),\(offsetMin),\(createdAt)")
+                    appendRow("\(userId),\(ts),workout_duration_min,\(formatValue(durMin)),min,\(typeLabel),\(tzName),\(offsetMin),\(createdAt)")
+                    appendRow("\(userId),\(ts),workout_energy_kcal,\(formatValue(kcal)),kcal,\(typeLabel),\(tzName),\(offsetMin),\(createdAt)")
                     if distKm >= 10.0 {
-                        appendRow("\(userId),\(ts),event_long_run_km,\(formatValue(distKm)),km,\(typeLabel),\(tz),\(createdAt)")
+                        appendRow("\(userId),\(ts),event_long_run_km,\(formatValue(distKm)),km,\(typeLabel),\(tzName),\(offsetMin),\(createdAt)")
                     }
                     if kcal >= 800.0 || durMin >= 60.0 {
-                        appendRow("\(userId),\(ts),event_hard_workout,1,count,\(typeLabel),\(tz),\(createdAt)")
+                        appendRow("\(userId),\(ts),event_hard_workout,1,count,\(typeLabel),\(tzName),\(offsetMin),\(createdAt)")
                     }
                     inner.leave()
                 }
