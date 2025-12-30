@@ -301,7 +301,7 @@ def _validate_sql_sources(sql: str, allowed_sources: set[str], health_sources: s
     used_health = seen & {s.lower() for s in health_sources}
     # Require that the query references at least one health data source
     if not used_health:
-        raise ValueError("Query must reference a health table (health_metrics, health_rollup_hourly, or health_events)")
+        raise ValueError("Query must reference a health table (health_rollup_hourly and/or health_events)")
     return used_health
 
 
@@ -361,6 +361,54 @@ def _rewrite_rollup_hourly_to_tz_derived(sql: str) -> str:
         return sql
 
 
+# Replace references to health_events table with a user-scoped derived table (alias-preserving).
+# This avoids requiring the LLM to remember a user_id predicate in multi-table queries.
+def _rewrite_health_events_to_user_scoped(sql: str) -> str:
+    try:
+        stripped = _strip_sql_strings_and_comments(sql)
+        if not re.search(r"(?is)\b(from|join)\s+health_events\b", stripped):
+            return sql
+
+        events_subquery = (
+            "(SELECT\n"
+            "   *\n"
+            " FROM health_events\n"
+            " WHERE user_id = :user_id)"
+        )
+
+        def _rewrite_from(m: re.Match) -> str:
+            alias = m.group("alias")
+            alias_out = alias if alias else "health_events"
+            return f"FROM {events_subquery} AS {alias_out}"
+
+        def _rewrite_join(m: re.Match) -> str:
+            alias = m.group("alias")
+            alias_out = alias if alias else "health_events"
+            return f"JOIN {events_subquery} AS {alias_out}"
+
+        _no_alias_keywords = (
+            r"where|group|order|limit|join|on|inner|left|right|full|cross|union|having|"
+            r"window|offset|fetch|for|into|values|select|from"
+        )
+
+        out = re.sub(
+            rf"(?is)\bfrom\s+health_events(?:\s+(?:as\s+)?(?P<alias>(?!({_no_alias_keywords})\b)[a-zA-Z_]\w*))?\b",
+            _rewrite_from,
+            sql,
+        )
+        out = re.sub(
+            rf"(?is)\bjoin\s+health_events(?:\s+(?:as\s+)?(?P<alias>(?!({_no_alias_keywords})\b)[a-zA-Z_]\w*))?\b",
+            _rewrite_join,
+            out,
+        )
+        if out != sql:
+            logger.info("sql.rewrite.events: rewrote health_events to user-scoped derived table (alias-preserving)")
+        return out
+    except Exception:
+        logger.exception("sql.rewrite.events.failed")
+        return sql
+
+
 # Extract a bare SQL statement from LLM output
 def _extract_sql_from_text(text: object) -> str:
     if not isinstance(text, str):
@@ -405,20 +453,32 @@ def _sanitize_sql(sql: str) -> str:
     used_health_sources = _validate_sql_sources(
         s,
         allowed_sources={
-            "health_metrics",
             "health_rollup_hourly",
             "health_events",
             "generate_series",
             "unnest",
         },
-        health_sources={"health_metrics", "health_rollup_hourly", "health_events"},
+        health_sources={"health_rollup_hourly", "health_events"},
     )
 
+    # Allow multi-table ONLY for the specific combo:
+    # - health_events (workouts/events)
+    # - health_rollup_hourly (recovery metrics)
     if len(used_health_sources) > 1:
-        raise ValueError("Query must use exactly one health table (health_metrics OR health_rollup_hourly OR health_events)")
+        if used_health_sources != {"health_events", "health_rollup_hourly"}:
+            raise ValueError(
+                "Query must use exactly one health table (health_rollup_hourly OR health_events), "
+                "or the specific combo (health_events + health_rollup_hourly)"
+            )
 
+    # Always rewrite to safe derived tables BEFORE further validation/rewrites:
+    # - hourly rollups get tz-normalized and scoped to user_id
+    # - events get scoped to user_id
     if "health_rollup_hourly" in used_health_sources:
         s = _rewrite_rollup_hourly_to_tz_derived(s)
+        stripped = _strip_sql_strings_and_comments(s)
+    if "health_events" in used_health_sources:
+        s = _rewrite_health_events_to_user_scoped(s)
         stripped = _strip_sql_strings_and_comments(s)
 
     scan = _scan_top_level_sql(stripped)
@@ -453,6 +513,8 @@ def _sanitize_sql(sql: str) -> str:
     ))
 
     # Ensure queries are scoped to the authenticated user (unless already scoped elsewhere).
+    # For health_events and health_rollup_hourly we rewrite to user-scoped derived tables above,
+    # which prevents ambiguous `user_id` injection in multi-table queries.
     if not has_user_predicate_anywhere:
         if where_idx >= 0:
             where_body = s[where_idx:next_clause_start]
@@ -595,17 +657,11 @@ def _sanitize_sql(sql: str) -> str:
     except Exception:
         pass
 
-    if re.search(r"\bfrom\s+health_metrics\b", s, flags=re.IGNORECASE):
-        def _rewrite_json_extract(match: re.Match) -> str:
-            metric = match.group(1)
-            return f"(CASE WHEN metric_type = '{metric}' THEN metric_value END)"
-
-        s_new = re.sub(r"metrics\s*->>\s*'([a-zA-Z0-9_]+)'", _rewrite_json_extract, s, flags=re.IGNORECASE)
-        if s_new != s:
-            s = s_new
-            logger.info("sql.rewrite.metrics: applied CASE WHEN metric_type rewrite")
-
+    # Block direct queries to the raw metrics table (keep the tool limited to events + rollups).
     stripped_final = _strip_sql_strings_and_comments(s)
+    if re.search(r"\b(from|join)\s+health_metrics\b", stripped_final, flags=re.IGNORECASE):
+        raise ValueError("Raw metrics table is not available; use health_rollup_hourly and/or health_events")
+
     if re.search(r"(?is)\b(insert|update|delete|drop|alter|create|truncate|grant|revoke)\b", stripped_final):
         raise ValueError("Forbidden tokens in SQL")
 

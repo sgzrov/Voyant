@@ -58,9 +58,15 @@ async def execute_sql_gen_tool(*, user_id: str, question: str, tz_name: str) -> 
 
     try:
         extracted = _extract_sql_from_text(sql_text)
+        logger.info("sql.gen.sql.extracted:\n%s", extracted)
         safe_sql = _sanitize_sql(extracted)
+        logger.info("sql.gen.sql.sanitized:\n%s", safe_sql)
     except Exception as e:
-        logger.error("sql.gen.error: question='%s' error=%s", question, str(e))
+        logger.exception("sql.gen.error: question='%s' error=%s", question, str(e))
+        try:
+            logger.info("sql.gen.sql.raw:\n%s", sql_text)
+        except Exception:
+            pass
         return {"sql": {"sql": sql_text, "rows": [], "error": f"invalid-sql: {e}"}}
 
     loop = asyncio.get_running_loop()
@@ -71,10 +77,10 @@ async def execute_sql_gen_tool(*, user_id: str, question: str, tz_name: str) -> 
                 result = session.execute(text(safe_sql), {"user_id": user_id, "tz_name": tz_name}).mappings().all()
                 rows = [dict(r) for r in result]
                 if not rows:
-                    logger.warning("sql.exec.empty: question='%s'", question)
+                    logger.warning("sql.exec.empty: question='%s'\nsql:\n%s", question, safe_sql)
                 return {"sql": safe_sql, "rows": rows}
             except Exception as e:
-                logger.error("sql.exec.error: question='%s' error=%s", question, str(e))
+                logger.exception("sql.exec.error: question='%s' error=%s\nsql:\n%s", question, str(e), safe_sql)
                 return {"sql": safe_sql, "rows": [], "error": str(e)}
 
     sql_out = await loop.run_in_executor(None, execute_sql)

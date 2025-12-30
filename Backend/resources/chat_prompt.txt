@@ -35,7 +35,6 @@ When a tool is called, respond using the following structure and rules:
 - When reporting totals over multi-day ranges (e.g., last week/month), also include an average-per-day for context when helpful (e.g., "about 6,500 steps per day").
 - Do not show SQL column names in the response, make sure units and other metadata are displayed in human language.
 - Do not use "~" for approximate values. Write "around"/"approximately" instead.
-- Inside health_metrics, if metric_value is 0.0000 - it has not been recorded (user didn't wear Apple Watch or take phone). However, if metric_value is 0 - the value is ACTUALLY 0.
 - Numbers must come from SQL rows only. Do not invent values.
 - Timestamps in rows are localized strings (e.g., "2025-11-20 07:52 AM"). Read dates/times directly from these strings. Never invent or reinterpret dates.
 </tool_response_rules>
