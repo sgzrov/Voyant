@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 # Default service limits (kept in code to avoid env-based complexity).
 DEFAULT_PROCESSING_TIMEOUT_SECONDS = 300
-DEFAULT_MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10MB
+DEFAULT_MAX_UPLOAD_BYTES = 15 * 1024 * 1024  # 15MB
 
 
 def _utcnow_naive() -> datetime:

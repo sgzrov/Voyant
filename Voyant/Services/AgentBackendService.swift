@@ -53,8 +53,13 @@ class AgentBackendService {
         request.httpBody = body
 
         let (respData, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            throw NSError(domain: "upload", code: -1, userInfo: [NSLocalizedDescriptionKey: "Upload failed"])
+         guard let http = response as? HTTPURLResponse else {
+            throw NSError(domain: "upload", code: -1, userInfo: [NSLocalizedDescriptionKey: "Upload failed (no HTTP response)"])
+        }
+        guard http.statusCode == 200 else {
+            let body = String(data: respData, encoding: .utf8) ?? ""
+            let msg = "Upload failed (HTTP \(http.statusCode))\(body.isEmpty ? "" : ": \(body)")"
+            throw NSError(domain: "upload", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: msg])
         }
         struct UploadResponse: Decodable {
             let task_id: String?
@@ -89,7 +94,7 @@ class AgentBackendService {
         let start = Date()
         while Date().timeIntervalSince(start) < timeout {
             let st = try await getHealthTaskStatus(taskId)
-            if st.state == "SUCCESS" || st.state == "FAILURE" || st.state == "REVOKED" {
+            if st.state == "SUCCESS" || st.state == "FAILURE" || st.state == "REVOKED" || st.state == "TIMEOUT" {
                 return st
             }
             try await Task.sleep(nanoseconds: UInt64(pollInterval * 1_000_000_000))

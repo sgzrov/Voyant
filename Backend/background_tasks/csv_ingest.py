@@ -30,7 +30,28 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc = True, errors = "coerce")
     if "created_at" in df.columns:
         df["created_at"] = pd.to_datetime(df["created_at"], utc = True, errors = "coerce")
-    df = df[df["user_id"] == user_id]
+
+    # Security + robustness:
+    # - The authenticated user_id passed to this task is authoritative.
+    # - CSVs may contain a different/old/malformed user_id (e.g., client-side bugs, casing issues).
+    # To prevent cross-user writes AND avoid dropping all rows on mismatch, always stamp rows with the
+    # authenticated user_id.
+    if "user_id" not in df.columns:
+        df["user_id"] = user_id
+    else:
+        try:
+            # Log distinct CSV user_ids for debugging, but do not trust them.
+            uniq = df["user_id"].dropna().astype(str).str.strip().unique().tolist()
+            if uniq and (len(uniq) > 1 or (len(uniq) == 1 and uniq[0] != user_id)):
+                logger.warning(
+                    "process_csv_upload: overriding mismatched csv user_id(s)=%s with task user_id=%s",
+                    uniq,
+                    user_id,
+                )
+        except Exception:
+            pass
+        df["user_id"] = user_id
+
     if df.empty:
         logger.info("process_csv_upload: no rows for user_id=%s after filter; nothing to insert", user_id)
         return {"inserted": 0}

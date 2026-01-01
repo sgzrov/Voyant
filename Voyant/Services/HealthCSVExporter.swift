@@ -1,5 +1,9 @@
 import Foundation
 import HealthKit
+import CoreLocation
+#if canImport(UIKit)
+import UIKit
+#endif
 
 struct HealthCSVExporter {
 
@@ -8,18 +12,101 @@ struct HealthCSVExporter {
         return (s ?? "").replacingOccurrences(of: "\n", with: " ").replacingOccurrences(of: "\r", with: " ")
     }
 
-    private static func bestTimezone(for date: Date, metadata: [String: Any]?) -> (tzName: String?, utcOffsetMin: Int?) {
-        // 1) Prefer HealthKit-provided timezone metadata if present (this is the most accurate for historical workouts).
-        if let md = metadata {
-            if let tz = md[HKMetadataKeyTimeZone] as? TimeZone {
-                return (tz.identifier, tz.secondsFromGMT(for: date) / 60)
+    /// HealthKit unit debug strings can contain conversion metadata like `mmol<180.15588>/L`.
+    /// For storage/display we want a clean, stable label like `mmol/L`.
+    private static func cleanedHKUnitLabel(_ unit: HKUnit) -> String {
+        var s = String(describing: unit)
+
+        // Strip any `<...>` segments (may include molar mass etc.)
+        while let lt = s.firstIndex(of: "<"), let gt = s[lt...].firstIndex(of: ">") {
+            s.removeSubrange(lt...gt)
+        }
+
+        // Common cosmetic normalizations
+        if s == "count/min" { return "bpm" }
+        return s
+    }
+
+    private static func workoutTimezoneFromGeoHistory(for date: Date) -> (tzName: String?, utcOffsetMin: Int?) {
+        // Prefer geo-derived timezone history (most accurate). If unavailable/denied, fall back to device tz history,
+        // but ONLY when it is actually known for that timestamp (never guess for older history).
+        if let name = GeoTimezoneHistoryService.shared.tzNameIfKnown(for: date),
+           let tz = TimeZone(identifier: name) {
+            return (tz.identifier, tz.secondsFromGMT(for: date) / 60)
+        }
+        if let name = TimezoneHistoryService.shared.tzNameIfKnown(for: date),
+           let tz = TimeZone(identifier: name) {
+            return (tz.identifier, tz.secondsFromGMT(for: date) / 60)
+        }
+        return (nil, nil)
+    }
+
+    private static func workoutTimezoneFromRoute(healthStore: HKHealthStore, workout: HKWorkout, completion: @escaping (String?, Int?) -> Void) {
+        // Defensive: never hang exporter if HealthKit route/geocoding never calls back.
+        let lock = NSLock()
+        var finished = false
+        let timeout = DispatchWorkItem {
+            var shouldCall = false
+            lock.lock()
+            if !finished {
+                finished = true
+                shouldCall = true
             }
-            if let tzId = md[HKMetadataKeyTimeZone] as? String, let tz = TimeZone(identifier: tzId) {
-                return (tz.identifier, tz.secondsFromGMT(for: date) / 60)
+            lock.unlock()
+            if shouldCall { completion(nil, nil) }
+        }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 3.0, execute: timeout)
+
+        func finish(_ tzName: String?, _ utcOffsetMin: Int?) {
+            var shouldCall = false
+            lock.lock()
+            if !finished {
+                finished = true
+                shouldCall = true
+            }
+            lock.unlock()
+            if shouldCall {
+                timeout.cancel()
+                completion(tzName, utcOffsetMin)
             }
         }
-        // Unknown: better to leave blank than to incorrectly stamp everything with the current timezone.
-        return (nil, nil)
+
+        let routeType = HKSeriesType.workoutRoute()
+        let predicate = HKQuery.predicateForObjects(from: workout)
+        let routeQuery = HKSampleQuery(sampleType: routeType, predicate: predicate, limit: 1, sortDescriptors: nil) { _, samples, _ in
+            guard let route = (samples as? [HKWorkoutRoute])?.first else {
+                finish(nil, nil)
+                return
+            }
+
+            var firstLocation: CLLocation?
+            let locQuery = HKWorkoutRouteQuery(route: route) { _, locationsOrNil, done, _ in
+                if firstLocation == nil, let loc = locationsOrNil?.first {
+                    firstLocation = loc
+                }
+                if done {
+                    guard let loc = firstLocation else {
+                        finish(nil, nil)
+                        return
+                    }
+                    #if canImport(UIKit)
+                    CLGeocoder().reverseGeocodeLocation(loc) { placemarks, _ in
+                        let tz = placemarks?.first?.timeZone
+                        if let tz = tz {
+                            finish(tz.identifier, tz.secondsFromGMT(for: workout.startDate) / 60)
+                        } else {
+                            finish(nil, nil)
+                        }
+                    }
+                    #else
+                    _ = loc
+                    finish(nil, nil)
+                    #endif
+                }
+            }
+            healthStore.execute(locQuery)
+        }
+        healthStore.execute(routeQuery)
     }
 
     // MARK: - Public API
@@ -30,6 +117,7 @@ struct HealthCSVExporter {
         let healthStore = HKHealthStore()
         let createdAt = ISO8601DateFormatter().string(from: Date())
         let iso = ISO8601DateFormatter()
+        print("[HealthCSVExporter] generateCSV start user=\(userId) requestedMetrics=\(requestedMetrics.count)")
         // Decide cadence per metric: minute for fast-changing, daily for daily metrics, hourly otherwise
         let minutelyNames: Set<String> = [
             "heart_rate",
@@ -60,12 +148,41 @@ struct HealthCSVExporter {
             rowsQueue.sync { rows.append(line) }
         }
 
-        let specs = MetricSpec.defaultSpecs().filter { requestedMetrics.isEmpty ? true : requestedMetrics.contains($0.name) }
+        let baseSpecs = MetricSpec.defaultSpecs().filter { requestedMetrics.isEmpty ? true : requestedMetrics.contains($0.name) }
+        let qtyTypes: Set<HKQuantityType> = Set(baseSpecs.compactMap { $0.quantityType })
 
-        let group = DispatchGroup()
-        let encounteredError: Error? = nil
+        // Export quantity values in the user's preferred units (matches Apple Health display settings).
+        healthStore.preferredUnits(for: qtyTypes) { preferredUnits, _ in
+            let specs = baseSpecs.map { spec in
+                if let qt = spec.quantityType, let u = preferredUnits[qt] {
+                    return spec.withUnit(u)
+                }
+                return spec
+            }
 
-        for spec in specs {
+            // Also apply preferred units to derived workout values (distance/energy).
+            let distanceUnit: HKUnit = {
+                if let qt = HKQuantityType.quantityType(forIdentifier: .distanceWalkingRunning),
+                   let u = preferredUnits[qt] {
+                    return u
+                }
+                return HKUnit.meterUnit(with: .kilo) // km fallback
+            }()
+            let distanceUnitLabel = cleanedHKUnitLabel(distanceUnit)
+
+            let energyUnit: HKUnit = {
+                if let qt = HKQuantityType.quantityType(forIdentifier: .activeEnergyBurned),
+                   let u = preferredUnits[qt] {
+                    return u
+                }
+                return HKUnit.kilocalorie() // kcal fallback
+            }()
+            let energyUnitLabel = cleanedHKUnitLabel(energyUnit)
+
+            let group = DispatchGroup()
+            let encounteredError: Error? = nil
+
+            for spec in specs {
             // Decide bucket size per metric
             let interval: DateComponents = {
                 if dailyNames.contains(spec.name) {
@@ -90,10 +207,13 @@ struct HealthCSVExporter {
                 switch result {
                 case .success(let points):
                     points.forEach { p in
-                        // For metrics, use our on-device timezone history so timestamps are stamped in the tz
-                        // that was active when the sample occurred (travel-proof going forward).
-                        let tzName = csvField(TimezoneHistoryService.shared.tzName(for: p.timestamp))
-                        let offsetMin = String(TimezoneHistoryService.shared.utcOffsetMinutes(for: p.timestamp))
+                        // For metrics, prefer on-device timezone history only when it is actually known
+                        // for that historical timestamp. If we don't know (e.g. first run after traveling
+                        // or after reinstall), leave blank rather than incorrectly stamping everything
+                        // with the current timezone.
+                        let tz = workoutTimezoneFromGeoHistory(for: p.timestamp)
+                        let tzName = csvField(tz.tzName)
+                        let offsetMin = tz.utcOffsetMin.map(String.init) ?? ""
                         let line = "\(userId),\(iso.string(from: p.timestamp)),\(spec.name),\(formatValue(p.value)),\(spec.unitLabel),\(p.source),\(tzName),\(offsetMin),\(createdAt)"
                         appendRow(line)
                     }
@@ -103,63 +223,76 @@ struct HealthCSVExporter {
                 }
                 group.leave()
             }
-        }
+            }
 
         // MARK: - Workouts + simple events
-        group.enter()
-        let workoutType = HKObjectType.workoutType()
-        let workoutPredicate = HKQuery.predicateForSamples(withStart: start60, end: now, options: .strictStartDate)
-        let sort = NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)
-        let workoutQuery = HKSampleQuery(sampleType: workoutType, predicate: workoutPredicate, limit: HKObjectQueryNoLimit, sortDescriptors: [sort]) { _, samples, error in
-            if let error = error {
-                // Non-fatal: skip workouts if unauthorized
-                print("[HealthCSVExporter] workouts query error: \(error.localizedDescription)")
-                group.leave()
-                return
-            }
-            guard let workouts = samples as? [HKWorkout] else { return }
-            let inner = DispatchGroup()
-            for w in workouts {
-                inner.enter()
-                Self.workoutKilocalories(healthStore: healthStore, workout: w) { kcal in
-                    let ts = iso.string(from: w.startDate)
-                    let typeLabel = Self.workoutActivityName(w.workoutActivityType)
-                    let distKm = (w.totalDistance?.doubleValue(for: HKUnit.meter()) ?? 0.0) / 1000.0
-                    let durMin = w.duration / 60.0
+            group.enter()
+            let workoutType = HKObjectType.workoutType()
+            let workoutPredicate = HKQuery.predicateForSamples(withStart: start60, end: now, options: .strictStartDate)
+            let sort = NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)
+            let workoutQuery = HKSampleQuery(sampleType: workoutType, predicate: workoutPredicate, limit: HKObjectQueryNoLimit, sortDescriptors: [sort]) { _, samples, error in
+                if let error = error {
+                    // Non-fatal: skip workouts if unauthorized
+                    print("[HealthCSVExporter] workouts query error: \(error.localizedDescription)")
+                    group.leave()
+                    return
+                }
+                let workouts = (samples as? [HKWorkout]) ?? []
+                if samples == nil {
+                    print("[HealthCSVExporter] workouts query returned nil samples (treating as 0 workouts)")
+                }
+                let inner = DispatchGroup()
+                for w in workouts {
+                    inner.enter()
+                    Self.workoutKilocalories(healthStore: healthStore, workout: w) { kcal in
+                        let ts = iso.string(from: w.startDate)
+                        let typeLabel = Self.workoutActivityName(w.workoutActivityType)
+                        let distOut = w.totalDistance?.doubleValue(for: distanceUnit) ?? 0.0
+                        // Keep km for heuristic thresholds regardless of output unit
+                        let distKmForHeuristics = (w.totalDistance?.doubleValue(for: HKUnit.meter()) ?? 0.0) / 1000.0
+                        let durMin = w.duration / 60.0
 
-                    let workoutDate = w.startDate
-                    let tz = bestTimezone(for: workoutDate, metadata: w.metadata)
-                    let tzName = csvField(tz.tzName)
-                    let offsetMin = tz.utcOffsetMin.map(String.init) ?? ""
+                        let energyOut = HKQuantity(unit: HKUnit.kilocalorie(), doubleValue: kcal).doubleValue(for: energyUnit)
 
-                    appendRow("\(userId),\(ts),workout_distance_km,\(formatValue(distKm)),km,\(typeLabel),\(tzName),\(offsetMin),\(createdAt)")
-                    appendRow("\(userId),\(ts),workout_duration_min,\(formatValue(durMin)),min,\(typeLabel),\(tzName),\(offsetMin),\(createdAt)")
-                    appendRow("\(userId),\(ts),workout_energy_kcal,\(formatValue(kcal)),kcal,\(typeLabel),\(tzName),\(offsetMin),\(createdAt)")
+                        // Infer timezone from workout route coordinates when available; otherwise fall back to our geo tz history.
+                        Self.workoutTimezoneFromRoute(healthStore: healthStore, workout: w) { routeTzName, routeOff in
+                            let workoutDate = w.startDate
+                            let tz = routeTzName != nil
+                                ? (tzName: routeTzName, utcOffsetMin: routeOff)
+                                : workoutTimezoneFromGeoHistory(for: workoutDate)
+                            let tzName = csvField(tz.tzName)
+                            let offsetMin = tz.utcOffsetMin.map(String.init) ?? ""
 
-                    // Simple events
-                    if distKm >= 10.0 {
-                        appendRow("\(userId),\(ts),event_long_run_km,\(formatValue(distKm)),km,\(typeLabel),\(tzName),\(offsetMin),\(createdAt)")
+                            appendRow("\(userId),\(ts),workout_distance_km,\(formatValue(distOut)),\(distanceUnitLabel),\(typeLabel),\(tzName),\(offsetMin),\(createdAt)")
+                            appendRow("\(userId),\(ts),workout_duration_min,\(formatValue(durMin)),min,\(typeLabel),\(tzName),\(offsetMin),\(createdAt)")
+                            appendRow("\(userId),\(ts),workout_energy_kcal,\(formatValue(energyOut)),\(energyUnitLabel),\(typeLabel),\(tzName),\(offsetMin),\(createdAt)")
+
+                            // Simple events
+                            if distKmForHeuristics >= 10.0 {
+                                appendRow("\(userId),\(ts),event_long_run_km,\(formatValue(distOut)),\(distanceUnitLabel),\(typeLabel),\(tzName),\(offsetMin),\(createdAt)")
+                            }
+                            if kcal >= 800.0 || durMin >= 60.0 {
+                                appendRow("\(userId),\(ts),event_hard_workout,1,count,\(typeLabel),\(tzName),\(offsetMin),\(createdAt)")
+                            }
+                            inner.leave()
+                        }
                     }
-                    if kcal >= 800.0 || durMin >= 60.0 {
-                        appendRow("\(userId),\(ts),event_hard_workout,1,count,\(typeLabel),\(tzName),\(offsetMin),\(createdAt)")
-                    }
-                    inner.leave()
+                }
+                inner.notify(queue: .global(qos: .utility)) {
+                    group.leave()
                 }
             }
-            inner.notify(queue: .global(qos: .utility)) {
-                group.leave()
-            }
-        }
-        healthStore.execute(workoutQuery)
+            healthStore.execute(workoutQuery)
 
-        group.notify(queue: .main) {
-            if let error = encounteredError {
-                completion(.failure(error))
-                return
+            group.notify(queue: .main) {
+                if let error = encounteredError {
+                    completion(.failure(error))
+                    return
+                }
+                let data = rowsQueue.sync { rows.joined(separator: "\n").data(using: .utf8) ?? Data() }
+                completion(.success(data))
             }
-            let data = rowsQueue.sync { rows.joined(separator: "\n").data(using: .utf8) ?? Data() }
-            completion(.success(data))
-        }
+        } // preferredUnits callback
     }
 
     // MARK: - Delta Exporter (hourly only within [start, end])
@@ -195,98 +328,132 @@ struct HealthCSVExporter {
             rowsQueue.sync { rows.append(line) }
         }
 
-        let specs = MetricSpec.defaultSpecs().filter { requestedMetrics.isEmpty ? true : requestedMetrics.contains($0.name) }
+        let baseSpecs = MetricSpec.defaultSpecs().filter { requestedMetrics.isEmpty ? true : requestedMetrics.contains($0.name) }
+        let qtyTypes: Set<HKQuantityType> = Set(baseSpecs.compactMap { $0.quantityType })
 
-        let group = DispatchGroup()
-        let encounteredError: Error? = nil
+        healthStore.preferredUnits(for: qtyTypes) { preferredUnits, _ in
+            let specs = baseSpecs.map { spec in
+                if let qt = spec.quantityType, let u = preferredUnits[qt] {
+                    return spec.withUnit(u)
+                }
+                return spec
+            }
 
-        for spec in specs {
-            group.enter()
-            // Choose interval per metric; allow minuteResolution to force minute for short windows
-            let interval: DateComponents = {
-                if dailyNames.contains(spec.name) {
-                    return DateComponents(day: 1)
+            let distanceUnit: HKUnit = {
+                if let qt = HKQuantityType.quantityType(forIdentifier: .distanceWalkingRunning),
+                   let u = preferredUnits[qt] {
+                    return u
                 }
-                if minuteResolution || minutelyNames.contains(spec.name) {
-                    return DateComponents(minute: 1)
-                }
-                return DateComponents(hour: 1)
+                return HKUnit.meterUnit(with: .kilo)
             }()
-            queryQuantityOrCategory(
-                healthStore: healthStore,
-                spec: spec,
-                start: start,
-                end: end,
-                interval: interval,
-                aggregation: spec.aggregation
-            ) { result in
-                switch result {
-                case .success(let points):
-                    points.forEach { p in
-                        let tzName = csvField(TimezoneHistoryService.shared.tzName(for: p.timestamp))
-                        let offsetMin = String(TimezoneHistoryService.shared.utcOffsetMinutes(for: p.timestamp))
-                        let line = "\(userId),\(iso.string(from: p.timestamp)),\(spec.name),\(formatValue(p.value)),\(spec.unitLabel),\(p.source),\(tzName),\(offsetMin),\(createdAt)"
-                        appendRow(line)
-                    }
-                case .failure(let error):
-                    // Non-fatal: ignore per-metric authorization or data errors
-                    print("[HealthCSVExporter] delta hourly '\(spec.name)' error: \(error.localizedDescription)")
+            let distanceUnitLabel = cleanedHKUnitLabel(distanceUnit)
+
+            let energyUnit: HKUnit = {
+                if let qt = HKQuantityType.quantityType(forIdentifier: .activeEnergyBurned),
+                   let u = preferredUnits[qt] {
+                    return u
                 }
-                group.leave()
-            }
-        }
+                return HKUnit.kilocalorie()
+            }()
+            let energyUnitLabel = cleanedHKUnitLabel(energyUnit)
 
-        // Workouts within window
-        group.enter()
-        let workoutType = HKObjectType.workoutType()
-        let workoutPredicate = HKQuery.predicateForSamples(withStart: start, end: end, options: .strictStartDate)
-        let sort = NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)
-        let workoutQuery = HKSampleQuery(sampleType: workoutType, predicate: workoutPredicate, limit: HKObjectQueryNoLimit, sortDescriptors: [sort]) { _, samples, error in
-            if let error = error {
-                print("[HealthCSVExporter] delta workouts query error: \(error.localizedDescription)")
-                group.leave()
-                return
-            }
-            guard let workouts = samples as? [HKWorkout] else { return }
-            let inner = DispatchGroup()
-            for w in workouts {
-                inner.enter()
-                Self.workoutKilocalories(healthStore: healthStore, workout: w) { kcal in
-                    let ts = iso.string(from: w.startDate)
-                    let typeLabel = Self.workoutActivityName(w.workoutActivityType)
-                    let distKm = (w.totalDistance?.doubleValue(for: HKUnit.meter()) ?? 0.0) / 1000.0
-                    let durMin = w.duration / 60.0
-                    let workoutDate = w.startDate
-                    let tz = bestTimezone(for: workoutDate, metadata: w.metadata)
-                    let tzName = csvField(tz.tzName)
-                    let offsetMin = tz.utcOffsetMin.map(String.init) ?? ""
+            let group = DispatchGroup()
+            let encounteredError: Error? = nil
 
-                    appendRow("\(userId),\(ts),workout_distance_km,\(formatValue(distKm)),km,\(typeLabel),\(tzName),\(offsetMin),\(createdAt)")
-                    appendRow("\(userId),\(ts),workout_duration_min,\(formatValue(durMin)),min,\(typeLabel),\(tzName),\(offsetMin),\(createdAt)")
-                    appendRow("\(userId),\(ts),workout_energy_kcal,\(formatValue(kcal)),kcal,\(typeLabel),\(tzName),\(offsetMin),\(createdAt)")
-                    if distKm >= 10.0 {
-                        appendRow("\(userId),\(ts),event_long_run_km,\(formatValue(distKm)),km,\(typeLabel),\(tzName),\(offsetMin),\(createdAt)")
+            for spec in specs {
+                group.enter()
+                // Choose interval per metric; allow minuteResolution to force minute for short windows
+                let interval: DateComponents = {
+                    if dailyNames.contains(spec.name) {
+                        return DateComponents(day: 1)
                     }
-                    if kcal >= 800.0 || durMin >= 60.0 {
-                        appendRow("\(userId),\(ts),event_hard_workout,1,count,\(typeLabel),\(tzName),\(offsetMin),\(createdAt)")
+                    if minuteResolution || minutelyNames.contains(spec.name) {
+                        return DateComponents(minute: 1)
                     }
-                    inner.leave()
+                    return DateComponents(hour: 1)
+                }()
+                queryQuantityOrCategory(
+                    healthStore: healthStore,
+                    spec: spec,
+                    start: start,
+                    end: end,
+                    interval: interval,
+                    aggregation: spec.aggregation
+                ) { result in
+                    switch result {
+                    case .success(let points):
+                        points.forEach { p in
+                            let tz = workoutTimezoneFromGeoHistory(for: p.timestamp)
+                            let tzName = csvField(tz.tzName)
+                            let offsetMin = tz.utcOffsetMin.map(String.init) ?? ""
+                            let line = "\(userId),\(iso.string(from: p.timestamp)),\(spec.name),\(formatValue(p.value)),\(spec.unitLabel),\(p.source),\(tzName),\(offsetMin),\(createdAt)"
+                            appendRow(line)
+                        }
+                    case .failure(let error):
+                        // Non-fatal: ignore per-metric authorization or data errors
+                        print("[HealthCSVExporter] delta hourly '\(spec.name)' error: \(error.localizedDescription)")
+                    }
+                    group.leave()
                 }
             }
-            inner.notify(queue: .global(qos: .utility)) {
-                group.leave()
-            }
-        }
-        healthStore.execute(workoutQuery)
 
-        group.notify(queue: .main) {
-            if let error = encounteredError {
-                completion(.failure(error))
-                return
+            // Workouts within window
+            group.enter()
+            let workoutType = HKObjectType.workoutType()
+            let workoutPredicate = HKQuery.predicateForSamples(withStart: start, end: end, options: .strictStartDate)
+            let sort = NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)
+            let workoutQuery = HKSampleQuery(sampleType: workoutType, predicate: workoutPredicate, limit: HKObjectQueryNoLimit, sortDescriptors: [sort]) { _, samples, error in
+                if let error = error {
+                    print("[HealthCSVExporter] delta workouts query error: \(error.localizedDescription)")
+                    group.leave()
+                    return
+                }
+                let workouts = (samples as? [HKWorkout]) ?? []
+                let inner = DispatchGroup()
+                for w in workouts {
+                    inner.enter()
+                    Self.workoutKilocalories(healthStore: healthStore, workout: w) { kcal in
+                        let ts = iso.string(from: w.startDate)
+                        let typeLabel = Self.workoutActivityName(w.workoutActivityType)
+                        let distOut = w.totalDistance?.doubleValue(for: distanceUnit) ?? 0.0
+                        let distKmForHeuristics = (w.totalDistance?.doubleValue(for: HKUnit.meter()) ?? 0.0) / 1000.0
+                        let durMin = w.duration / 60.0
+                        let workoutDate = w.startDate
+                        // Route-based tz inference is async; use geo history fallback for delta exporter workouts to avoid
+                        // delaying the export (delta windows are short and often lack routes for indoor workouts).
+                        let tz = workoutTimezoneFromGeoHistory(for: workoutDate)
+                        let tzName = csvField(tz.tzName)
+                        let offsetMin = tz.utcOffsetMin.map(String.init) ?? ""
+
+                        let energyOut = HKQuantity(unit: HKUnit.kilocalorie(), doubleValue: kcal).doubleValue(for: energyUnit)
+
+                        appendRow("\(userId),\(ts),workout_distance_km,\(formatValue(distOut)),\(distanceUnitLabel),\(typeLabel),\(tzName),\(offsetMin),\(createdAt)")
+                        appendRow("\(userId),\(ts),workout_duration_min,\(formatValue(durMin)),min,\(typeLabel),\(tzName),\(offsetMin),\(createdAt)")
+                        appendRow("\(userId),\(ts),workout_energy_kcal,\(formatValue(energyOut)),\(energyUnitLabel),\(typeLabel),\(tzName),\(offsetMin),\(createdAt)")
+                        if distKmForHeuristics >= 10.0 {
+                            appendRow("\(userId),\(ts),event_long_run_km,\(formatValue(distOut)),\(distanceUnitLabel),\(typeLabel),\(tzName),\(offsetMin),\(createdAt)")
+                        }
+                        if kcal >= 800.0 || durMin >= 60.0 {
+                            appendRow("\(userId),\(ts),event_hard_workout,1,count,\(typeLabel),\(tzName),\(offsetMin),\(createdAt)")
+                        }
+                        inner.leave()
+                    }
+                }
+                inner.notify(queue: .global(qos: .utility)) {
+                    group.leave()
+                }
             }
-            let data = rowsQueue.sync { rows.joined(separator: "\n").data(using: .utf8) ?? Data() }
-            completion(.success(data))
-        }
+            healthStore.execute(workoutQuery)
+
+            group.notify(queue: .main) {
+                if let error = encounteredError {
+                    completion(.failure(error))
+                    return
+                }
+                let data = rowsQueue.sync { rows.joined(separator: "\n").data(using: .utf8) ?? Data() }
+                completion(.success(data))
+            }
+        } // preferredUnits callback
     }
 
     // MARK: - Workout helpers
@@ -320,6 +487,18 @@ struct HealthCSVExporter {
         let unit: HKUnit?
         let unitLabel: String
         let aggregation: Aggregation
+
+        func withUnit(_ preferredUnit: HKUnit) -> MetricSpec {
+            // Export values in the user's preferred HealthKit units and stamp the exact unit string into CSV.
+            MetricSpec(
+                name: name,
+                quantityType: quantityType,
+                categoryType: categoryType,
+                unit: preferredUnit,
+                unitLabel: HealthCSVExporter.cleanedHKUnitLabel(preferredUnit),
+                aggregation: aggregation
+            )
+        }
 
         static func defaultSpecs() -> [MetricSpec] {
             var list: [MetricSpec] = []
@@ -413,8 +592,9 @@ struct HealthCSVExporter {
                     maybeValue = v
                 }
                 if var value = maybeValue {
+                    // Oxygen saturation is commonly represented as a fraction (0..1). Convert to percentage points (0..100)
+                    // for easier interpretation and alignment with how the Health app presents it.
                     if quantityType.identifier == HKQuantityTypeIdentifier.oxygenSaturation.rawValue {
-                        // Convert fraction to percent
                         value *= 100.0
                     }
                     out.append(DataPoint(timestamp: ts, value: value, source: "Apple Watch"))

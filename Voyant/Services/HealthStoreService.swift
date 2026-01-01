@@ -52,13 +52,17 @@ class HealthStoreService {
             .mindfulSession
         ]
 
-        let readTypes: Set<HKObjectType> = Set(
+        var readTypes: [HKObjectType] =
             quantityTypes.compactMap { HKObjectType.quantityType(forIdentifier: $0) } +
             categoryTypes.compactMap { HKObjectType.categoryType(forIdentifier: $0) } +
             [HKObjectType.workoutType()]
-        )
 
-        healthStore.requestAuthorization(toShare: [], read: readTypes) { success, error in
+        // Needed to read workout routes so we can infer timezone from coordinates when available.
+        readTypes.append(HKSeriesType.workoutRoute())
+
+        let readTypesSet: Set<HKObjectType> = Set(readTypes)
+
+        healthStore.requestAuthorization(toShare: [], read: readTypesSet) { success, error in
             completion(success, error)
         }
     }

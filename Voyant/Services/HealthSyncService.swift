@@ -29,10 +29,14 @@ final class HealthSyncService {
 	private let healthStore = HKHealthStore()
 	private let calendar = Calendar.current
 	private var currentUserId: String?
-	private let lookbackHours: Int = 6
+	// How far back to recompute on delta uploads to catch late-arriving HealthKit sync/backfills.
+	// Keep this bounded to avoid oversized uploads.
+	private let lookbackHours: Int = 24
 
 	// Flag to prevent observer uploads during initial seed
 	private var isPerformingInitialSeed = false
+	// Prevent duplicate initial seed scheduling (startBackgroundSync can be called multiple times on startup).
+	private var initialSeedWorkScheduled = false
 
 	// Debouncing for delta uploads to prevent multiple simultaneous uploads
 	private var pendingDeltaWorkItem: DispatchWorkItem?
@@ -64,9 +68,20 @@ final class HealthSyncService {
 
 	// Call on sign-in to handle initial seed upload (one-time per user)
 	func startBackgroundSync(userId: String) {
+		// Record timezone at sync time so we capture travel changes even if the app wasn't foregrounded.
+		// (TimezoneHistoryService dedupes if nothing changed.)
+		TimezoneHistoryService.shared.recordCurrentTimeZone()
+		GeoTimezoneHistoryService.shared.recordNow()
+
 		// Store current user ID
 		self.currentUserId = userId
 		print("[HealthSync] startBackgroundSync for user=\(userId)")
+
+		// Avoid duplicate seed scheduling during the same app session.
+		if isPerformingInitialSeed || initialSeedWorkScheduled {
+			print("[HealthSync] Initial seed already in progress/scheduled, skipping duplicate start")
+			return
+		}
 
 		// Check if initial seed already done for this user
 		let seedKey = self.initialSeedDoneKey(for: userId)
@@ -77,6 +92,7 @@ final class HealthSyncService {
 
 		// Set flag to prevent observer uploads during initial seed
 		self.isPerformingInitialSeed = true
+		self.initialSeedWorkScheduled = true
 
 		print("[HealthSync] Performing initial seed for user=\(userId)")
 
@@ -104,29 +120,37 @@ final class HealthSyncService {
 								print("[HealthSync] Uploading initial CSV (\(data.count) bytes)")
 								let taskId = try await AgentBackendService.shared.uploadHealthCSV(data, uploadMode: "seed")
 								print("[HealthSync] Enqueued process_csv_upload taskId=\(taskId)")
-								// Optionally poll for completion so we can log success
-								let status = try await AgentBackendService.shared.waitForHealthTask(taskId, timeout: 120)
-								print("[HealthSync] Initial seed completed with state=\(status.state)")
-
-								// Clear flag to allow observer uploads now
-								self.isPerformingInitialSeed = false
-
-								// Mark initial seed done for this user if succeeded
-								if status.state.uppercased() == "SUCCESS" || status.state.uppercased() == "SUCCESSFUL" || status.state.uppercased() == "SUCCESSFUL_RESULT" {
+								// Seed is "done" from the client perspective once the backend accepted/enqueued it.
+								// The worker can take >2 minutes on a cold DB; don't treat that as failure.
+								await MainActor.run {
+									self.isPerformingInitialSeed = false
+									self.initialSeedWorkScheduled = false
 									UserDefaults.standard.set(true, forKey: seedKey)
-								} else {
-									// Even if backend didn't report explicit SUCCESS text, we can still mark as done after wait,
-									// comment out if you prefer strict success-only marking.
-									UserDefaults.standard.set(true, forKey: seedKey)
+								}
+
+								// Poll for completion for debug only (non-fatal if it takes too long).
+								Task.detached(priority: .background) {
+									do {
+										let status = try await AgentBackendService.shared.waitForHealthTask(taskId, timeout: 600, pollInterval: 3)
+										print("[HealthSync] Initial seed backend state=\(status.state)")
+									} catch {
+										print("[HealthSync] Initial seed status poll failed (non-fatal): \(error)")
+									}
 								}
 							} catch {
 								print("[HealthSync] Initial upload failed: \(error)")
+								// Clear flags so user can retry later
+								await MainActor.run {
+									self.isPerformingInitialSeed = false
+									self.initialSeedWorkScheduled = false
+								}
 							}
 						}
 				case .failure(let e):
 					print("[HealthSync] generateCSV failed: \(e.localizedDescription)")
 					// Clear flag even on failure
 					self.isPerformingInitialSeed = false
+					self.initialSeedWorkScheduled = false
 				}
 			}
 		}
@@ -193,6 +217,10 @@ final class HealthSyncService {
 		// Immediately complete the HealthKit callback to keep the system happy
 		completionHandler()
 
+		// Capture timezone whenever we get woken up for HealthKit background delivery.
+		TimezoneHistoryService.shared.recordCurrentTimeZone()
+		GeoTimezoneHistoryService.shared.recordNow()
+
 		// Skip if we're doing initial seed
 		if isPerformingInitialSeed {
 			print("[HealthSync] Skipping observer event during initial seed")
@@ -250,6 +278,18 @@ final class HealthSyncService {
 			return q + c + w
 		}()
 
+		// If we don't have anchors yet (first run), anchored queries can return *all history*,
+		// which can create massive "delta" windows and huge CSV uploads. In that case:
+		// - We still run anchored queries to establish anchors.
+		// - But we do NOT widen the delta window based on returned historical samples.
+		var anyMissingAnchor = false
+		for type in sampleTypes {
+			if loadAnchor(for: type) == nil {
+				anyMissingAnchor = true
+				break
+			}
+		}
+
 		for type in sampleTypes {
 			group.enter()
 			let anchor = loadAnchor(for: type)
@@ -260,6 +300,12 @@ final class HealthSyncService {
 					self.saveAnchor(newAnchor, for: type)
 				}
 				if error != nil { return }
+
+				// If this is the first run (missing anchors), don't treat historical samples as "delta".
+				// We'll keep the delta window bounded below after the group completes.
+				if anyMissingAnchor {
+					return
+				}
 				let samples = samplesOrNil ?? []
 				// Consider both additions and deletions; deletions don't give startDate, so we keep small lookback anyway
 				for s in samples {
@@ -284,6 +330,10 @@ final class HealthSyncService {
 			guard let self = self else { return }
 			let end = now
 			let start: Date = {
+				// If anchors were missing, keep a small delta window so uploads stay small.
+				if anyMissingAnchor {
+					return now.addingTimeInterval(-Double(self.lookbackHours) * 3600.0)
+				}
 				if let minChangedDate = minChangedDate {
 					return min(minChangedDate, now.addingTimeInterval(-Double(self.lookbackHours) * 3600.0))
 				}
