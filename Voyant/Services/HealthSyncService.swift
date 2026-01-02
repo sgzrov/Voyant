@@ -15,20 +15,15 @@ final class HealthSyncService {
 
 
 	private let healthStoreService: HealthStoreService
-	private let healthCSVExporter: HealthCSVExporter.Type
-	private let agentBackendService: AgentBackendService
-	private let authService: AuthService
 
 	private init() {
 		self.healthStoreService = HealthStoreService.shared
-		self.healthCSVExporter = HealthCSVExporter.self
-		self.agentBackendService = AgentBackendService.shared
-		self.authService = AuthService.shared
 	}
 
 	private let healthStore = HKHealthStore()
 	private let calendar = Calendar.current
 	private var currentUserId: String?
+	private var pendingSeedUserId: String?
 	// How far back to recompute on delta uploads to catch late-arriving HealthKit sync/backfills.
 	// Keep this bounded to avoid oversized uploads.
 	private let lookbackHours: Int = 24
@@ -46,6 +41,25 @@ final class HealthSyncService {
 	// MARK: - First-time seed persistence
 	private func initialSeedDoneKey(for userId: String) -> String {
 		return "health_initial_seed_done_\(userId)"
+	}
+	private func initialSeedBytesKey(for userId: String) -> String {
+		return "health_initial_seed_bytes_\(userId)"
+	}
+	private func initialSeedAuthorizedKey(for userId: String) -> String {
+		return "health_initial_seed_ran_after_hk_auth_\(userId)"
+	}
+
+	/// Called once HealthKit authorization is granted (from `HealthPredictorApp`).
+	/// If a seed was deferred because auth wasn't ready yet, this will kick it off.
+	func notifyHealthKitAuthorized() {
+		guard healthStoreService.isReadGrantedCached() else {
+			print("[HealthSync] HealthKit read not granted; seed will remain deferred")
+			return
+		}
+		if let uid = pendingSeedUserId {
+			pendingSeedUserId = nil
+			startBackgroundSync(userId: uid)
+		}
 	}
 
 	// MARK: - Background Observers Setup
@@ -68,7 +82,7 @@ final class HealthSyncService {
 
 	// Call on sign-in to handle initial seed upload (one-time per user)
 	func startBackgroundSync(userId: String) {
-		// Record timezone at sync time so we capture travel changes even if the app wasn't foregrounded.
+		// Record timezone at sync time so we capture travel changes even if geo isn't available.
 		// (TimezoneHistoryService dedupes if nothing changed.)
 		TimezoneHistoryService.shared.recordCurrentTimeZone()
 		GeoTimezoneHistoryService.shared.recordNow()
@@ -76,6 +90,13 @@ final class HealthSyncService {
 		// Store current user ID
 		self.currentUserId = userId
 		print("[HealthSync] startBackgroundSync for user=\(userId)")
+
+		// Don't run the initial seed until HealthKit authorization is granted; otherwise we export a near-empty CSV.
+		if !healthStoreService.isReadGrantedCached() {
+			print("[HealthSync] HealthKit not authorized yet; deferring initial seed until authorization completes")
+			pendingSeedUserId = userId
+			return
+		}
 
 		// Avoid duplicate seed scheduling during the same app session.
 		if isPerformingInitialSeed || initialSeedWorkScheduled {
@@ -85,9 +106,16 @@ final class HealthSyncService {
 
 		// Check if initial seed already done for this user
 		let seedKey = self.initialSeedDoneKey(for: userId)
+		let seedBytesKey = self.initialSeedBytesKey(for: userId)
+		let seedAuthKey = self.initialSeedAuthorizedKey(for: userId)
 		if UserDefaults.standard.bool(forKey: seedKey) {
-			print("[HealthSync] Initial seed already completed for user=\(userId), skipping")
-			return
+			// If we've already successfully run a seed *after* HealthKit auth, don't rerun (even if user has 0 data).
+			if UserDefaults.standard.bool(forKey: seedAuthKey) {
+				print("[HealthSync] Initial seed already completed for user=\(userId), skipping")
+				return
+			}
+			let prevBytes = UserDefaults.standard.integer(forKey: seedBytesKey)
+			print("[HealthSync] Initial seed was previously marked done but was not confirmed post-auth (\(prevBytes) bytes); re-running")
 		}
 
 		// Set flag to prevent observer uploads during initial seed
@@ -100,57 +128,79 @@ final class HealthSyncService {
 		let initialSeed = DispatchWorkItem { [weak self] in
 			guard let self = self else { return }
 
-			// Initial full backfill (~164 days) to guarantee seed on first run
-			HealthCSVExporter.generateCSV(for: userId, metrics: []) { res in
-				switch res {
-				case .success(let data):
-						// Write debug CSV to Documents so it can be inspected in Files
-						do {
-							let ts = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
-							if let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
-								let url = docs.appendingPathComponent("HealthExport-\(ts).csv")
-								try data.write(to: url, options: .atomic)
-								print("[HealthSync] Saved initial CSV to \(url.path)")
-							}
-						} catch {
-							print("[HealthSync] Failed saving initial CSV: \(error)")
-						}
-						Task {
-							do {
-								print("[HealthSync] Uploading initial CSV (\(data.count) bytes)")
-								let taskId = try await AgentBackendService.shared.uploadHealthCSV(data, uploadMode: "seed")
-								print("[HealthSync] Enqueued process_csv_upload taskId=\(taskId)")
-								// Seed is "done" from the client perspective once the backend accepted/enqueued it.
-								// The worker can take >2 minutes on a cold DB; don't treat that as failure.
-								await MainActor.run {
-									self.isPerformingInitialSeed = false
-									self.initialSeedWorkScheduled = false
-									UserDefaults.standard.set(true, forKey: seedKey)
-								}
+			// Mirror seed: export raw samples in manageable chunks to avoid oversized uploads/timeouts.
+			let now = Date()
+			let backfillDays = 60
+			// Split the seed window into smaller uploads for reliability on mobile networks.
+			let chunkDays = 7
+			guard let startAll = Calendar.current.date(byAdding: .day, value: -backfillDays, to: now) else {
+				self.isPerformingInitialSeed = false
+				self.initialSeedWorkScheduled = false
+				return
+			}
 
-								// Poll for completion for debug only (non-fatal if it takes too long).
-								Task.detached(priority: .background) {
-									do {
-										let status = try await AgentBackendService.shared.waitForHealthTask(taskId, timeout: 600, pollInterval: 3)
-										print("[HealthSync] Initial seed backend state=\(status.state)")
-									} catch {
-										print("[HealthSync] Initial seed status poll failed (non-fatal): \(error)")
-									}
-								}
-							} catch {
-								print("[HealthSync] Initial upload failed: \(error)")
-								// Clear flags so user can retry later
-								await MainActor.run {
-									self.isPerformingInitialSeed = false
-									self.initialSeedWorkScheduled = false
+			Task {
+				do {
+					let seedBatchId = UUID().uuidString
+					var cursor = startAll
+					var totalBytes = 0
+					var lastTaskId: String?
+					let chunkTotal = Int(ceil(Double(backfillDays) / Double(chunkDays)))
+					var chunkIndex = 0
+					while cursor < now {
+						chunkIndex += 1
+						let next = Calendar.current.date(byAdding: .day, value: chunkDays, to: cursor) ?? now
+						let end = min(next, now)
+						let data: Data = try await withCheckedThrowingContinuation { cont in
+							HealthCSVExporter.generateMirrorCSV(for: userId, start: cursor, end: end) { res in
+								switch res {
+								case .success(let d): cont.resume(returning: d)
+								case .failure(let e): cont.resume(throwing: e)
 								}
 							}
 						}
-				case .failure(let e):
-					print("[HealthSync] generateCSV failed: \(e.localizedDescription)")
-					// Clear flag even on failure
-					self.isPerformingInitialSeed = false
-					self.initialSeedWorkScheduled = false
+						totalBytes += data.count
+
+						print("[HealthSync] Uploading mirror seed chunk \(cursor) -> \(end) (\(data.count) bytes)")
+						let fileName = "health-seed-\(seedBatchId)-\(chunkIndex)-of-\(chunkTotal).csv"
+						lastTaskId = try await AgentBackendService.shared.uploadHealthCSV(
+							data,
+							uploadMode: "seed",
+							fileName: fileName,
+							seedBatchId: seedBatchId,
+							seedChunkIndex: chunkIndex,
+							seedChunkTotal: chunkTotal
+						)
+
+						// Small delay to avoid bursty uploads.
+						try await Task.sleep(nanoseconds: 250_000_000)
+						cursor = end
+					}
+
+					await MainActor.run {
+						self.isPerformingInitialSeed = false
+						self.initialSeedWorkScheduled = false
+						UserDefaults.standard.set(true, forKey: seedKey)
+						UserDefaults.standard.set(totalBytes, forKey: seedBytesKey)
+						UserDefaults.standard.set(true, forKey: seedAuthKey)
+					}
+
+					if let taskId = lastTaskId, taskId.isEmpty == false {
+						Task.detached(priority: .background) {
+							do {
+								let status = try await AgentBackendService.shared.waitForHealthTask(taskId, timeout: 600, pollInterval: 3)
+								print("[HealthSync] Mirror seed last-chunk backend state=\(status.state)")
+							} catch {
+								print("[HealthSync] Mirror seed status poll failed (non-fatal): \(error)")
+							}
+						}
+					}
+				} catch {
+					print("[HealthSync] Mirror seed failed: \(error)")
+					await MainActor.run {
+						self.isPerformingInitialSeed = false
+						self.initialSeedWorkScheduled = false
+					}
 				}
 			}
 		}
@@ -217,7 +267,7 @@ final class HealthSyncService {
 		// Immediately complete the HealthKit callback to keep the system happy
 		completionHandler()
 
-		// Capture timezone whenever we get woken up for HealthKit background delivery.
+		// Capture timezone + location whenever we get woken up for HealthKit background delivery.
 		TimezoneHistoryService.shared.recordCurrentTimeZone()
 		GeoTimezoneHistoryService.shared.recordNow()
 
@@ -244,10 +294,12 @@ final class HealthSyncService {
 	}
 
 	private func performDeltaUpload() {
-		// Use anchored queries for tighter deltas; fallback to small lookback if no changes detected
+		// Use anchored queries for tight raw-sample deltas (HealthKit mirror).
 		let now = Date()
 		let group = DispatchGroup()
-		var minChangedDate: Date?
+		let lock = NSLock()
+		var collectedSamples: [HKSample] = []
+		var collectedDeleted: [HKDeletedObject] = []
 
 		let sampleTypes: [HKSampleType] = {
 			let q: [HKSampleType] = [
@@ -302,25 +354,21 @@ final class HealthSyncService {
 				if error != nil { return }
 
 				// If this is the first run (missing anchors), don't treat historical samples as "delta".
-				// We'll keep the delta window bounded below after the group completes.
+				// We still establish anchors, but we don't upload a huge delta here.
 				if anyMissingAnchor {
 					return
 				}
+
 				let samples = samplesOrNil ?? []
-				// Consider both additions and deletions; deletions don't give startDate, so we keep small lookback anyway
-				for s in samples {
-					let start = (s as? HKWorkout)?.startDate ?? s.startDate
-					if let currentMin = minChangedDate {
-						if start < currentMin { minChangedDate = start }
-					} else {
-						minChangedDate = start
-					}
+				if !samples.isEmpty {
+					lock.lock()
+					collectedSamples.append(contentsOf: samples)
+					lock.unlock()
 				}
-                if let deleted = deleted, !deleted.isEmpty {
-					// Force a lookback by setting minChangedDate if none yet
-					if minChangedDate == nil {
-						minChangedDate = now.addingTimeInterval(-Double(lookbackHours) * 3600.0)
-					}
+				if let deleted = deleted, !deleted.isEmpty {
+					lock.lock()
+					collectedDeleted.append(contentsOf: deleted)
+					lock.unlock()
 				}
 			}
 			healthStore.execute(anchored)
@@ -328,17 +376,17 @@ final class HealthSyncService {
 
 		group.notify(queue: .main) { [weak self] in
 			guard let self = self else { return }
-			let end = now
-			let start: Date = {
-				// If anchors were missing, keep a small delta window so uploads stay small.
-				if anyMissingAnchor {
-					return now.addingTimeInterval(-Double(self.lookbackHours) * 3600.0)
-				}
-				if let minChangedDate = minChangedDate {
-					return min(minChangedDate, now.addingTimeInterval(-Double(self.lookbackHours) * 3600.0))
-				}
-				return now.addingTimeInterval(-Double(self.lookbackHours) * 3600.0)
-			}()
+
+			if anyMissingAnchor {
+				print("[HealthSync] Anchors missing; established anchors but skipping huge delta upload")
+				return
+			}
+
+			let samples = collectedSamples
+			let deleted = collectedDeleted
+			if samples.isEmpty && deleted.isEmpty {
+				return
+			}
 
 			Task {
 				var userId = self.currentUserId
@@ -348,35 +396,20 @@ final class HealthSyncService {
 				}
 				guard let uid = userId else { return }
 
-				let minuteResolution = end.timeIntervalSince(start) <= (90 * 60)
-
-				print("[HealthSync] Creating delta CSV for period: \(start) to \(end)")
-
-				HealthCSVExporter.generateDeltaCSV(for: uid, start: start, end: end, metrics: [], minuteResolution: minuteResolution) { result in
+				HealthCSVExporter.generateMirrorDeltaCSV(for: uid, samples: samples, deleted: deleted) { result in
 					switch result {
 					case .success(let data):
-						// Save delta CSV for debugging
-						do {
-							let ts = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
-							if let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
-								let url = docs.appendingPathComponent("HealthDelta-\(ts).csv")
-								try data.write(to: url, options: .atomic)
-								print("[HealthSync] Saved delta CSV to \(url.path) (\(data.count) bytes)")
-							}
-						} catch {
-							print("[HealthSync] Failed saving delta CSV: \(error)")
-						}
 						Task {
 							do {
-								print("[HealthSync] Uploading delta CSV (\(data.count) bytes)")
+								print("[HealthSync] Uploading mirror delta CSV (\(data.count) bytes) samples=\(samples.count) deleted=\(deleted.count)")
 								let taskId = try await AgentBackendService.shared.uploadHealthCSV(data, uploadMode: "delta")
-								print("[HealthSync] Delta upload enqueued with task_id=\(taskId)")
+								print("[HealthSync] Mirror delta upload enqueued with task_id=\(taskId)")
 							} catch {
-								print("[HealthSync] Delta upload failed: \(error)")
+								print("[HealthSync] Mirror delta upload failed: \(error)")
 							}
 						}
 					case .failure(let error):
-						print("[HealthSync] Failed to generate delta CSV: \(error)")
+						print("[HealthSync] Failed to generate mirror delta CSV: \(error)")
 					}
 				}
 			}

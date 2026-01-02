@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 # Default service limits (kept in code to avoid env-based complexity).
 DEFAULT_PROCESSING_TIMEOUT_SECONDS = 300
-DEFAULT_MAX_UPLOAD_BYTES = 15 * 1024 * 1024  # 15MB
+DEFAULT_MAX_UPLOAD_BYTES = 200 * 1024 * 1024  # 200MB (single-shot 60d mirror seed can be large)
 
 
 def _utcnow_naive() -> datetime:
@@ -77,6 +77,9 @@ class HealthUploadService:
         content: bytes,
         file_name: str,
         upload_mode: Optional[str] = None,
+        seed_batch_id: Optional[str] = None,
+        seed_chunk_index: Optional[int] = None,
+        seed_chunk_total: Optional[int] = None,
     ) -> UploadCsvResult:
         if len(content) > self.max_upload_bytes:
             raise HTTPException(
@@ -91,6 +94,10 @@ class HealthUploadService:
         if existing:
             existing.request_count = (existing.request_count or 0) + 1
             existing.updated_at = now
+            existing.upload_mode = (upload_mode or existing.upload_mode)
+            existing.seed_batch_id = seed_batch_id or existing.seed_batch_id
+            existing.seed_chunk_index = seed_chunk_index or existing.seed_chunk_index
+            existing.seed_chunk_total = seed_chunk_total or existing.seed_chunk_total
 
             if existing.status in ["pending", "processing"]:
                 age_s = (now - existing.created_at).total_seconds() if existing.created_at else 0
@@ -179,6 +186,10 @@ class HealthUploadService:
             task_id=task_id,
             file_size=len(content),
             file_name=file_name,
+            upload_mode=(upload_mode or None),
+            seed_batch_id=(seed_batch_id or None),
+            seed_chunk_index=seed_chunk_index,
+            seed_chunk_total=seed_chunk_total,
             status="pending",
             request_count=1,
         )
@@ -235,3 +246,48 @@ class HealthUploadService:
                 self.db.commit()
 
         return {"id": task_id, "state": celery_state, "result": celery_result}
+
+    def get_seed_status(self, *, user_id: str, batch_id: Optional[str] = None, limit: int = 200) -> dict[str, Any]:
+        bid = batch_id or tracking_crud.get_latest_seed_batch_id(self.db, user_id=user_id)
+        if not bid:
+            return {"batch_id": None, "chunks": [], "summary": {"total": 0, "completed": 0, "failed": 0, "processing": 0}}
+
+        rows = tracking_crud.list_seed_batch(self.db, user_id=user_id, batch_id=bid, limit=limit)
+        chunks = []
+        completed = failed = processing = 0
+        total = 0
+        for r in rows:
+            if r.seed_chunk_total and r.seed_chunk_total > total:
+                total = int(r.seed_chunk_total)
+            st = (r.status or "").lower()
+            if st == "completed":
+                completed += 1
+            elif st in {"failed", "timeout"}:
+                failed += 1
+            elif st in {"pending", "processing"}:
+                processing += 1
+
+            chunks.append(
+                {
+                    "chunk_index": r.seed_chunk_index,
+                    "chunk_total": r.seed_chunk_total,
+                    "task_id": r.task_id,
+                    "status": r.status,
+                    "file_size": r.file_size,
+                    "row_count": r.row_count,
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                    "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+                    "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+                    "error_message": r.error_message,
+                }
+            )
+
+        # If chunk_total isn't present (older rows), fall back to count.
+        if total == 0:
+            total = len({c.get("chunk_index") for c in chunks if c.get("chunk_index") is not None}) or len(chunks)
+
+        return {
+            "batch_id": bid,
+            "summary": {"total": total, "completed": completed, "failed": failed, "processing": processing},
+            "chunks": chunks,
+        }

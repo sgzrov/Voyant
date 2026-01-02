@@ -22,16 +22,26 @@ final class GeoTimezoneHistoryService: NSObject, CLLocationManagerDelegate {
     private let queue = DispatchQueue(label: "Voyant.GeoTimezoneHistoryService")
 
     private let manager = CLLocationManager()
+    private var backgroundUpdatesStarted = false
 
-    // Callbacks to run once the user has responded to the location permission prompt
-    // (i.e., authorization is no longer .notDetermined), or after a timeout.
-    private var authDeterminedCallbacks: [() -> Void] = []
-    private var authTimeoutWorkItem: DispatchWorkItem?
+    struct Place: Equatable {
+        let country: String?
+        let region: String?
+        let city: String?
+    }
 
     private override init() {
         super.init()
         manager.delegate = self
-        manager.desiredAccuracy = kCLLocationAccuracyThreeKilometers
+        // We want enough resolution to get at least city.
+        manager.desiredAccuracy = kCLLocationAccuracyKilometer
+        manager.distanceFilter = 500 // meters; coarse to reduce battery
+        manager.activityType = .fitness
+#if canImport(UIKit)
+        // Requires UIBackgroundModes = location.
+        manager.allowsBackgroundLocationUpdates = true
+#endif
+        manager.pausesLocationUpdatesAutomatically = true
     }
 
     /// Start recording. This may trigger a location permission prompt depending on current status.
@@ -44,48 +54,26 @@ final class GeoTimezoneHistoryService: NSObject, CLLocationManagerDelegate {
             }
         }
 
-        // Ask for permission if needed; otherwise request a single location to geocode.
+        // Request "Always" so we can capture location even when the user isn't actively using the app
+        // (e.g., while Apple Watch workouts/metrics are being written and HealthKit wakes the app).
         let status = manager.authorizationStatus
         switch status {
         case .notDetermined:
-            manager.requestWhenInUseAuthorization()
+            #if canImport(UIKit)
+            manager.requestAlwaysAuthorization()
+            #endif
         default:
-            // Avoid platform-specific enum cases (some toolchains/lints evaluate this file under macOS).
-            // Treat any "authorized" state as allowed.
-            if status.rawValue >= CLAuthorizationStatus.authorizedAlways.rawValue {
+            if isAuthorized(status) {
+                if isAuthorizedAlways(status) {
+                    startBackgroundLocationUpdatesIfNeeded()
+                } else {
+                    // Attempt to upgrade to Always (iOS may require a user journey / Settings depending on OS version).
+                    #if canImport(UIKit)
+                    manager.requestAlwaysAuthorization()
+                    #endif
+                }
                 manager.requestLocation()
             }
-            break
-        }
-    }
-
-    /// Ensures the user has responded to the location authorization prompt before calling `completion`.
-    /// If authorization is already determined, calls `completion` immediately.
-    /// If not determined, triggers the prompt (via `start()`) and waits until the user responds.
-    ///
-    /// - timeoutSeconds: Optional safety timeout. If nil, waits indefinitely (strict ordering).
-    func whenAuthorizationDetermined(timeoutSeconds: TimeInterval? = 6.0, completion: @escaping () -> Void) {
-        let status = manager.authorizationStatus
-        if status != .notDetermined {
-            completion()
-            return
-        }
-
-        queue.async {
-            self.authDeterminedCallbacks.append(completion)
-        }
-
-        // Ensure the prompt is shown.
-        start()
-
-        // Optional safety timeout so we don't block forever if user ignores the prompt.
-        if let timeoutSeconds = timeoutSeconds, timeoutSeconds > 0 {
-            let wi = DispatchWorkItem { [weak self] in
-                self?.flushAuthDeterminedCallbacks()
-            }
-            authTimeoutWorkItem?.cancel()
-            authTimeoutWorkItem = wi
-            DispatchQueue.main.asyncAfter(deadline: .now() + timeoutSeconds, execute: wi)
         }
     }
 
@@ -93,47 +81,59 @@ final class GeoTimezoneHistoryService: NSObject, CLLocationManagerDelegate {
     /// Safe to call frequently; persistence dedupes consecutive identical tz.
     func recordNow() {
         let status = manager.authorizationStatus
-        // Treat any "authorized" state as allowed (covers iOS WhenInUse + Always, and macOS Authorized).
-        guard status.rawValue >= CLAuthorizationStatus.authorizedAlways.rawValue else { return }
+        guard isAuthorized(status) else { return }
+        if isAuthorizedAlways(status) {
+            startBackgroundLocationUpdatesIfNeeded()
+            manager.requestLocation()
+            return
+        }
+        // Fallback: if only WhenInUse is granted, we can only snapshot while the app is active.
+        #if canImport(UIKit)
+        if UIApplication.shared.applicationState == .active {
+            manager.requestLocation()
+        }
+        #else
         manager.requestLocation()
+        #endif
     }
 
     // MARK: - Queries
 
-    /// Returns a timezone identifier only if we have a recorded entry effective at or before `date`.
-    /// If `date` is earlier than our first recorded entry, returns nil (unknown).
-    func tzNameIfKnown(for date: Date) -> String? {
+    /// Returns the most recent *geocoded* entry (source == "geocode") effective at or before `date`.
+    /// If the only entry is the seed_device_tz placeholder, returns nil so callers can fall back to other sources.
+    func geocodedEntryIfKnown(for date: Date) -> (tzName: String, place: Place?)? {
         return queue.sync {
             let entries = loadEntries()
             guard !entries.isEmpty else { return nil }
             if date < entries[0].effectiveAt { return nil }
 
-            var candidate = entries[0].tzName
+            var candidate: Entry?
             for e in entries {
                 if e.effectiveAt <= date {
-                    candidate = e.tzName
+                    candidate = e
                 } else {
                     break
                 }
             }
-            return candidate
+            guard let c = candidate, c.source == "geocode" else { return nil }
+            return (c.tzName, c.place)
         }
-    }
-
-    func utcOffsetMinutesIfKnown(for date: Date) -> Int? {
-        guard let name = tzNameIfKnown(for: date), let tz = TimeZone(identifier: name) else { return nil }
-        return tz.secondsFromGMT(for: date) / 60
     }
 
     // MARK: - CLLocationManagerDelegate
 
     func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
         let status = manager.authorizationStatus
-        if status.rawValue >= CLAuthorizationStatus.authorizedAlways.rawValue {
+        if isAuthorized(status) {
+            if isAuthorizedAlways(status) {
+                startBackgroundLocationUpdatesIfNeeded()
+            } else {
+                // Attempt to upgrade to Always once we have at least some authorization.
+                #if canImport(UIKit)
+                manager.requestAlwaysAuthorization()
+                #endif
+            }
             manager.requestLocation()
-        }
-        if status != .notDetermined {
-            flushAuthDeterminedCallbacks()
         }
     }
 
@@ -147,10 +147,16 @@ final class GeoTimezoneHistoryService: NSObject, CLLocationManagerDelegate {
         #if canImport(UIKit)
         CLGeocoder().reverseGeocodeLocation(loc) { [weak self] placemarks, _ in
             guard let self = self else { return }
-            let tzName = placemarks?.first?.timeZone?.identifier
+            let pm = placemarks?.first
+            let tzName = pm?.timeZone?.identifier
             let name = tzName?.isEmpty == false ? tzName! : TimeZone.current.identifier
+            let place = Place(
+                country: pm?.country,
+                region: pm?.administrativeArea,
+                city: pm?.locality
+            )
             self.queue.sync {
-                self.appendEntry(effectiveAt: Date(), tzName: name, source: "geocode")
+                self.appendEntry(effectiveAt: Date(), tzName: name, source: "geocode", place: place)
             }
         }
         #else
@@ -162,18 +168,22 @@ final class GeoTimezoneHistoryService: NSObject, CLLocationManagerDelegate {
         // Best-effort only; ignore.
     }
 
-    private func flushAuthDeterminedCallbacks() {
-        authTimeoutWorkItem?.cancel()
-        authTimeoutWorkItem = nil
-        let callbacks: [() -> Void] = queue.sync {
-            let cbs = self.authDeterminedCallbacks
-            self.authDeterminedCallbacks.removeAll()
-            return cbs
-        }
-        guard !callbacks.isEmpty else { return }
-        DispatchQueue.main.async {
-            callbacks.forEach { $0() }
-        }
+    private func startBackgroundLocationUpdatesIfNeeded() {
+        guard !backgroundUpdatesStarted else { return }
+        backgroundUpdatesStarted = true
+        // "Significant changes" is the lowest-battery way to get background location.
+        // It will wake the app periodically as the user moves (useful for workouts/travel).
+        manager.startMonitoringSignificantLocationChanges()
+    }
+
+    // MARK: - Authorization helpers
+    // Avoid referencing iOS-only enum cases (e.g., .authorizedWhenInUse) because some toolchains index this file under macOS.
+    private func isAuthorized(_ status: CLAuthorizationStatus) -> Bool {
+        status.rawValue >= CLAuthorizationStatus.authorizedAlways.rawValue
+    }
+
+    private func isAuthorizedAlways(_ status: CLAuthorizationStatus) -> Bool {
+        status.rawValue == CLAuthorizationStatus.authorizedAlways.rawValue
     }
 
     // MARK: - Persistence
@@ -182,6 +192,7 @@ final class GeoTimezoneHistoryService: NSObject, CLLocationManagerDelegate {
         let effectiveAt: Date
         let tzName: String
         let source: String
+        let place: Place?
     }
 
     private func loadEntries() -> [Entry] {
@@ -195,12 +206,23 @@ final class GeoTimezoneHistoryService: NSObject, CLLocationManagerDelegate {
                 !tz.isEmpty
             else { return nil }
             let src = (d["src"] as? String) ?? "unknown"
-            return Entry(effectiveAt: Date(timeIntervalSince1970: ts), tzName: tz, source: src)
+            let place = Place(
+                country: d["place_country"] as? String,
+                region: d["place_region"] as? String,
+                city: d["place_city"] as? String
+            )
+            let hasPlace = (place.country?.isEmpty == false) || (place.region?.isEmpty == false) || (place.city?.isEmpty == false)
+            return Entry(
+                effectiveAt: Date(timeIntervalSince1970: ts),
+                tzName: tz,
+                source: src,
+                place: hasPlace ? place : nil
+            )
         }
         return entries.sorted(by: { $0.effectiveAt < $1.effectiveAt })
     }
 
-    private func appendEntry(effectiveAt: Date, tzName: String, source: String) {
+    private func appendEntry(effectiveAt: Date, tzName: String, source: String, place: Place? = nil) {
         let tz = tzName.isEmpty ? TimeZone.current.identifier : tzName
         var raw = (UserDefaults.standard.array(forKey: storageKey) as? [[String: Any]]) ?? []
 
@@ -209,11 +231,17 @@ final class GeoTimezoneHistoryService: NSObject, CLLocationManagerDelegate {
             return
         }
 
-        raw.append([
+        var row: [String: Any] = [
             "ts": effectiveAt.timeIntervalSince1970,
             "tz": tz,
             "src": source,
-        ])
+        ]
+        if let p = place {
+            if let v = p.country, !v.isEmpty { row["place_country"] = v }
+            if let v = p.region, !v.isEmpty { row["place_region"] = v }
+            if let v = p.city, !v.isEmpty { row["place_city"] = v }
+        }
+        raw.append(row)
 
         // Keep bounded
         if raw.count > 64 {

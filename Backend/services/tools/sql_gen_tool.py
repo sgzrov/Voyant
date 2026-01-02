@@ -208,7 +208,7 @@ def _rewrite_event_timestamps_inplace(*, session, user_id: str, rows: list[dict]
 
 
 def _rewrite_rollup_bucket_ts_inplace(*, session, user_id: str, rows: list[dict], request_tz: str) -> None:
-    """Rewrite rollup bucket_ts to the timezone active when the bucket occurred (from health_rollup_hourly.meta)."""
+    """Rewrite rollup bucket_ts to the timezone active when the bucket occurred (from rollup meta)."""
     bucket_key = "bucket_ts"
 
     # Collect unique (bucket_ts, metric_type) pairs that look like datetimes
@@ -250,6 +250,8 @@ def _rewrite_rollup_bucket_ts_inplace(*, session, user_id: str, rows: list[dict]
             tz_map[(dt, mt)] = tzv
             continue
 
+        # Try hourly first; if not present, try daily (restored in mirror mode).
+        meta_row = None
         if mt:
             meta_row = session.execute(
                 text(
@@ -264,6 +266,20 @@ def _rewrite_rollup_bucket_ts_inplace(*, session, user_id: str, rows: list[dict]
                 ),
                 {"user_id": user_id, "ts": dt, "mt": mt},
             ).mappings().first()
+            if not meta_row:
+                meta_row = session.execute(
+                    text(
+                        """
+                        SELECT meta
+                        FROM health_rollup_daily
+                        WHERE user_id = :user_id
+                          AND bucket_ts = :ts
+                          AND metric_type = :mt
+                        LIMIT 1
+                        """
+                    ),
+                    {"user_id": user_id, "ts": dt, "mt": mt},
+                ).mappings().first()
         else:
             meta_row = session.execute(
                 text(
@@ -277,6 +293,19 @@ def _rewrite_rollup_bucket_ts_inplace(*, session, user_id: str, rows: list[dict]
                 ),
                 {"user_id": user_id, "ts": dt},
             ).mappings().first()
+            if not meta_row:
+                meta_row = session.execute(
+                    text(
+                        """
+                        SELECT meta
+                        FROM health_rollup_daily
+                        WHERE user_id = :user_id
+                          AND bucket_ts = :ts
+                        LIMIT 1
+                        """
+                    ),
+                    {"user_id": user_id, "ts": dt},
+                ).mappings().first()
 
         meta = meta_row.get("meta") if meta_row else None
         if isinstance(meta, dict):

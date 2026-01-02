@@ -36,17 +36,33 @@ class AgentBackendService {
         return try await sseService.streamSSE(request: request)
     }
 
-    func uploadHealthCSV(_ data: Data, uploadMode: String? = nil) async throws -> (String) {
+    func uploadHealthCSV(
+        _ data: Data,
+        uploadMode: String? = nil,
+        fileName: String = "health.csv",
+        seedBatchId: String? = nil,
+        seedChunkIndex: Int? = nil,
+        seedChunkTotal: Int? = nil
+    ) async throws -> (String) {
         var request = try await authService.authenticatedRequest(for: "/health/upload-csv", method: "POST")
         let boundary = "Boundary-\(UUID().uuidString)"
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         if let uploadMode = uploadMode {
             request.setValue(uploadMode, forHTTPHeaderField: "x-upload-mode")
         }
+        if let seedBatchId = seedBatchId {
+            request.setValue(seedBatchId, forHTTPHeaderField: "x-seed-batch-id")
+        }
+        if let seedChunkIndex = seedChunkIndex {
+            request.setValue(String(seedChunkIndex), forHTTPHeaderField: "x-seed-chunk-index")
+        }
+        if let seedChunkTotal = seedChunkTotal {
+            request.setValue(String(seedChunkTotal), forHTTPHeaderField: "x-seed-chunk-total")
+        }
 
         var body = Data()
         body.append("--\(boundary)\r\n".data(using: .utf8)!)
-        body.append("Content-Disposition: form-data; name=\"file\"; filename=\"health.csv\"\r\n".data(using: .utf8)!)
+        body.append("Content-Disposition: form-data; name=\"file\"; filename=\"\(fileName)\"\r\n".data(using: .utf8)!)
         body.append("Content-Type: text/csv\r\n\r\n".data(using: .utf8)!)
         body.append(data)
         body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)

@@ -17,7 +17,8 @@ class RateLimitDecision:
 # Limits health data CSV uploads to 10 requests per minute for a user
 class RedisUploadRateLimiter:
     def __init__(self, redis_url: str):
-        self.max_requests = 10
+        # Higher throughput for raw-sample mirroring (initial backfills can require many chunks).
+        self.max_requests = 60
         self.window_seconds = 60
         self._client = redis.from_url(redis_url, decode_responses=True)
 

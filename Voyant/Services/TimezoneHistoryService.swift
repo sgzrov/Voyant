@@ -62,34 +62,6 @@ final class TimezoneHistoryService {
         return tz.secondsFromGMT(for: date) / 60
     }
 
-    /// Returns the best-known timezone identifier for a given date based on recorded changes.
-    func tzName(for date: Date) -> String {
-        return queue.sync {
-            let entries = loadEntries()
-            guard !entries.isEmpty else { return TimeZone.current.identifier }
-
-            // Find latest entry whose effectiveAt <= date
-            var candidate = entries[0].tzName
-            for e in entries {
-                if e.effectiveAt <= date {
-                    candidate = e.tzName
-                } else {
-                    break
-                }
-            }
-            return candidate
-        }
-    }
-
-    /// Returns UTC offset minutes for the timezone that was active at the given date.
-    func utcOffsetMinutes(for date: Date) -> Int {
-        let name = tzName(for: date)
-        if let tz = TimeZone(identifier: name) {
-            return tz.secondsFromGMT(for: date) / 60
-        }
-        return TimeZone.current.secondsFromGMT(for: date) / 60
-    }
-
     // MARK: - Persistence
 
     private struct Entry {

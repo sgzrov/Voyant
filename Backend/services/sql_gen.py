@@ -301,7 +301,7 @@ def _validate_sql_sources(sql: str, allowed_sources: set[str], health_sources: s
     used_health = seen & {s.lower() for s in health_sources}
     # Require that the query references at least one health data source
     if not used_health:
-        raise ValueError("Query must reference a health table (health_rollup_hourly and/or health_events)")
+        raise ValueError("Query must reference a health table (health_rollup_hourly, health_rollup_daily, and/or health_events)")
     return used_health
 
 
@@ -359,6 +359,62 @@ def _rewrite_rollup_hourly_to_tz_derived(sql: str) -> str:
         return out
     except Exception:
         logger.exception("sql.rewrite.hourly.failed")
+        return sql
+
+
+# Replace references to health_rollup_daily table with a tz-normalized derived table (day buckets).
+def _rewrite_rollup_daily_to_tz_derived(sql: str) -> str:
+    try:
+        stripped = _strip_sql_strings_and_comments(sql)
+        if not re.search(r"(?is)\b(from|join)\s+health_rollup_daily\b", stripped):
+            return sql
+
+        daily_subquery = (
+            "(SELECT\n"
+            "   user_id,\n"
+            "   (date_trunc('day', bucket_ts AT TIME ZONE :tz_name) AT TIME ZONE :tz_name) AS bucket_ts,\n"
+            "   metric_type,\n"
+            "   (ARRAY_AGG(meta) FILTER (WHERE meta IS NOT NULL))[1] AS meta,\n"
+            "   CASE WHEN SUM(n) > 0 THEN SUM(COALESCE(avg_value, 0) * n) / SUM(n) END AS avg_value,\n"
+            "   SUM(COALESCE(sum_value, 0)) AS sum_value,\n"
+            "   MIN(min_value) AS min_value,\n"
+            "   MAX(max_value) AS max_value,\n"
+            "   SUM(n) AS n\n"
+            " FROM health_rollup_daily\n"
+            " WHERE user_id = :user_id\n"
+            " GROUP BY 1,2,3)"
+        )
+
+        def _rewrite_from(m: re.Match) -> str:
+            alias = m.group("alias")
+            alias_out = alias if alias else "health_rollup_daily"
+            return f"FROM {daily_subquery} AS {alias_out}"
+
+        def _rewrite_join(m: re.Match) -> str:
+            alias = m.group("alias")
+            alias_out = alias if alias else "health_rollup_daily"
+            return f"JOIN {daily_subquery} AS {alias_out}"
+
+        _no_alias_keywords = (
+            r"where|group|order|limit|join|on|inner|left|right|full|cross|union|having|"
+            r"window|offset|fetch|for|into|values|select|from"
+        )
+
+        out = re.sub(
+            rf"(?is)\bfrom\s+health_rollup_daily(?:\s+(?:as\s+)?(?P<alias>(?!({_no_alias_keywords})\b)[a-zA-Z_]\w*))?\b",
+            _rewrite_from,
+            sql,
+        )
+        out = re.sub(
+            rf"(?is)\bjoin\s+health_rollup_daily(?:\s+(?:as\s+)?(?P<alias>(?!({_no_alias_keywords})\b)[a-zA-Z_]\w*))?\b",
+            _rewrite_join,
+            out,
+        )
+        if out != sql:
+            logger.info("sql.rewrite.daily: rewrote health_rollup_daily to tz-localized derived table (alias-preserving)")
+        return out
+    except Exception:
+        logger.exception("sql.rewrite.daily.failed")
         return sql
 
 
@@ -455,21 +511,25 @@ def _sanitize_sql(sql: str) -> str:
         s,
         allowed_sources={
             "health_rollup_hourly",
+            "health_rollup_daily",
             "health_events",
             "generate_series",
             "unnest",
         },
-        health_sources={"health_rollup_hourly", "health_events"},
+        health_sources={"health_rollup_hourly", "health_rollup_daily", "health_events"},
     )
 
-    # Allow multi-table ONLY for the specific combo:
+    # Allow multi-table ONLY for the specific combos:
     # - health_events (workouts/events)
-    # - health_rollup_hourly (recovery metrics)
+    # - health_rollup_hourly or health_rollup_daily (recovery metrics)
     if len(used_health_sources) > 1:
-        if used_health_sources != {"health_events", "health_rollup_hourly"}:
+        if used_health_sources not in (
+            {"health_events", "health_rollup_hourly"},
+            {"health_events", "health_rollup_daily"},
+        ):
             raise ValueError(
-                "Query must use exactly one health table (health_rollup_hourly OR health_events), "
-                "or the specific combo (health_events + health_rollup_hourly)"
+                "Query must use exactly one health table (health_rollup_hourly OR health_rollup_daily OR health_events), "
+                "or the specific combos (health_events + health_rollup_hourly) / (health_events + health_rollup_daily)"
             )
 
     # Always rewrite to safe derived tables BEFORE further validation/rewrites:
@@ -477,6 +537,9 @@ def _sanitize_sql(sql: str) -> str:
     # - events get scoped to user_id
     if "health_rollup_hourly" in used_health_sources:
         s = _rewrite_rollup_hourly_to_tz_derived(s)
+        stripped = _strip_sql_strings_and_comments(s)
+    if "health_rollup_daily" in used_health_sources:
+        s = _rewrite_rollup_daily_to_tz_derived(s)
         stripped = _strip_sql_strings_and_comments(s)
     if "health_events" in used_health_sources:
         s = _rewrite_health_events_to_user_scoped(s)

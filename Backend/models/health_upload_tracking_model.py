@@ -11,6 +11,10 @@ class HealthUploadTracking(Base):
     task_id = Column(String(100), nullable=True)
     file_size = Column(Integer, nullable=False)
     file_name = Column(String(255), nullable=True)
+    upload_mode = Column(String(32), nullable=True)  # e.g. "seed" / "delta"
+    seed_batch_id = Column(String(64), nullable=True)
+    seed_chunk_index = Column(Integer, nullable=True)
+    seed_chunk_total = Column(Integer, nullable=True)
     status = Column(String(50), nullable=False, default="pending")
     created_at = Column(DateTime, nullable=False, server_default=func.now())
     updated_at = Column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())

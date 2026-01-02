@@ -97,6 +97,14 @@
     <key>NSLocationWhenInUseUsageDescription</key>
     <string>Voyant uses your approximate location to infer your timezone for workouts and health metrics when HealthKit does not provide timezone metadata.</string>
 
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>Voyant uses your location in the background to attach place/timezone context to workouts and health metrics for a better coaching/chat experience.</string>
+
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>location</string>
+	</array>
+
     <key>BACKEND_BASE_URL</key>
     <string>https://voyant-production-bff4.up.railway.app</string>
 </dict>
