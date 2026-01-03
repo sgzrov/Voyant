@@ -698,9 +698,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                     "hk_source_bundle_id",
                     "hk_source_name",
                     "hk_source_version",
-                    "hk_device",
                     "hk_metadata",
-                    "hk_was_user_entered",
                 ):
                     if not he_cols or c in he_cols:
                         select_cols.append(c)
@@ -740,9 +738,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                             "hk_source_bundle_id": None,
                             "hk_source_name": None,
                             "hk_source_version": None,
-                            "hk_device": None,
                             "hk_metadata": None,
-                            "hk_was_user_entered": None,
                         },
                     )
                     if w["timestamp"] is None and r.get("timestamp") is not None:
@@ -756,9 +752,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                         "hk_source_bundle_id",
                         "hk_source_name",
                         "hk_source_version",
-                        "hk_device",
                         "hk_metadata",
-                        "hk_was_user_entered",
                     ):
                         if w.get(k) is None and r.get(k) is not None:
                             w[k] = r.get(k)
@@ -806,10 +800,14 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                                 "hk_source_bundle_id": w.get("hk_source_bundle_id"),
                                 "hk_source_name": w.get("hk_source_name"),
                                 "hk_source_version": w.get("hk_source_version"),
-                                "hk_was_user_entered": w.get("hk_was_user_entered"),
-                                "hk_device": json.dumps(w.get("hk_device")) if isinstance(w.get("hk_device"), (dict, list)) else w.get("hk_device"),
+                                "hk_sources": json.dumps(
+                                    [
+                                        {"name": w.get("hk_source_name"), "version": w.get("hk_source_version")}
+                                    ]
+                                )
+                                if w.get("hk_source_name") is not None
+                                else "[]",
                                 "hk_metadata": json.dumps(w.get("hk_metadata")) if isinstance(w.get("hk_metadata"), (dict, list)) else w.get("hk_metadata"),
-                                "features": None,
                             }
                         )
                     if dw_rows:
@@ -818,13 +816,13 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                                 """
                                 INSERT INTO workouts
                                     (user_id, workout_uuid, workout_type, start_ts, end_ts, duration_min, distance_km, energy_kcal,
-                                     hk_source_bundle_id, hk_source_name, hk_source_version, hk_device, hk_metadata, hk_was_user_entered,
-                                     features, created_at, updated_at)
+                                     hk_source_bundle_id, hk_source_name, hk_source_version, hk_sources, hk_metadata,
+                                     created_at, updated_at)
                                 VALUES
                                     (:user_id, :workout_uuid, :workout_type, :start_ts, :end_ts, :duration_min, :distance_km, :energy_kcal,
                                      :hk_source_bundle_id, :hk_source_name, :hk_source_version,
-                                     CAST(:hk_device AS jsonb), CAST(:hk_metadata AS jsonb), :hk_was_user_entered,
-                                     CAST(:features AS jsonb), NOW(), NOW())
+                                     CAST(:hk_sources AS jsonb), CAST(:hk_metadata AS jsonb),
+                                     NOW(), NOW())
                                 ON CONFLICT (user_id, workout_uuid) DO UPDATE
                                 SET
                                     workout_type = COALESCE(EXCLUDED.workout_type, workouts.workout_type),
@@ -836,10 +834,8 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                                     hk_source_bundle_id = COALESCE(EXCLUDED.hk_source_bundle_id, workouts.hk_source_bundle_id),
                                     hk_source_name = COALESCE(EXCLUDED.hk_source_name, workouts.hk_source_name),
                                     hk_source_version = COALESCE(EXCLUDED.hk_source_version, workouts.hk_source_version),
-                                    hk_device = COALESCE(EXCLUDED.hk_device, workouts.hk_device),
                                     hk_metadata = COALESCE(EXCLUDED.hk_metadata, workouts.hk_metadata),
-                                    hk_was_user_entered = COALESCE(EXCLUDED.hk_was_user_entered, workouts.hk_was_user_entered),
-                                    features = COALESCE(EXCLUDED.features, workouts.features),
+                                    hk_sources = COALESCE(EXCLUDED.hk_sources, workouts.hk_sources),
                                     updated_at = NOW()
                                 """
                             ),
@@ -995,6 +991,25 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                     for wid, w in workouts.items():
                         ts0 = w["timestamp"]
                         end0 = w.get("end_ts") or ts0
+                        workout_type = str(w.get("source") or "").strip().lower()
+                        workout_dist_km = float(w.get("dist_km") or 0.0)
+
+                        # Only generate segments for distance-based activities (and require non-trivial workout distance).
+                        # This prevents background walking distance from accidentally producing "segments" for strength workouts.
+                        distance_type_keywords = (
+                            "run",
+                            "walk",
+                            "hike",
+                            "cycle",
+                            "bike",
+                            "swim",
+                            "row",
+                            "ski",
+                        )
+                        is_distance_activity = any(k in workout_type for k in distance_type_keywords)
+                        if (not is_distance_activity) or workout_dist_km < 1.0:
+                            continue
+
                         # Choose the best distance stream inside the workout window.
                         candidates = []
                         for mt in dist_metric_types:

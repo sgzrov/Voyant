@@ -5,13 +5,12 @@ workouts (one row per workout):
   (user_id TEXT, workout_uuid TEXT, workout_type TEXT, start_ts TIMESTAMPTZ, end_ts TIMESTAMPTZ,
    duration_min DOUBLE PRECISION, distance_km DOUBLE PRECISION, energy_kcal DOUBLE PRECISION,
    hk_source_bundle_id TEXT, hk_source_name TEXT, hk_source_version TEXT,
-   hk_device JSONB, hk_metadata JSONB, hk_was_user_entered BOOLEAN,
-   features JSONB, created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ)
+   hk_sources JSONB, hk_metadata JSONB, created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ)
   Notes:
   - This is the preferred table for workout summary queries (one row per workout).
   - workout_uuid is the HealthKit HKWorkout UUID string.
   - HealthKit provenance is stored in the hk_* columns (similar to mirrored raw tables).
-  - features is reserved for optional extra attributes in the future and may be NULL.
+  - hk_sources is a JSONB array like rollups, e.g. [{"name":"Apple Watch","version":"11.6.1"}]. It may be [].
 distance_workout_segments (per-workout distance splits):
   (user_id TEXT, workout_uuid TEXT, workout_start_ts TIMESTAMPTZ, segment_unit TEXT, segment_index INTEGER,
    start_ts TIMESTAMPTZ, end_ts TIMESTAMPTZ, start_offset_min DOUBLE PRECISION, end_offset_min DOUBLE PRECISION,
