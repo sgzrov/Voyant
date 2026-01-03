@@ -623,7 +623,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                 _exec(
                     """
                     INSERT INTO health_rollup_hourly
-                        (user_id, bucket_ts, metric_type, avg_value, sum_value, min_value, max_value, n, hk_source_name, hk_source_version, hk_sources, meta)
+                        (user_id, bucket_ts, metric_type, avg_value, sum_value, min_value, max_value, n, hk_sources, meta)
                     SELECT
                         :user_id AS user_id,
                         date_trunc('hour', timestamp) AS bucket_ts,
@@ -642,14 +642,6 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                         MIN(metric_value) AS min_value,
                         MAX(metric_value) AS max_value,
                         COUNT(*) AS n
-                        , CASE
-                            WHEN COUNT(DISTINCT hk_source_name) = 1 THEN MIN(hk_source_name)
-                            ELSE NULL
-                          END AS hk_source_name
-                        , CASE
-                            WHEN COUNT(DISTINCT hk_source_name) = 1 AND COUNT(DISTINCT hk_source_version) = 1 THEN MIN(hk_source_version)
-                            ELSE NULL
-                          END AS hk_source_version
                         , COALESCE(
                             jsonb_agg(DISTINCT jsonb_build_object('name', hk_source_name, 'version', hk_source_version))
                               FILTER (WHERE hk_source_name IS NOT NULL),
@@ -667,8 +659,6 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                       min_value = EXCLUDED.min_value,
                       max_value = EXCLUDED.max_value,
                       n = EXCLUDED.n,
-                      hk_source_name = EXCLUDED.hk_source_name,
-                      hk_source_version = EXCLUDED.hk_source_version,
                       hk_sources = EXCLUDED.hk_sources,
                       meta = EXCLUDED.meta
                     """,
@@ -683,7 +673,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                 _exec(
                     """
                     INSERT INTO health_rollup_daily
-                        (user_id, bucket_ts, metric_type, avg_value, sum_value, min_value, max_value, n, hk_source_name, hk_source_version, hk_sources, meta)
+                        (user_id, bucket_ts, metric_type, avg_value, sum_value, min_value, max_value, n, hk_sources, meta)
                     SELECT
                         :user_id AS user_id,
                         date_trunc('day', timestamp) AS bucket_ts,
@@ -702,14 +692,6 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                         MIN(metric_value) AS min_value,
                         MAX(metric_value) AS max_value,
                         COUNT(*) AS n
-                        , CASE
-                            WHEN COUNT(DISTINCT hk_source_name) = 1 THEN MIN(hk_source_name)
-                            ELSE NULL
-                          END AS hk_source_name
-                        , CASE
-                            WHEN COUNT(DISTINCT hk_source_name) = 1 AND COUNT(DISTINCT hk_source_version) = 1 THEN MIN(hk_source_version)
-                            ELSE NULL
-                          END AS hk_source_version
                         , COALESCE(
                             jsonb_agg(DISTINCT jsonb_build_object('name', hk_source_name, 'version', hk_source_version))
                               FILTER (WHERE hk_source_name IS NOT NULL),
@@ -727,8 +709,6 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                       min_value = EXCLUDED.min_value,
                       max_value = EXCLUDED.max_value,
                       n = EXCLUDED.n,
-                      hk_source_name = EXCLUDED.hk_source_name,
-                      hk_source_version = EXCLUDED.hk_source_version,
                       hk_sources = EXCLUDED.hk_sources,
                       meta = EXCLUDED.meta
                     """,
