@@ -301,7 +301,9 @@ def _validate_sql_sources(sql: str, allowed_sources: set[str], health_sources: s
     used_health = seen & {s.lower() for s in health_sources}
     # Require that the query references at least one health data source
     if not used_health:
-        raise ValueError("Query must reference a health table (health_rollup_hourly, health_rollup_daily, and/or health_events)")
+        raise ValueError(
+            "Query must reference a health table (health_rollup_hourly, health_rollup_daily, workouts, and/or distance_workout_segments)"
+        )
     return used_health
 
 
@@ -466,6 +468,100 @@ def _rewrite_health_events_to_user_scoped(sql: str) -> str:
         return sql
 
 
+# Replace references to distance_workout_segments with a user-scoped derived table (alias-preserving).
+def _rewrite_distance_workout_segments_to_user_scoped(sql: str) -> str:
+    try:
+        stripped = _strip_sql_strings_and_comments(sql)
+        if not re.search(r"(?is)\b(from|join)\s+distance_workout_segments\b", stripped):
+            return sql
+
+        seg_subquery = (
+            "(SELECT\n"
+            "   *\n"
+            " FROM distance_workout_segments\n"
+            " WHERE user_id = :user_id)"
+        )
+
+        def _rewrite_from(m: re.Match) -> str:
+            alias = m.group("alias")
+            alias_out = alias if alias else "distance_workout_segments"
+            return f"FROM {seg_subquery} AS {alias_out}"
+
+        def _rewrite_join(m: re.Match) -> str:
+            alias = m.group("alias")
+            alias_out = alias if alias else "distance_workout_segments"
+            return f"JOIN {seg_subquery} AS {alias_out}"
+
+        _no_alias_keywords = (
+            r"where|group|order|limit|join|on|inner|left|right|full|cross|union|having|"
+            r"window|offset|fetch|for|into|values|select|from"
+        )
+
+        out = re.sub(
+            rf"(?is)\bfrom\s+distance_workout_segments(?:\s+(?:as\s+)?(?P<alias>(?!({_no_alias_keywords})\b)[a-zA-Z_]\w*))?\b",
+            _rewrite_from,
+            sql,
+        )
+        out = re.sub(
+            rf"(?is)\bjoin\s+distance_workout_segments(?:\s+(?:as\s+)?(?P<alias>(?!({_no_alias_keywords})\b)[a-zA-Z_]\w*))?\b",
+            _rewrite_join,
+            out,
+        )
+        if out != sql:
+            logger.info("sql.rewrite.segments: rewrote distance_workout_segments to user-scoped derived table (alias-preserving)")
+        return out
+    except Exception:
+        logger.exception("sql.rewrite.segments.failed")
+        return sql
+
+
+# Replace references to workouts with a user-scoped derived table (alias-preserving).
+def _rewrite_workouts_to_user_scoped(sql: str) -> str:
+    try:
+        stripped = _strip_sql_strings_and_comments(sql)
+        if not re.search(r"(?is)\b(from|join)\s+workouts\b", stripped):
+            return sql
+
+        w_subquery = (
+            "(SELECT\n"
+            "   *\n"
+            " FROM workouts\n"
+            " WHERE user_id = :user_id)"
+        )
+
+        def _rewrite_from(m: re.Match) -> str:
+            alias = m.group("alias")
+            alias_out = alias if alias else "workouts"
+            return f"FROM {w_subquery} AS {alias_out}"
+
+        def _rewrite_join(m: re.Match) -> str:
+            alias = m.group("alias")
+            alias_out = alias if alias else "workouts"
+            return f"JOIN {w_subquery} AS {alias_out}"
+
+        _no_alias_keywords = (
+            r"where|group|order|limit|join|on|inner|left|right|full|cross|union|having|"
+            r"window|offset|fetch|for|into|values|select|from"
+        )
+
+        out = re.sub(
+            rf"(?is)\bfrom\s+workouts(?:\s+(?:as\s+)?(?P<alias>(?!({_no_alias_keywords})\b)[a-zA-Z_]\w*))?\b",
+            _rewrite_from,
+            sql,
+        )
+        out = re.sub(
+            rf"(?is)\bjoin\s+workouts(?:\s+(?:as\s+)?(?P<alias>(?!({_no_alias_keywords})\b)[a-zA-Z_]\w*))?\b",
+            _rewrite_join,
+            out,
+        )
+        if out != sql:
+            logger.info("sql.rewrite.workouts: rewrote workouts to user-scoped derived table (alias-preserving)")
+        return out
+    except Exception:
+        logger.exception("sql.rewrite.workouts.failed")
+        return sql
+
+
 # Extract a bare SQL statement from LLM output
 def _extract_sql_from_text(text: object) -> str:
     if not isinstance(text, str):
@@ -512,24 +608,29 @@ def _sanitize_sql(sql: str) -> str:
         allowed_sources={
             "health_rollup_hourly",
             "health_rollup_daily",
-            "health_events",
+            "workouts",
+            "distance_workout_segments",
             "generate_series",
             "unnest",
         },
-        health_sources={"health_rollup_hourly", "health_rollup_daily", "health_events"},
+        health_sources={"health_rollup_hourly", "health_rollup_daily", "workouts", "distance_workout_segments"},
     )
 
     # Allow multi-table ONLY for the specific combos:
-    # - health_events (workouts/events)
-    # - health_rollup_hourly or health_rollup_daily (recovery metrics)
     if len(used_health_sources) > 1:
-        if used_health_sources not in (
-            {"health_events", "health_rollup_hourly"},
-            {"health_events", "health_rollup_daily"},
-        ):
+        allowed_combos = (
+            {"workouts", "distance_workout_segments"},
+            {"workouts", "health_rollup_hourly"},
+            {"workouts", "health_rollup_daily"},
+            {"workouts", "distance_workout_segments", "health_rollup_hourly"},
+            {"workouts", "distance_workout_segments", "health_rollup_daily"},
+        )
+        if used_health_sources not in allowed_combos:
             raise ValueError(
-                "Query must use exactly one health table (health_rollup_hourly OR health_rollup_daily OR health_events), "
-                "or the specific combos (health_events + health_rollup_hourly) / (health_events + health_rollup_daily)"
+                "Query must use exactly one health table (health_rollup_hourly OR health_rollup_daily OR workouts OR distance_workout_segments), "
+                "or one of the allowed combos: "
+                "(workouts + distance_workout_segments) / (workouts + health_rollup_hourly) / (workouts + health_rollup_daily) / "
+                "(workouts + distance_workout_segments + health_rollup_hourly) / (workouts + distance_workout_segments + health_rollup_daily)"
             )
 
     # Always rewrite to safe derived tables BEFORE further validation/rewrites:
@@ -541,8 +642,11 @@ def _sanitize_sql(sql: str) -> str:
     if "health_rollup_daily" in used_health_sources:
         s = _rewrite_rollup_daily_to_tz_derived(s)
         stripped = _strip_sql_strings_and_comments(s)
-    if "health_events" in used_health_sources:
-        s = _rewrite_health_events_to_user_scoped(s)
+    if "workouts" in used_health_sources:
+        s = _rewrite_workouts_to_user_scoped(s)
+        stripped = _strip_sql_strings_and_comments(s)
+    if "distance_workout_segments" in used_health_sources:
+        s = _rewrite_distance_workout_segments_to_user_scoped(s)
         stripped = _strip_sql_strings_and_comments(s)
 
     scan = _scan_top_level_sql(stripped)

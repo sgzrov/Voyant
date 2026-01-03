@@ -5,6 +5,8 @@ import logging
 import pandas as pd
 import base64
 import json
+from datetime import timedelta
+from bisect import bisect_left
 from sqlalchemy import text
 import time
 import random
@@ -13,6 +15,18 @@ from Backend.database import SessionLocal
 
 
 logger = logging.getLogger(__name__)
+
+# Derived workout context rows written into health_events (Option A: keep only health_events + rollups).
+# These are keyed by hk_uuid "<workoutUUID>|<event_type>" and share the workout timestamp/source.
+_DERIVED_WORKOUT_EVENT_TYPES: tuple[str, ...] = (
+    # Keep only lightweight derived workout flags in health_events.
+    "event_long_run_km",
+    "event_hard_workout",
+)
+
+# Safety cap: prevents pathological workloads (e.g., very long cycling sessions) from producing
+# thousands of segment rows. This is not a "mile 10" hardcode; segments are still generated 1..N.
+_MAX_SEGMENTS_PER_WORKOUT: int = 300
 
 # Parse uploaded CSV bytes into a DataFrame for normalization and bulk inserts
 def _parse_csv_bytes(data: bytes) -> pd.DataFrame:
@@ -319,8 +333,8 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                 if workout_ids_deleted:
                     derived_uuids: list[str] = []
                     for wid in workout_ids_deleted:
-                        derived_uuids.append(f"{wid}|event_long_run_km")
-                        derived_uuids.append(f"{wid}|event_hard_workout")
+                        for et in _DERIVED_WORKOUT_EVENT_TYPES:
+                            derived_uuids.append(f"{wid}|{et}")
                     _exec(
                         """
                         UPDATE health_events
@@ -328,7 +342,24 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                         WHERE user_id = :user_id AND hk_uuid = ANY(:uuids)
                         """,
                         {"user_id": user_id, "uuids": derived_uuids},
-                        "tombstone derived workout flags (deletes)",
+                        "tombstone derived workout events (deletes)",
+                    )
+                    # Remove any precomputed segments for deleted workouts.
+                    _exec(
+                        """
+                        DELETE FROM distance_workout_segments
+                        WHERE user_id = :user_id AND workout_uuid = ANY(:wids)
+                        """,
+                        {"user_id": user_id, "wids": sorted(list(workout_ids_deleted))},
+                        "delete distance_workout_segments (workout deletes)",
+                    )
+                    _exec(
+                        """
+                        DELETE FROM workouts
+                        WHERE user_id = :user_id AND workout_uuid = ANY(:wids)
+                        """,
+                        {"user_id": user_id, "wids": sorted(list(workout_ids_deleted))},
+                        "delete workouts (workout deletes)",
                     )
 
                 # Recompute derived flags for workouts whose base rows were upserted.
@@ -586,6 +617,11 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
 
         session.commit()  # Commit raw writes first so rollup failures never discard ingested data
 
+        # Track metric window (if any) so we can recompute derived workout context for workouts
+        # whose explanations might be affected by newly synced metrics.
+        metrics_t_min = None
+        metrics_t_max = None
+
         # Recompute hourly rollups (best-effort) for the affected time window from health_metrics table
         if not df_metrics.empty:
             t_min = pd.to_datetime(df_metrics["timestamp"].min())
@@ -618,6 +654,8 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                 except Exception:
                     logger.exception("process_csv_upload: failed to widen rollup window from deletes user_id=%s", user_id)
             if pd.notna(t_min) and pd.notna(t_max):
+                metrics_t_min = pd.Timestamp(t_min).to_pydatetime()
+                metrics_t_max = pd.Timestamp(t_max).to_pydatetime()
                 t0 = pd.Timestamp(t_min).floor("H").to_pydatetime()
                 t1 = (pd.Timestamp(t_max).floor("H") + pd.Timedelta(hours = 1)).to_pydatetime()
                 _exec(
@@ -716,5 +754,452 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                     "upsert health_rollup_daily",
                 )
                 session.commit()
+        # --- Derive distance_workout_segments (best-effort).
+        # We persist segments in a dedicated table (not in health_events) to keep the event surface clean.
+        try:
+            target_wids: set[str] = set(workout_ids_upserted)
+            # If metrics were updated, also recompute segments for workouts that overlap the affected window.
+            if metrics_t_min is not None and metrics_t_max is not None:
+                try:
+                    res = session.execute(
+                        text(
+                            """
+                            SELECT hk_uuid
+                            FROM health_events
+                            WHERE user_id = :user_id
+                              AND deleted_at IS NULL
+                              AND event_type = 'workout_duration_min'
+                              AND timestamp >= :t0
+                              AND timestamp < :t1
+                            """
+                        ),
+                        {
+                            "user_id": user_id,
+                            "t0": metrics_t_min,
+                            "t1": metrics_t_max + timedelta(hours=72),
+                        },
+                    ).mappings().all()
+                    for rr in res:
+                        hu = (rr.get("hk_uuid") or "").strip()
+                        if "|" in hu:
+                            wid = hu.split("|", 1)[0].strip()
+                            if wid:
+                                target_wids.add(wid)
+                except Exception:
+                    logger.exception("process_csv_upload: failed to expand workout set from metrics window user_id=%s", user_id)
+
+            if target_wids:
+                wids = sorted([w for w in target_wids if w])
+
+                # Pull base workout rows for these workouts to get timestamp/source/duration/energy.
+                base_uuids: list[str] = []
+                for wid in wids:
+                    base_uuids.extend(
+                        [
+                            f"{wid}|workout_distance_km",
+                            f"{wid}|workout_duration_min",
+                            f"{wid}|workout_energy_kcal",
+                        ]
+                    )
+
+                base_rows = session.execute(
+                    text(
+                        """
+                        SELECT
+                          hk_uuid,
+                          event_type,
+                          value,
+                          source,
+                          timestamp,
+                          end_ts,
+                          hk_source_bundle_id,
+                          hk_source_name,
+                          hk_source_version,
+                          hk_device,
+                          hk_metadata,
+                          hk_was_user_entered
+                        FROM health_events
+                        WHERE user_id = :user_id
+                          AND hk_uuid = ANY(:uuids)
+                          AND deleted_at IS NULL
+                        """
+                    ),
+                    {"user_id": user_id, "uuids": base_uuids},
+                ).mappings().all()
+
+                workouts: dict[str, dict] = {}
+                for r in base_rows:
+                    hk_uuid = (r.get("hk_uuid") or "").strip()
+                    if "|" not in hk_uuid:
+                        continue
+                    wid, _suffix = hk_uuid.split("|", 1)
+                    wid = wid.strip()
+                    if not wid:
+                        continue
+                    w = workouts.setdefault(
+                        wid,
+                        {
+                            "timestamp": None,
+                            "end_ts": None,
+                            "source": None,
+                            "dist_km": None,
+                            "dur_min": None,
+                            "kcal": None,
+                            "hk_source_bundle_id": None,
+                            "hk_source_name": None,
+                            "hk_source_version": None,
+                            "hk_device": None,
+                            "hk_metadata": None,
+                            "hk_was_user_entered": None,
+                        },
+                    )
+                    if w["timestamp"] is None and r.get("timestamp") is not None:
+                        w["timestamp"] = r["timestamp"]
+                    if w["end_ts"] is None and r.get("end_ts") is not None:
+                        w["end_ts"] = r["end_ts"]
+                    if w["source"] is None and r.get("source") is not None:
+                        w["source"] = r["source"]
+                    # Provenance: keep first non-null.
+                    for k in (
+                        "hk_source_bundle_id",
+                        "hk_source_name",
+                        "hk_source_version",
+                        "hk_device",
+                        "hk_metadata",
+                        "hk_was_user_entered",
+                    ):
+                        if w.get(k) is None and r.get(k) is not None:
+                            w[k] = r.get(k)
+                    et = r.get("event_type")
+                    v = r.get("value")
+                    if et == "workout_distance_km" and v is not None:
+                        w["dist_km"] = float(v)
+                    elif et == "workout_duration_min" and v is not None:
+                        w["dur_min"] = float(v)
+                    elif et == "workout_energy_kcal" and v is not None:
+                        w["kcal"] = float(v)
+
+                workouts = {wid: w for wid, w in workouts.items() if w.get("timestamp") is not None}
+                if workouts:
+                    # Normalize workout windows so we can derive splits/segments.
+                    # Prefer explicit workout end_ts; fallback to duration_min when needed.
+                    for _wid, _w in workouts.items():
+                        if _w.get("end_ts") is None:
+                            dur_min = _w.get("dur_min")
+                            if dur_min is not None and _w.get("timestamp") is not None:
+                                try:
+                                    _w["end_ts"] = _w["timestamp"] + timedelta(minutes=float(dur_min))
+                                except Exception:
+                                    _w["end_ts"] = None
+
+                    # Upsert workouts (one row per workout uuid).
+                    # This is the preferred surface for workout summary queries (avoids EAV pivoting).
+                    dw_rows: list[dict] = []
+                    for wid, w in workouts.items():
+                        start_ts = w["timestamp"]
+                        end_ts = w.get("end_ts")
+                        dist_km = w.get("dist_km")
+                        dur_min = w.get("dur_min")
+                        kcal = w.get("kcal")
+                        is_hard = None
+                        try:
+                            is_hard = bool((kcal is not None and float(kcal) >= 800.0) or (dur_min is not None and float(dur_min) >= 60.0))
+                        except Exception:
+                            is_hard = None
+                        is_long = None
+                        try:
+                            is_long = bool(dist_km is not None and float(dist_km) >= 10.0)
+                        except Exception:
+                            is_long = None
+                        dw_rows.append(
+                            {
+                                "user_id": user_id,
+                                "workout_uuid": wid,
+                                "workout_type": w.get("source"),
+                                "start_ts": start_ts,
+                                "end_ts": end_ts,
+                                "duration_min": float(dur_min) if dur_min is not None else None,
+                                "distance_km": float(dist_km) if dist_km is not None else None,
+                                "energy_kcal": float(kcal) if kcal is not None else None,
+                                "is_hard_workout": is_hard,
+                                "is_long_run": is_long,
+                                "features": json.dumps(
+                                    {
+                                        "hk_source_bundle_id": w.get("hk_source_bundle_id"),
+                                        "hk_source_name": w.get("hk_source_name"),
+                                        "hk_source_version": w.get("hk_source_version"),
+                                        "hk_was_user_entered": w.get("hk_was_user_entered"),
+                                        "hk_device": w.get("hk_device"),
+                                        "hk_metadata": w.get("hk_metadata"),
+                                    }
+                                ),
+                            }
+                        )
+                    if dw_rows:
+                        session.execute(
+                            text(
+                                """
+                                INSERT INTO workouts
+                                    (user_id, workout_uuid, workout_type, start_ts, end_ts, duration_min, distance_km, energy_kcal,
+                                     is_hard_workout, is_long_run, features, created_at, updated_at)
+                                VALUES
+                                    (:user_id, :workout_uuid, :workout_type, :start_ts, :end_ts, :duration_min, :distance_km, :energy_kcal,
+                                     :is_hard_workout, :is_long_run, CAST(:features AS jsonb), NOW(), NOW())
+                                ON CONFLICT (user_id, workout_uuid) DO UPDATE
+                                SET
+                                    workout_type = COALESCE(EXCLUDED.workout_type, workouts.workout_type),
+                                    start_ts = EXCLUDED.start_ts,
+                                    end_ts = COALESCE(EXCLUDED.end_ts, workouts.end_ts),
+                                    duration_min = COALESCE(EXCLUDED.duration_min, workouts.duration_min),
+                                    distance_km = COALESCE(EXCLUDED.distance_km, workouts.distance_km),
+                                    energy_kcal = COALESCE(EXCLUDED.energy_kcal, workouts.energy_kcal),
+                                    is_hard_workout = COALESCE(EXCLUDED.is_hard_workout, workouts.is_hard_workout),
+                                    is_long_run = COALESCE(EXCLUDED.is_long_run, workouts.is_long_run),
+                                    features = COALESCE(EXCLUDED.features, workouts.features),
+                                    updated_at = NOW()
+                                """
+                            ),
+                            dw_rows,
+                        )
+
+                    ts_list = [w["timestamp"] for w in workouts.values()]
+                    t_min_w = min(ts_list)
+                    t_max_w = max(ts_list)
+
+                    # --- Raw metrics slab for segment derivation (batch query; then slice per workout).
+                    # We only need a few raw metric types here.
+                    dist_metric_types = ["distance_walking_running_km", "distance_cycling_km", "distance_swimming_km"]
+                    raw_dist_rows = session.execute(
+                        text(
+                            """
+                            SELECT metric_type, timestamp, end_ts, metric_value
+                            FROM health_metrics
+                            WHERE user_id = :user_id
+                              AND deleted_at IS NULL
+                              AND metric_type = ANY(:metric_types)
+                              AND timestamp >= :t0
+                              AND timestamp < :t1
+                            ORDER BY metric_type, timestamp
+                            """
+                        ),
+                        {
+                            "user_id": user_id,
+                            "metric_types": dist_metric_types,
+                            "t0": t_min_w,
+                            "t1": max([w.get("end_ts") or w["timestamp"] for w in workouts.values()]),
+                        },
+                    ).mappings().all()
+
+                    raw_hr_rows = session.execute(
+                        text(
+                            """
+                            SELECT timestamp, metric_value
+                            FROM health_metrics
+                            WHERE user_id = :user_id
+                              AND deleted_at IS NULL
+                              AND metric_type = 'heart_rate'
+                              AND timestamp >= :t0
+                              AND timestamp < :t1
+                            ORDER BY timestamp
+                            """
+                        ),
+                        {
+                            "user_id": user_id,
+                            "t0": t_min_w,
+                            "t1": max([w.get("end_ts") or w["timestamp"] for w in workouts.values()]),
+                        },
+                    ).mappings().all()
+
+                    # Build per-metric arrays for distance.
+                    dist_times: dict[str, list] = {mt: [] for mt in dist_metric_types}
+                    dist_end: dict[str, list] = {mt: [] for mt in dist_metric_types}
+                    dist_vals: dict[str, list[float]] = {mt: [] for mt in dist_metric_types}
+                    for rr in raw_dist_rows:
+                        mt = rr.get("metric_type")
+                        ts = rr.get("timestamp")
+                        v = rr.get("metric_value")
+                        if mt not in dist_times or ts is None or v is None:
+                            continue
+                        dist_times[mt].append(ts)
+                        dist_end[mt].append(rr.get("end_ts"))
+                        dist_vals[mt].append(float(v))
+
+                    hr_times = [rr["timestamp"] for rr in raw_hr_rows if rr.get("timestamp") is not None and rr.get("metric_value") is not None]
+                    hr_vals = [float(rr["metric_value"]) for rr in raw_hr_rows if rr.get("timestamp") is not None and rr.get("metric_value") is not None]
+
+                    def _slice_dist(metric_type: str, start_ts, end_ts):
+                        ts = dist_times.get(metric_type) or []
+                        if not ts:
+                            return []
+                        lo = bisect_left(ts, start_ts)
+                        hi = bisect_left(ts, end_ts)
+                        out = []
+                        for i in range(lo, hi):
+                            out.append((ts[i], dist_end[metric_type][i], dist_vals[metric_type][i]))
+                        return out
+
+                    def _slice_hr(start_ts, end_ts):
+                        if not hr_times:
+                            return ([], [])
+                        lo = bisect_left(hr_times, start_ts)
+                        hi = bisect_left(hr_times, end_ts)
+                        return (hr_times[lo:hi], hr_vals[lo:hi])
+
+                    def _compute_segments(*, dist_samples, workout_start, seg_len_km: float):
+                        """
+                        Convert distance samples into contiguous segment time windows by assuming uniform speed
+                        within each sample interval (when end_ts exists), and instantaneous distance otherwise.
+                        Returns list of (segment_index_1based, seg_start_ts, seg_end_ts, distance_km).
+                        Only returns FULL segments of length seg_len_km.
+                        """
+                        if seg_len_km <= 0:
+                            return []
+                        # Find a reasonable start: first sample timestamp (avoids counting pre-distance idle time).
+                        if not dist_samples:
+                            return []
+                        seg_start = dist_samples[0][0] if dist_samples[0][0] is not None else workout_start
+                        segs = []
+                        carried = 0.0
+                        idx = 1
+                        cur_start = seg_start
+                        for (s, e, dist) in dist_samples:
+                            if s is None:
+                                continue
+                            if dist is None:
+                                continue
+                            d = float(dist)
+                            if d <= 0:
+                                continue
+                            # Interval duration for proportional boundary placement.
+                            if e is None or (hasattr(e, "timestamp") and hasattr(s, "timestamp") and e <= s):
+                                e = s
+                            dt_sec = float((e - s).total_seconds()) if e is not None else 0.0
+                            # Consume this sample's distance into 1..N segments.
+                            while idx <= _MAX_SEGMENTS_PER_WORKOUT and (carried + d) >= seg_len_km:
+                                need = seg_len_km - carried
+                                frac = (need / d) if d > 0 else 0.0
+                                if dt_sec > 0:
+                                    boundary = s + timedelta(seconds=dt_sec * frac)
+                                else:
+                                    boundary = s
+                                segs.append((idx, cur_start, boundary, seg_len_km))
+                                idx += 1
+                                cur_start = boundary
+                                d -= need
+                                carried = 0.0
+                                # Remaining portion of the interval starts at boundary.
+                                s = boundary
+                                if dt_sec > 0:
+                                    dt_sec = float((e - s).total_seconds()) if e is not None else 0.0
+                            carried += d
+                            if idx > _MAX_SEGMENTS_PER_WORKOUT:
+                                break
+                        return segs
+
+                    # Replace segments for these workouts (idempotent: delete then insert).
+                    session.execute(
+                        text(
+                            """
+                            DELETE FROM distance_workout_segments
+                            WHERE user_id = :user_id AND workout_uuid = ANY(:wids)
+                            """
+                        ),
+                        {"user_id": user_id, "wids": sorted(list(workouts.keys()))},
+                    )
+
+                    seg_rows: list[dict] = []
+                    for wid, w in workouts.items():
+                        ts0 = w["timestamp"]
+                        end0 = w.get("end_ts") or ts0
+                        # Choose the best distance stream inside the workout window.
+                        candidates = []
+                        for mt in dist_metric_types:
+                            ds = _slice_dist(mt, ts0, end0)
+                            total = sum([float(x[2]) for x in ds]) if ds else 0.0
+                            candidates.append((total, mt, ds))
+                        candidates.sort(key=lambda x: x[0], reverse=True)
+                        best_total, _best_mt, best_ds = candidates[0] if candidates else (0.0, None, [])
+                        if not best_ds or best_total < 1.0:
+                            continue
+
+                        hr_t, hr_v = _slice_hr(ts0, end0)
+
+                        def _avg_hr_in_window(a, b) -> float | None:
+                            if not hr_t:
+                                return None
+                            lo = bisect_left(hr_t, a)
+                            hi = bisect_left(hr_t, b)
+                            if hi <= lo:
+                                return None
+                            xs = hr_v[lo:hi]
+                            return (sum(xs) / len(xs)) if xs else None
+
+                        def _append_seg(*, unit: str, i: int, s, e, unit_km: float) -> None:
+                            dur_min = max(0.0, (e - s).total_seconds() / 60.0)
+                            start_off = max(0.0, (s - ts0).total_seconds() / 60.0)
+                            end_off = max(0.0, (e - ts0).total_seconds() / 60.0)
+                            # pace in seconds per unit (km or mi)
+                            length_units = unit_km if unit == "km" else (unit_km / 1.609344)
+                            pace = (dur_min * 60.0) / length_units if length_units > 0 else None
+                            avg_hr = _avg_hr_in_window(s, e)
+                            seg_rows.append(
+                                {
+                                    "user_id": user_id,
+                                    "workout_uuid": wid,
+                                    "workout_start_ts": ts0,
+                                    "segment_unit": unit,
+                                    "segment_index": int(i),
+                                    "start_ts": s,
+                                    "end_ts": e,
+                                    "start_offset_min": float(start_off),
+                                    "end_offset_min": float(end_off),
+                                    "duration_min": float(dur_min),
+                                    "pace_s_per_unit": float(pace) if pace is not None else None,
+                                    "avg_hr_bpm": float(avg_hr) if avg_hr is not None else None,
+                                }
+                            )
+
+                        # km segments (1.0 km)
+                        for (i, s, e, dkm) in _compute_segments(dist_samples=best_ds, workout_start=ts0, seg_len_km=1.0):
+                            _append_seg(unit="km", i=i, s=s, e=e, unit_km=dkm)
+                        # mile segments (1.0 mi = 1.609344 km)
+                        for (i, s, e, dkm) in _compute_segments(dist_samples=best_ds, workout_start=ts0, seg_len_km=1.609344):
+                            _append_seg(unit="mi", i=i, s=s, e=e, unit_km=dkm)
+
+                    if seg_rows:
+                        session.execute(
+                            text(
+                                """
+                                INSERT INTO distance_workout_segments
+                                    (user_id, workout_uuid, workout_start_ts, segment_unit, segment_index,
+                                     start_ts, end_ts, start_offset_min, end_offset_min, duration_min,
+                                     pace_s_per_unit, avg_hr_bpm, created_at)
+                                VALUES
+                                    (:user_id, :workout_uuid, :workout_start_ts, :segment_unit, :segment_index,
+                                     :start_ts, :end_ts, :start_offset_min, :end_offset_min, :duration_min,
+                                     :pace_s_per_unit, :avg_hr_bpm, NOW())
+                                ON CONFLICT (user_id, workout_uuid, segment_unit, segment_index) DO UPDATE
+                                SET
+                                    workout_start_ts = EXCLUDED.workout_start_ts,
+                                    start_ts = EXCLUDED.start_ts,
+                                    end_ts = EXCLUDED.end_ts,
+                                    start_offset_min = EXCLUDED.start_offset_min,
+                                    end_offset_min = EXCLUDED.end_offset_min,
+                                    duration_min = EXCLUDED.duration_min,
+                                    pace_s_per_unit = EXCLUDED.pace_s_per_unit,
+                                    avg_hr_bpm = EXCLUDED.avg_hr_bpm
+                                """
+                            ),
+                            seg_rows,
+                        )
+
+                session.commit()
+        except Exception:
+            logger.exception("process_csv_upload: derive distance_workout_segments failed user_id=%s", user_id)
+            try:
+                session.rollback()
+            except Exception:
+                logger.exception("process_csv_upload: rollback failed after derive distance_workout_segments user_id=%s", user_id)
+
     logger.info("process_csv_upload: done user_id=%s metrics=%s events=%s", user_id, len(df_metrics), len(df_events))
     return {"inserted": int(len(df_metrics) + len(df_events))}

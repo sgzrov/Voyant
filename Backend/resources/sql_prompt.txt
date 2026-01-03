@@ -1,14 +1,26 @@
 Output ONLY raw SQL code with no explanations, commentary, markdown fences, or prose.
 
 <database_schema>
-health_events (workouts/events):
-  (id, user_id TEXT, timestamp TIMESTAMPTZ, event_type TEXT, value DOUBLE PRECISION, unit TEXT, source TEXT, created_at TIMESTAMPTZ)
+workouts (one row per workout):
+  (user_id TEXT, workout_uuid TEXT, workout_type TEXT, start_ts TIMESTAMPTZ, end_ts TIMESTAMPTZ,
+   duration_min DOUBLE PRECISION, distance_km DOUBLE PRECISION, energy_kcal DOUBLE PRECISION,
+   is_hard_workout BOOLEAN, is_long_run BOOLEAN, features JSONB, created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ)
   Notes:
-  - Workouts are stored in rows with event_type values like "workout_duration_min", "workout_energy_kcal", "workout_distance_km".
-  - For workout_* rows, source is the workout activity label (e.g., running, strength), not just the data source device.
-  - If a workout is considered hard (kcal > 800 or duration > 60 mins), it will be stored as a flag row with event_type "event_hard_workout" and value=1 (same timestamp/source as the workout_* rows).
-  - If a workout is considered long (distance > 10 km), it will be stored in the row with event_type "event_long_run_km".
-  - Do NOT use per-event metadata for filtering. (The backend may localize timestamps for display using HealthKit metadata like HKTimeZone when available.)
+  - This is the preferred table for workout summary queries (one row per workout).
+  - workout_uuid is the HealthKit HKWorkout UUID string.
+  - features may include HealthKit provenance, e.g.:
+    * hk_source_bundle_id, hk_source_name, hk_source_version
+    * hk_was_user_entered
+    * hk_device (JSON)
+    * hk_metadata (JSON)
+distance_workout_segments (per-workout distance splits):
+  (user_id TEXT, workout_uuid TEXT, workout_start_ts TIMESTAMPTZ, segment_unit TEXT, segment_index INTEGER,
+   start_ts TIMESTAMPTZ, end_ts TIMESTAMPTZ, start_offset_min DOUBLE PRECISION, end_offset_min DOUBLE PRECISION,
+   duration_min DOUBLE PRECISION, pace_s_per_unit DOUBLE PRECISION, avg_hr_bpm DOUBLE PRECISION, created_at TIMESTAMPTZ)
+  Notes:
+  - Rows are computed server-side from raw distance samples (distance_walking_running_km / distance_cycling_km / distance_swimming_km)
+    plus heart_rate samples, for each workout_uuid (HKWorkout UUID).
+  - segment_unit is 'km' or 'mi'. segment_index is 1..N based on the workout distance.
 health_rollup_hourly (general health data):
   (user_id TEXT, bucket_ts TIMESTAMPTZ, metric_type TEXT, avg_value DOUBLE PRECISION, sum_value DOUBLE PRECISION, min_value DOUBLE PRECISION, max_value DOUBLE PRECISION, n BIGINT, hk_sources JSONB, meta JSONB)
   EAV model: filter by metric_type (e.g., WHERE metric_type = 'steps'). For continuous metrics read avg_value; for additive metrics read sum_value.
@@ -27,7 +39,7 @@ Continuous metrics (AVG over time): heart_rate, resting_heart_rate, walking_hr_a
 <sql_query_rules>
 - SELECT-only; never modify data.
 - Do NOT use UNION or UNION ALL (complex queries are not allowed).
-- Do NOT use ORDER BY unless absolutely necessary; for "most recent" use MAX(timestamp) instead.
+- Do NOT use ORDER BY unless absolutely necessary; for "most recent" use MAX(start_ts) for workouts.
 - Always filter by user_id = :user_id.
 - Do NOT use health_metrics table. It is not part of the supported SQL tool surface area.
 - Do NOT select columns that do not exist on the chosen table (e.g., do NOT select unit from rollup tables).
@@ -38,11 +50,9 @@ Continuous metrics (AVG over time): heart_rate, resting_heart_rate, walking_hr_a
 
 <table_mapping_rules>
 You can query either ONE or BOTH of the tables together, depending on the question.
-- health_events is for workouts + derived workout events (workout_* and event_*). If you need general health metric data (heart rate, sleep, steps, HRV, etc.), use health_rollup_hourly.
-- For workout questions, include the health_events.source column in SELECT (it is the activity type label).
-- Preferred workout summary shape: one row per workout timestamp (and source) using conditional aggregation, e.g. duration/energy/distance columns.
-- If you mention whether a workout was "hard", you MUST retrieve the event_hard_workout flag row (event_type='event_hard_workout') for that workout timestamp OR compute it from workout_duration_min/workout_energy_kcal. Do NOT guess.
-- If you filter health_events by event_type LIKE 'workout_%', you will exclude derived flags (event_*). If you need a flag, fetch it via a separate subquery or widen the filter.
+- For workout summary questions, prefer workouts (one row per workout).
+- Use distance_workout_segments for within-workout “mile/km X” questions; join to workouts by workout_uuid when you need workout context.
+- If you need general health metric data (heart rate, sleep, steps, HRV, etc.), use health_rollup_hourly.
 - If you need data from both tables, use a CTE to find the relevant workout timestamp first, then query health_rollup_hourly in a post-workout window.
 - If you need to return BOTH workout details and recovery metrics, do it in ONE SELECT using:
   (a) a CTE to find the workout timestamp, and
@@ -51,35 +61,16 @@ You can query either ONE or BOTH of the tables together, depending on the questi
 - If you use CTEs/derived tables, do NOT reference columns that are not selected into them. If you need user_id for joins, either:
   (a) select user_id into the CTE, or
   (b) join/filter with user_id = :user_id (preferred, since user_id is constant).
-- For "most recent workout + recovery", prefer a CTE for MAX(timestamp) and scalar subqueries for recovery metrics (avoids UNION and avoids join-key mistakes):
-  WITH latest AS (SELECT MAX(timestamp) AS t0 FROM health_events WHERE user_id=:user_id AND event_type LIKE 'workout_%' AND timestamp >= now() - INTERVAL '60 days')
-  SELECT
-    (SELECT t0 FROM latest) AS workout_ts,
-    (SELECT MAX(source) FROM health_events WHERE user_id=:user_id AND timestamp=(SELECT t0 FROM latest) AND event_type LIKE 'workout_%') AS workout_type,
-    (SELECT MAX(value) FROM health_events WHERE user_id=:user_id AND timestamp=(SELECT t0 FROM latest) AND event_type='workout_duration_min') AS duration_min,
-    (SELECT MAX(value) FROM health_events WHERE user_id=:user_id AND timestamp=(SELECT t0 FROM latest) AND event_type='workout_energy_kcal') AS energy_kcal,
-    COALESCE((SELECT MAX(value) FROM health_events WHERE user_id=:user_id AND timestamp=(SELECT t0 FROM latest) AND event_type='event_hard_workout'), 0) AS is_hard_workout,
-    (SELECT SUM(sum_value) FROM health_rollup_hourly WHERE user_id=:user_id AND metric_type='sleep_hours' AND bucket_ts >= (SELECT t0 FROM latest) AND bucket_ts < (SELECT t0 FROM latest) + INTERVAL '24 hours') AS sleep_hours_24h,
-    (SELECT SUM(avg_value * n) / NULLIF(SUM(n), 0) FROM health_rollup_hourly WHERE user_id=:user_id AND metric_type='heart_rate' AND bucket_ts >= (SELECT t0 FROM latest) AND bucket_ts < (SELECT t0 FROM latest) + INTERVAL '24 hours') AS avg_hr_24h,
-    (SELECT MAX(max_value) FROM health_rollup_hourly WHERE user_id=:user_id AND metric_type='heart_rate' AND bucket_ts >= (SELECT t0 FROM latest) AND bucket_ts < (SELECT t0 FROM latest) + INTERVAL '24 hours') AS peak_hr_24h,
-    (SELECT avg_value FROM health_rollup_hourly
-      WHERE user_id=:user_id AND metric_type='resting_heart_rate'
-        AND bucket_ts = (SELECT MAX(bucket_ts) FROM health_rollup_hourly WHERE user_id=:user_id AND metric_type='resting_heart_rate' AND bucket_ts <= (SELECT t0 FROM latest))
-    ) AS resting_hr_latest,
-    (SELECT avg_value FROM health_rollup_hourly
-      WHERE user_id=:user_id AND metric_type='hr_variability_sdnn'
-        AND bucket_ts = (SELECT MAX(bucket_ts) FROM health_rollup_hourly WHERE user_id=:user_id AND metric_type='hr_variability_sdnn' AND bucket_ts <= (SELECT t0 FROM latest))
-    ) AS hrv_sdnn_latest;
-- For "most recent" / "latest" workout, do NOT use ORDER BY; use MAX(timestamp) to find the latest workout timestamp, then return the workout_* rows at that timestamp.
+- For "most recent" / "latest" workout, do NOT use ORDER BY; use MAX(start_ts) from workouts.
 </table_mapping_rules>
 
 <date_filtering_rules>
 - ALWAYS include date predicates when the user mentions ANY time period (specific or vague):
-  * For health_events, filter on timestamp. For health_rollup_hourly, filter on bucket_ts.
+  * For workouts, filter on start_ts. For rollups, filter on bucket_ts.
   * Prefer placeholders (must be quoted strings; backend rewrites them): 'today_start'/'today_end', 'yesterday_start'/'yesterday_end'.
     Examples:
-    - timestamp >= 'today_start' AND timestamp < 'today_end'
-    - timestamp >= 'yesterday_start' AND timestamp < 'yesterday_end'
+    - start_ts >= 'today_start' AND start_ts < 'today_end'
+    - start_ts >= 'yesterday_start' AND start_ts < 'yesterday_end'
     - bucket_ts >= 'today_start' AND bucket_ts < 'today_end'
     - bucket_ts >= 'yesterday_start' AND bucket_ts < 'yesterday_end'
   * When filtering for a specific day, ALWAYS use a half-open interval with matching boundaries for the same period. Do NOT mix a start from one period with an end from another (e.g., 'yesterday_start' with 'today_end').
