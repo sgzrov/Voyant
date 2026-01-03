@@ -10,13 +10,14 @@ health_events (workouts/events):
   - If a workout is considered long (distance > 10 km), it will be stored in the row with event_type "event_long_run_km".
   - Do NOT use per-event metadata for filtering. (The backend may localize timestamps for display using HealthKit metadata like HKTimeZone when available.)
 health_rollup_hourly (general health data):
-  (user_id TEXT, bucket_ts TIMESTAMPTZ, metric_type TEXT, avg_value DOUBLE PRECISION, sum_value DOUBLE PRECISION, min_value DOUBLE PRECISION, max_value DOUBLE PRECISION, n BIGINT, hk_source_name TEXT, hk_source_version TEXT, meta JSONB)
+  (user_id TEXT, bucket_ts TIMESTAMPTZ, metric_type TEXT, avg_value DOUBLE PRECISION, sum_value DOUBLE PRECISION, min_value DOUBLE PRECISION, max_value DOUBLE PRECISION, n BIGINT, hk_source_name TEXT, hk_source_version TEXT, hk_sources JSONB, meta JSONB)
   EAV model: filter by metric_type (e.g., WHERE metric_type = 'steps'). For continuous metrics read avg_value; for additive metrics read sum_value.
   meta may include {"tz_name": "...", "utc_offset_min": ...} describing the timezone active when that bucket occurred (used for display). meta may be NULL.
-  hk_source_name is the HealthKit source name (e.g., "Stephan’s Apple Watch", "Health") when all samples in that bucket come from one source; otherwise it may be "mixed" or NULL. When mixed, meta may include {"hk_source_names": [...]}.
-  hk_source_version is the HealthKit source version (e.g., OS/app version) when consistent in-bucket; otherwise it may be "mixed" or NULL. When mixed, meta may include {"hk_source_versions": [...]}.
+  hk_source_name is the HealthKit source name (e.g., "Stephan’s Apple Watch", "Health") when all samples in that bucket come from one source; otherwise it may be NULL.
+  hk_source_version is the HealthKit source version (e.g., OS/app version) when consistent in-bucket; otherwise it may be NULL.
+  hk_sources is a JSONB array describing the contributing sources, e.g. [{"name":"Stephan’s Apple Watch","version":"11.6.1"},{"name":"iPad","version":"26.1"}]. It may be [].
 health_rollup_daily (general health data, daily buckets):
-  (user_id TEXT, bucket_ts TIMESTAMPTZ, metric_type TEXT, avg_value DOUBLE PRECISION, sum_value DOUBLE PRECISION, min_value DOUBLE PRECISION, max_value DOUBLE PRECISION, n BIGINT, hk_source_name TEXT, hk_source_version TEXT, meta JSONB)
+  (user_id TEXT, bucket_ts TIMESTAMPTZ, metric_type TEXT, avg_value DOUBLE PRECISION, sum_value DOUBLE PRECISION, min_value DOUBLE PRECISION, max_value DOUBLE PRECISION, n BIGINT, hk_source_name TEXT, hk_source_version TEXT, hk_sources JSONB, meta JSONB)
   Same conventions as hourly; bucket_ts is day bucket start.
 </database_schema>
 
