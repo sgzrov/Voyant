@@ -117,28 +117,8 @@ struct HealthCSVExporter {
             "hk_source_bundle_id",
             "hk_source_name",
             "hk_source_version",
-            "hk_device",
-            "hk_metadata",
-            "hk_was_user_entered"
+            "hk_metadata"
         ].joined(separator: ",")
-    }
-
-    private static func jsonStringForDevice(_ device: HKDevice?) -> String? {
-        guard let d = device else { return nil }
-        var obj: [String: Any] = [:]
-        if let name = d.name { obj["name"] = name }
-        if let manufacturer = d.manufacturer { obj["manufacturer"] = manufacturer }
-        if let model = d.model { obj["model"] = model }
-        if let hardwareVersion = d.hardwareVersion { obj["hardware_version"] = hardwareVersion }
-        if let softwareVersion = d.softwareVersion { obj["software_version"] = softwareVersion }
-        if let firmwareVersion = d.firmwareVersion { obj["firmware_version"] = firmwareVersion }
-        if let localIdentifier = d.localIdentifier { obj["local_identifier"] = localIdentifier }
-        if let udiDeviceIdentifier = d.udiDeviceIdentifier { obj["udi_device_identifier"] = udiDeviceIdentifier }
-        guard JSONSerialization.isValidJSONObject(obj),
-              let data = try? JSONSerialization.data(withJSONObject: obj, options: []) else {
-            return nil
-        }
-        return String(data: data, encoding: .utf8)
     }
 
     private static func jsonStringForMetadata(_ meta: [String: Any]?) -> String? {
@@ -211,9 +191,7 @@ struct HealthCSVExporter {
         let bundleId = sr.source.bundleIdentifier
         let version = sr.version
 
-        let deviceJson = csvField(jsonStringForDevice(workout.device))
         let metaJson = csvField(jsonStringForMetadata(workout.metadata))
-        let wasUserEntered = (workout.metadata?[HKMetadataKeyWasUserEntered] as? Bool).map { $0 ? "true" : "false" } ?? ""
 
         let workoutUUID = workout.uuid.uuidString
         let endTs = (end != start) ? iso.string(from: end) : ""
@@ -257,9 +235,7 @@ struct HealthCSVExporter {
                 csvField(bundleId),
                 csvField(sourceName),
                 csvField(version),
-                deviceJson,
-                metaJson,
-                wasUserEntered
+                metaJson
             ].joined(separator: ",")
         }
 
@@ -272,7 +248,7 @@ struct HealthCSVExporter {
 
     private static func mirrorRowForSample(userId: String,
                                            sample: HKSample,
-                                           spec: MetricSpec,
+                                                spec: MetricSpec,
                                            createdAt: String,
                                            iso: ISO8601DateFormatter) -> String? {
         let start = sample.startDate
@@ -288,9 +264,7 @@ struct HealthCSVExporter {
         let bundleId = sr.source.bundleIdentifier
         let version = sr.version
 
-        let deviceJson = csvField(jsonStringForDevice(sample.device))
         let metaJson = csvField(jsonStringForMetadata(sample.metadata))
-        let wasUserEntered = (sample.metadata?[HKMetadataKeyWasUserEntered] as? Bool).map { $0 ? "true" : "false" } ?? ""
 
         let hkUUID = sample.uuid.uuidString
 
@@ -346,9 +320,7 @@ struct HealthCSVExporter {
             csvField(bundleId),
             csvField(sourceName),
             csvField(version),
-            deviceJson,
-            metaJson,
-            wasUserEntered
+            metaJson
         ].joined(separator: ",")
         return line
     }
@@ -449,8 +421,8 @@ struct HealthCSVExporter {
     }
 
     static func generateMirrorCSV(for userId: String,
-                                  start: Date,
-                                  end: Date,
+                                   start: Date,
+                                   end: Date,
                                   completion: @escaping (Result<Data, Error>) -> Void) {
         let healthStore = HKHealthStore()
         let createdAt = ISO8601DateFormatter().string(from: Date())

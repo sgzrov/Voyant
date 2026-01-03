@@ -75,7 +75,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
     else:
         df = df[df["timestamp"] >= cutoff_ts]
 
-        # Split event/workout rows for separate health_events table. Remaining rows are raw metrics for health_metrics table
+    # Split event/workout rows for separate health_events table. Remaining rows are raw metrics for health_metrics table
     df_events = df[df["metric_type"].str.startswith(("event_", "workout_"), na = False)].copy()
     df_metrics = df[~df["metric_type"].str.startswith(("event_", "workout_"), na = False)].copy()
 
@@ -184,30 +184,6 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                 df_ev_up["metric_value"] = pd.to_numeric(df_ev_up["metric_value"], errors="coerce")
                 df_ev_up = df_ev_up[pd.notna(df_ev_up["metric_value"])]
 
-            # Optional per-row timezone info from the CSV (used to display historical events in the tz they occurred in)
-            tz_series = df_ev_up["timezone"] if "timezone" in df_ev_up.columns else None
-            off_series = df_ev_up["utc_offset_min"] if "utc_offset_min" in df_ev_up.columns else None
-            ctry_series = df_ev_up["place_country"] if "place_country" in df_ev_up.columns else None
-            region_series = df_ev_up["place_region"] if "place_region" in df_ev_up.columns else None
-            city_series = df_ev_up["place_city"] if "place_city" in df_ev_up.columns else None
-
-            def _meta_json(tz, off, c, r, ci):
-                meta: dict = {}
-                if tz is not None and pd.notna(tz) and str(tz).strip():
-                    meta["tz_name"] = str(tz).strip()
-                if off is not None and pd.notna(off):
-                    meta["utc_offset_min"] = int(float(off))
-                place: dict = {}
-                if c is not None and pd.notna(c) and str(c).strip():
-                    place["country"] = str(c).strip()
-                if r is not None and pd.notna(r) and str(r).strip():
-                    place["region"] = str(r).strip()
-                if ci is not None and pd.notna(ci) and str(ci).strip():
-                    place["city"] = str(ci).strip()
-                if place:
-                    meta["place"] = place
-                return json.dumps(meta) if meta else None
-
             params = []
             if not df_ev_up.empty:
                 def _str_or_none(x):
@@ -247,31 +223,21 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                     val = r.get("metric_value")
                     if ts is None or pd.isna(ts) or etype is None or pd.isna(etype) or val is None or pd.isna(val):
                         continue
-                    meta = _meta_json(
-                        r.get("timezone"),
-                        r.get("utc_offset_min"),
-                        r.get("place_country"),
-                        r.get("place_region"),
-                        r.get("place_city"),
-                    )
                     params.append(
-                        {
-                            "user_id": user_id,
+                {
+                    "user_id": user_id,
                             "hk_uuid": hk_uuid,
-                            "timestamp": _py_dt(ts),
+                    "timestamp": _py_dt(ts),
                             "end_ts": _py_dt_or_none(r.get("end_ts")) if "end_ts" in df_ev_up.columns else None,
                             "event_type": str(etype),
-                            "value": float(val),
+                    "value": float(val),
                             "unit": _str_or_none(r.get("unit")) if "unit" in df_ev_up.columns else None,
                             "source": _str_or_none(r.get("source")) if "source" in df_ev_up.columns else None,
                             "created_at": _py_dt_or_none(r.get("created_at")) if "created_at" in df_ev_up.columns else None,
-                            "meta": meta,
                             "hk_source_bundle_id": _str_or_none(r.get("hk_source_bundle_id")) if "hk_source_bundle_id" in df_ev_up.columns else None,
                             "hk_source_name": _str_or_none(r.get("hk_source_name")) if "hk_source_name" in df_ev_up.columns else None,
                             "hk_source_version": _str_or_none(r.get("hk_source_version")) if "hk_source_version" in df_ev_up.columns else None,
-                            "hk_device": _str_or_none(r.get("hk_device")) if "hk_device" in df_ev_up.columns else None,
                             "hk_metadata": _str_or_none(r.get("hk_metadata")) if "hk_metadata" in df_ev_up.columns else None,
-                            "hk_was_user_entered": _bool_or_none(r.get("hk_was_user_entered")) if "hk_was_user_entered" in df_ev_up.columns else None,
                         }
                     )
 
@@ -279,12 +245,12 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                 _execmany(
                     """
                     INSERT INTO health_events
-                        (user_id, hk_uuid, timestamp, end_ts, event_type, value, unit, source, meta, created_at,
-                         hk_source_bundle_id, hk_source_name, hk_source_version, hk_device, hk_metadata, hk_was_user_entered, deleted_at)
+                        (user_id, hk_uuid, timestamp, end_ts, event_type, value, unit, source, created_at,
+                         hk_source_bundle_id, hk_source_name, hk_source_version, hk_metadata, deleted_at)
                     VALUES
-                        (:user_id, :hk_uuid, :timestamp, :end_ts, :event_type, :value, :unit, :source, CAST(:meta AS jsonb), :created_at,
-                         :hk_source_bundle_id, :hk_source_name, :hk_source_version, CAST(:hk_device AS jsonb), CAST(:hk_metadata AS jsonb), :hk_was_user_entered, NULL)
-                    ON CONFLICT (user_id, hk_uuid, event_type) DO UPDATE
+                        (:user_id, :hk_uuid, :timestamp, :end_ts, :event_type, :value, :unit, :source, :created_at,
+                         :hk_source_bundle_id, :hk_source_name, :hk_source_version, CAST(:hk_metadata AS jsonb), NULL)
+                    ON CONFLICT (user_id, hk_uuid, event_type) WHERE hk_uuid IS NOT NULL DO UPDATE
                     SET
                         timestamp = EXCLUDED.timestamp,
                         end_ts = COALESCE(EXCLUDED.end_ts, health_events.end_ts),
@@ -292,13 +258,10 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                         unit = COALESCE(EXCLUDED.unit, health_events.unit),
                         source = COALESCE(EXCLUDED.source, health_events.source),
                         created_at = COALESCE(EXCLUDED.created_at, health_events.created_at),
-                        meta = COALESCE(EXCLUDED.meta, health_events.meta),
                         hk_source_bundle_id = COALESCE(EXCLUDED.hk_source_bundle_id, health_events.hk_source_bundle_id),
                         hk_source_name = COALESCE(EXCLUDED.hk_source_name, health_events.hk_source_name),
                         hk_source_version = COALESCE(EXCLUDED.hk_source_version, health_events.hk_source_version),
-                        hk_device = COALESCE(EXCLUDED.hk_device, health_events.hk_device),
                         hk_metadata = COALESCE(EXCLUDED.hk_metadata, health_events.hk_metadata),
-                        hk_was_user_entered = COALESCE(EXCLUDED.hk_was_user_entered, health_events.hk_was_user_entered),
                         deleted_at = NULL
                     """,
                     params,
@@ -337,8 +300,8 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                     rows = session.execute(
                         text(
                             """
-                            SELECT hk_uuid, event_type, value, unit, source, timestamp, meta,
-                                   hk_source_bundle_id, hk_source_name, hk_source_version, hk_device, hk_metadata, hk_was_user_entered
+                                SELECT hk_uuid, event_type, value, unit, source, timestamp,
+                                   hk_source_bundle_id, hk_source_name, hk_source_version, hk_metadata
                             FROM health_events
                             WHERE user_id = :user_id
                               AND hk_uuid = ANY(:uuids)
@@ -354,14 +317,11 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                     kcal = 0.0
                     ts0 = None
                     src0 = None
-                    meta0 = None
                     prov = {
                         "hk_source_bundle_id": None,
                         "hk_source_name": None,
                         "hk_source_version": None,
-                        "hk_device": None,
                         "hk_metadata": None,
-                        "hk_was_user_entered": None,
                     }
                     for rr in rows:
                         et = rr.get("event_type")
@@ -376,8 +336,6 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                             ts0 = rr.get("timestamp")
                         if src0 is None:
                             src0 = rr.get("source")
-                        if meta0 is None:
-                            meta0 = rr.get("meta")
                         for k in prov.keys():
                             if prov[k] is None and rr.get(k) is not None:
                                 prov[k] = rr.get(k)
@@ -386,32 +344,27 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                         continue
 
                     def _upsert_flag(*, hk_uuid: str, event_type: str, value: float, unit: str) -> None:
-                        hk_device = prov.get("hk_device")
                         hk_metadata = prov.get("hk_metadata")
-                        hk_device_json = json.dumps(hk_device) if isinstance(hk_device, dict) else hk_device
                         hk_metadata_json = json.dumps(hk_metadata) if isinstance(hk_metadata, dict) else hk_metadata
                         session.execute(
                             text(
                                 """
                                 INSERT INTO health_events
-                                    (user_id, hk_uuid, timestamp, end_ts, event_type, value, unit, source, meta, created_at,
-                                     hk_source_bundle_id, hk_source_name, hk_source_version, hk_device, hk_metadata, hk_was_user_entered, deleted_at)
+                                    (user_id, hk_uuid, timestamp, end_ts, event_type, value, unit, source, created_at,
+                                     hk_source_bundle_id, hk_source_name, hk_source_version, hk_metadata, deleted_at)
                                 VALUES
-                                    (:user_id, :hk_uuid, :timestamp, NULL, :event_type, :value, :unit, :source, CAST(:meta AS jsonb), NOW(),
-                                     :hk_source_bundle_id, :hk_source_name, :hk_source_version, CAST(:hk_device AS jsonb), CAST(:hk_metadata AS jsonb), :hk_was_user_entered, NULL)
-                                ON CONFLICT (user_id, hk_uuid, event_type) DO UPDATE
+                                    (:user_id, :hk_uuid, :timestamp, NULL, :event_type, :value, :unit, :source, NOW(),
+                                     :hk_source_bundle_id, :hk_source_name, :hk_source_version, CAST(:hk_metadata AS jsonb), NULL)
+                                ON CONFLICT (user_id, hk_uuid, event_type) WHERE hk_uuid IS NOT NULL DO UPDATE
                                 SET
                                     timestamp = EXCLUDED.timestamp,
                                     value = EXCLUDED.value,
                                     unit = EXCLUDED.unit,
                                     source = COALESCE(EXCLUDED.source, health_events.source),
-                                    meta = COALESCE(EXCLUDED.meta, health_events.meta),
                                     hk_source_bundle_id = COALESCE(EXCLUDED.hk_source_bundle_id, health_events.hk_source_bundle_id),
                                     hk_source_name = COALESCE(EXCLUDED.hk_source_name, health_events.hk_source_name),
                                     hk_source_version = COALESCE(EXCLUDED.hk_source_version, health_events.hk_source_version),
-                                    hk_device = COALESCE(EXCLUDED.hk_device, health_events.hk_device),
                                     hk_metadata = COALESCE(EXCLUDED.hk_metadata, health_events.hk_metadata),
-                                    hk_was_user_entered = COALESCE(EXCLUDED.hk_was_user_entered, health_events.hk_was_user_entered),
                                     deleted_at = NULL
                                 """
                             ),
@@ -423,13 +376,10 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                                 "value": float(value),
                                 "unit": unit,
                                 "source": src0,
-                                "meta": json.dumps(meta0) if isinstance(meta0, dict) else None,
                                 "hk_source_bundle_id": prov["hk_source_bundle_id"],
                                 "hk_source_name": prov["hk_source_name"],
                                 "hk_source_version": prov["hk_source_version"],
-                                "hk_device": hk_device_json,
                                 "hk_metadata": hk_metadata_json,
-                                "hk_was_user_entered": prov["hk_was_user_entered"],
                             },
                         )
 
@@ -550,22 +500,19 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                     )
 
                     base = {
-                        "user_id": user_id,
-                        "timestamp": _py_dt(ts),
+                    "user_id": user_id,
+                    "timestamp": _py_dt(ts),
                         "end_ts": _py_dt_or_none(r.get("end_ts")) if "end_ts" in df_up.columns else None,
                         "metric_type": str(mtype),
-                        "metric_value": float(val),
+                    "metric_value": float(val),
                         "unit": _str_or_none(r.get("unit")) if "unit" in df_up.columns else None,
-                        "source": _str_or_none(r.get("source")) if "source" in df_up.columns else None,
                         "created_at": _py_dt_or_none(r.get("created_at")) if "created_at" in df_up.columns else None,
-                        "meta": meta,
+                    "meta": meta,
                         "hk_uuid": _str_or_none(r.get("hk_uuid")) if "hk_uuid" in df_up.columns else None,
                         "hk_source_bundle_id": _str_or_none(r.get("hk_source_bundle_id")) if "hk_source_bundle_id" in df_up.columns else None,
                         "hk_source_name": _str_or_none(r.get("hk_source_name")) if "hk_source_name" in df_up.columns else None,
                         "hk_source_version": _str_or_none(r.get("hk_source_version")) if "hk_source_version" in df_up.columns else None,
-                        "hk_device": _str_or_none(r.get("hk_device")) if "hk_device" in df_up.columns else None,
                         "hk_metadata": _str_or_none(r.get("hk_metadata")) if "hk_metadata" in df_up.columns else None,
-                        "hk_was_user_entered": _bool_or_none(r.get("hk_was_user_entered")) if "hk_was_user_entered" in df_up.columns else None,
                     }
 
                     if base["hk_uuid"]:
@@ -578,27 +525,24 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                 _execmany(
                     """
                     INSERT INTO health_metrics
-                        (user_id, hk_uuid, timestamp, end_ts, metric_type, metric_value, unit, source, created_at, meta,
-                         hk_source_bundle_id, hk_source_name, hk_source_version, hk_device, hk_metadata, hk_was_user_entered, deleted_at)
+                        (user_id, hk_uuid, timestamp, end_ts, metric_type, metric_value, unit, created_at, meta,
+                         hk_source_bundle_id, hk_source_name, hk_source_version, hk_metadata, deleted_at)
                     VALUES
-                        (:user_id, :hk_uuid, :timestamp, :end_ts, :metric_type, :metric_value, :unit, :source, :created_at, CAST(:meta AS jsonb),
-                         :hk_source_bundle_id, :hk_source_name, :hk_source_version, CAST(:hk_device AS jsonb), CAST(:hk_metadata AS jsonb), :hk_was_user_entered, NULL)
-                    ON CONFLICT (user_id, hk_uuid) DO UPDATE
+                        (:user_id, :hk_uuid, :timestamp, :end_ts, :metric_type, :metric_value, :unit, :created_at, CAST(:meta AS jsonb),
+                         :hk_source_bundle_id, :hk_source_name, :hk_source_version, CAST(:hk_metadata AS jsonb), NULL)
+                    ON CONFLICT (user_id, hk_uuid) WHERE hk_uuid IS NOT NULL DO UPDATE
                     SET
                         timestamp = EXCLUDED.timestamp,
                         end_ts = COALESCE(EXCLUDED.end_ts, health_metrics.end_ts),
                         metric_type = EXCLUDED.metric_type,
                         metric_value = EXCLUDED.metric_value,
                         unit = COALESCE(EXCLUDED.unit, health_metrics.unit),
-                        source = COALESCE(EXCLUDED.source, health_metrics.source),
                         created_at = COALESCE(EXCLUDED.created_at, health_metrics.created_at),
                         meta = COALESCE(EXCLUDED.meta, health_metrics.meta),
                         hk_source_bundle_id = COALESCE(EXCLUDED.hk_source_bundle_id, health_metrics.hk_source_bundle_id),
                         hk_source_name = COALESCE(EXCLUDED.hk_source_name, health_metrics.hk_source_name),
                         hk_source_version = COALESCE(EXCLUDED.hk_source_version, health_metrics.hk_source_version),
-                        hk_device = COALESCE(EXCLUDED.hk_device, health_metrics.hk_device),
                         hk_metadata = COALESCE(EXCLUDED.hk_metadata, health_metrics.hk_metadata),
-                        hk_was_user_entered = COALESCE(EXCLUDED.hk_was_user_entered, health_metrics.hk_was_user_entered),
                         deleted_at = NULL
                     """,
                     params_m_uuid,
@@ -647,7 +591,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                 _exec(
                     """
                     INSERT INTO health_rollup_hourly
-                        (user_id, bucket_ts, metric_type, avg_value, sum_value, min_value, max_value, n, meta)
+                        (user_id, bucket_ts, metric_type, avg_value, sum_value, min_value, max_value, n, hk_source_name, hk_source_version, meta)
                     SELECT
                         :user_id AS user_id,
                         date_trunc('hour', timestamp) AS bucket_ts,
@@ -666,7 +610,28 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                         MIN(metric_value) AS min_value,
                         MAX(metric_value) AS max_value,
                         COUNT(*) AS n
-                        , (ARRAY_AGG(meta ORDER BY timestamp DESC) FILTER (WHERE meta IS NOT NULL))[1] AS meta
+                        , CASE
+                            WHEN COUNT(DISTINCT hk_source_name) = 1 THEN MIN(hk_source_name)
+                            WHEN COUNT(DISTINCT hk_source_name) > 1 THEN 'mixed'
+                            ELSE NULL
+                          END AS hk_source_name
+                        , CASE
+                            WHEN COUNT(DISTINCT hk_source_version) = 1 THEN MIN(hk_source_version)
+                            WHEN COUNT(DISTINCT hk_source_version) > 1 THEN 'mixed'
+                            ELSE NULL
+                          END AS hk_source_version
+                        , CASE
+                            WHEN COUNT(DISTINCT hk_source_name) > 1 OR COUNT(DISTINCT hk_source_version) > 1 THEN
+                              COALESCE(
+                                (ARRAY_AGG(meta ORDER BY timestamp DESC) FILTER (WHERE meta IS NOT NULL))[1],
+                                '{}'::jsonb
+                              ) || jsonb_build_object(
+                                'hk_source_names', COALESCE(jsonb_agg(DISTINCT hk_source_name) FILTER (WHERE hk_source_name IS NOT NULL), '[]'::jsonb),
+                                'hk_source_versions', COALESCE(jsonb_agg(DISTINCT hk_source_version) FILTER (WHERE hk_source_version IS NOT NULL), '[]'::jsonb)
+                              )
+                            ELSE
+                              (ARRAY_AGG(meta ORDER BY timestamp DESC) FILTER (WHERE meta IS NOT NULL))[1]
+                          END AS meta
                     FROM health_metrics
                     WHERE user_id = :user_id
                       AND deleted_at IS NULL
@@ -678,6 +643,8 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                       min_value = EXCLUDED.min_value,
                       max_value = EXCLUDED.max_value,
                       n = EXCLUDED.n,
+                      hk_source_name = EXCLUDED.hk_source_name,
+                      hk_source_version = EXCLUDED.hk_source_version,
                       meta = COALESCE(EXCLUDED.meta, health_rollup_hourly.meta)
                     """,
                     {"user_id": user_id, "t0": t0, "t1": t1},
@@ -691,7 +658,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                 _exec(
                     """
                     INSERT INTO health_rollup_daily
-                        (user_id, bucket_ts, metric_type, avg_value, sum_value, min_value, max_value, n, meta)
+                        (user_id, bucket_ts, metric_type, avg_value, sum_value, min_value, max_value, n, hk_source_name, hk_source_version, meta)
                     SELECT
                         :user_id AS user_id,
                         date_trunc('day', timestamp) AS bucket_ts,
@@ -710,7 +677,28 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                         MIN(metric_value) AS min_value,
                         MAX(metric_value) AS max_value,
                         COUNT(*) AS n
-                        , (ARRAY_AGG(meta ORDER BY timestamp DESC) FILTER (WHERE meta IS NOT NULL))[1] AS meta
+                        , CASE
+                            WHEN COUNT(DISTINCT hk_source_name) = 1 THEN MIN(hk_source_name)
+                            WHEN COUNT(DISTINCT hk_source_name) > 1 THEN 'mixed'
+                            ELSE NULL
+                          END AS hk_source_name
+                        , CASE
+                            WHEN COUNT(DISTINCT hk_source_version) = 1 THEN MIN(hk_source_version)
+                            WHEN COUNT(DISTINCT hk_source_version) > 1 THEN 'mixed'
+                            ELSE NULL
+                          END AS hk_source_version
+                        , CASE
+                            WHEN COUNT(DISTINCT hk_source_name) > 1 OR COUNT(DISTINCT hk_source_version) > 1 THEN
+                              COALESCE(
+                                (ARRAY_AGG(meta ORDER BY timestamp DESC) FILTER (WHERE meta IS NOT NULL))[1],
+                                '{}'::jsonb
+                              ) || jsonb_build_object(
+                                'hk_source_names', COALESCE(jsonb_agg(DISTINCT hk_source_name) FILTER (WHERE hk_source_name IS NOT NULL), '[]'::jsonb),
+                                'hk_source_versions', COALESCE(jsonb_agg(DISTINCT hk_source_version) FILTER (WHERE hk_source_version IS NOT NULL), '[]'::jsonb)
+                              )
+                            ELSE
+                              (ARRAY_AGG(meta ORDER BY timestamp DESC) FILTER (WHERE meta IS NOT NULL))[1]
+                          END AS meta
                     FROM health_metrics
                     WHERE user_id = :user_id
                       AND deleted_at IS NULL
@@ -722,6 +710,8 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                       min_value = EXCLUDED.min_value,
                       max_value = EXCLUDED.max_value,
                       n = EXCLUDED.n,
+                      hk_source_name = EXCLUDED.hk_source_name,
+                      hk_source_version = EXCLUDED.hk_source_version,
                       meta = COALESCE(EXCLUDED.meta, health_rollup_daily.meta)
                     """,
                     {"user_id": user_id, "t0": d0, "t1": d1},

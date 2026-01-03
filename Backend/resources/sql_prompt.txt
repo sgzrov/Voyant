@@ -2,19 +2,21 @@ Output ONLY raw SQL code with no explanations, commentary, markdown fences, or p
 
 <database_schema>
 health_events (workouts/events):
-  (id, user_id TEXT, timestamp TIMESTAMPTZ, event_type TEXT, value DOUBLE PRECISION, unit TEXT, source TEXT, meta JSONB, created_at TIMESTAMPTZ)
+  (id, user_id TEXT, timestamp TIMESTAMPTZ, event_type TEXT, value DOUBLE PRECISION, unit TEXT, source TEXT, created_at TIMESTAMPTZ)
   Notes:
   - Workouts are stored in rows with event_type values like "workout_duration_min", "workout_energy_kcal", "workout_distance_km".
   - For workout_* rows, source is the workout activity label (e.g., running, strength), not just the data source device.
   - If a workout is considered hard (kcal > 800 or duration > 60 mins), it will be stored as a flag row with event_type "event_hard_workout" and value=1 (same timestamp/source as the workout_* rows).
   - If a workout is considered long (distance > 10 km), it will be stored in the row with event_type "event_long_run_km".
-  - meta may include {"tz_name": "...", "utc_offset_min": ...} describing the timezone active when the event occurred (used for display). Do NOT use meta for filtering.
+  - Do NOT use per-event metadata for filtering. (The backend may localize timestamps for display using HealthKit metadata like HKTimeZone when available.)
 health_rollup_hourly (general health data):
-  (user_id TEXT, bucket_ts TIMESTAMPTZ, metric_type TEXT, avg_value DOUBLE PRECISION, sum_value DOUBLE PRECISION, min_value DOUBLE PRECISION, max_value DOUBLE PRECISION, n BIGINT, meta JSONB)
+  (user_id TEXT, bucket_ts TIMESTAMPTZ, metric_type TEXT, avg_value DOUBLE PRECISION, sum_value DOUBLE PRECISION, min_value DOUBLE PRECISION, max_value DOUBLE PRECISION, n BIGINT, hk_source_name TEXT, hk_source_version TEXT, meta JSONB)
   EAV model: filter by metric_type (e.g., WHERE metric_type = 'steps'). For continuous metrics read avg_value; for additive metrics read sum_value.
   meta may include {"tz_name": "...", "utc_offset_min": ...} describing the timezone active when that bucket occurred (used for display). meta may be NULL.
+  hk_source_name is the HealthKit source name (e.g., "Stephan’s Apple Watch", "Health") when all samples in that bucket come from one source; otherwise it may be "mixed" or NULL. When mixed, meta may include {"hk_source_names": [...]}.
+  hk_source_version is the HealthKit source version (e.g., OS/app version) when consistent in-bucket; otherwise it may be "mixed" or NULL. When mixed, meta may include {"hk_source_versions": [...]}.
 health_rollup_daily (general health data, daily buckets):
-  (user_id TEXT, bucket_ts TIMESTAMPTZ, metric_type TEXT, avg_value DOUBLE PRECISION, sum_value DOUBLE PRECISION, min_value DOUBLE PRECISION, max_value DOUBLE PRECISION, n BIGINT, meta JSONB)
+  (user_id TEXT, bucket_ts TIMESTAMPTZ, metric_type TEXT, avg_value DOUBLE PRECISION, sum_value DOUBLE PRECISION, min_value DOUBLE PRECISION, max_value DOUBLE PRECISION, n BIGINT, hk_source_name TEXT, hk_source_version TEXT, meta JSONB)
   Same conventions as hourly; bucket_ts is day bucket start.
 </database_schema>
 
@@ -29,7 +31,7 @@ Continuous metrics (AVG over time): heart_rate, resting_heart_rate, walking_hr_a
 - Do NOT use ORDER BY unless absolutely necessary; for "most recent" use MAX(timestamp) instead.
 - Always filter by user_id = :user_id.
 - Do NOT use health_metrics table. It is not part of the supported SQL tool surface area.
-- Do NOT select columns that do not exist on the chosen table (e.g., do NOT select unit or source from rollup tables).
+- Do NOT select columns that do not exist on the chosen table (e.g., do NOT select unit from rollup tables).
 - Do NOT use AT TIME ZONE in queries; the backend localizes timestamps using :tz_name.
 - Do NOT do timezone formatting in SQL. Select raw TIMESTAMPTZ columns (timestamp, bucket_ts). The backend formats them for display, using per-row meta tz when available.
 - Do NOT introduce custom bind parameters (e.g., :start, :end, :yesterday_start). Only :user_id and :tz_name are allowed. Use plain comparisons; the backend rewrites ranges.

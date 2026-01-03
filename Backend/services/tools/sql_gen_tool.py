@@ -109,7 +109,7 @@ def localize_health_rows(rows: list[dict], tz: str) -> list[dict]:
     for r in rows:
         rr = dict(r)
         # Localize any timestamp-like fields into the user's current timezone for display.
-        # Note: workout timestamps may be further rewritten upstream using per-event timezone in health_events.meta.
+        # Note: workout timestamps may be further rewritten upstream using per-event timezone in health_events.hk_metadata (HKTimeZone).
         for key in ("timestamp", "start_ts", "end_ts", "bucket_ts", "workout_ts", "workout_timestamp"):
             if key in rr and rr[key]:
                 dt = rr[key]
@@ -134,7 +134,7 @@ def localize_health_rows(rows: list[dict], tz: str) -> list[dict]:
 
 
 def _rewrite_event_timestamps_inplace(*, session, user_id: str, rows: list[dict], request_tz: str) -> None:
-    """Rewrite workout/event timestamps to the timezone active when the event occurred (from health_events.meta)."""
+    """Rewrite workout/event timestamps to the timezone active when the event occurred (from health_events.hk_metadata['HKTimeZone'])."""
     candidate_keys = ("workout_ts", "workout_timestamp", "timestamp")
 
     ts_vals = []
@@ -164,7 +164,7 @@ def _rewrite_event_timestamps_inplace(*, session, user_id: str, rows: list[dict]
         meta_row = session.execute(
             text(
                 """
-                SELECT meta
+                SELECT hk_metadata
                 FROM health_events
                 WHERE user_id = :user_id
                   AND timestamp = :ts
@@ -174,10 +174,11 @@ def _rewrite_event_timestamps_inplace(*, session, user_id: str, rows: list[dict]
             ),
             {"user_id": user_id, "ts": dt},
         ).mappings().first()
-        meta = meta_row.get("meta") if meta_row else None
+        meta = meta_row.get("hk_metadata") if meta_row else None
         tzv = None
         if isinstance(meta, dict):
-            tz_raw = meta.get("tz_name") or meta.get("timezone")
+            # HealthKit commonly stores timezone for workouts as HKTimeZone (IANA name).
+            tz_raw = meta.get("HKTimeZone") or meta.get("tz_name") or meta.get("timezone")
             if isinstance(tz_raw, str) and tz_raw.strip():
                 tzv = tz_raw.strip()
         tz_map[dt] = tzv
