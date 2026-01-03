@@ -16,14 +16,6 @@ from Backend.database import SessionLocal
 
 logger = logging.getLogger(__name__)
 
-# Derived workout context rows written into health_events (Option A: keep only health_events + rollups).
-# These are keyed by hk_uuid "<workoutUUID>|<event_type>" and share the workout timestamp/source.
-_DERIVED_WORKOUT_EVENT_TYPES: tuple[str, ...] = (
-    # Keep only lightweight derived workout flags in health_events.
-    "event_long_run_km",
-    "event_hard_workout",
-)
-
 # Safety cap: prevents pathological workloads (e.g., very long cycling sessions) from producing
 # thousands of segment rows. This is not a "mile 10" hardcode; segments are still generated 1..N.
 _MAX_SEGMENTS_PER_WORKOUT: int = 300
@@ -324,164 +316,46 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                     delay=0.2,
                 )
 
-            # Server-side derived workout flags to keep health_events faithful and consistent:
-            # - event_long_run_km: when workout_distance_km >= 10.0
-            # - event_hard_workout: when workout_energy_kcal >= 800 OR workout_duration_min >= 60
-            # Derivations are keyed as hk_uuid "<workoutUUID>|event_*" and are tombstoned when conditions are not met.
-            try:
-                # Tombstone derived flags when any base workout row is deleted.
-                if workout_ids_deleted:
-                    derived_uuids: list[str] = []
-                    for wid in workout_ids_deleted:
-                        for et in _DERIVED_WORKOUT_EVENT_TYPES:
-                            derived_uuids.append(f"{wid}|{et}")
-                    _exec(
-                        """
-                        UPDATE health_events
-                        SET deleted_at = NOW()
-                        WHERE user_id = :user_id AND hk_uuid = ANY(:uuids)
-                        """,
-                        {"user_id": user_id, "uuids": derived_uuids},
-                        "tombstone derived workout events (deletes)",
-                    )
-                    # Remove any precomputed segments for deleted workouts.
-                    _exec(
-                        """
-                        DELETE FROM distance_workout_segments
-                        WHERE user_id = :user_id AND workout_uuid = ANY(:wids)
-                        """,
-                        {"user_id": user_id, "wids": sorted(list(workout_ids_deleted))},
-                        "delete distance_workout_segments (workout deletes)",
-                    )
-                    _exec(
-                        """
-                        DELETE FROM workouts
-                        WHERE user_id = :user_id AND workout_uuid = ANY(:wids)
-                        """,
-                        {"user_id": user_id, "wids": sorted(list(workout_ids_deleted))},
-                        "delete workouts (workout deletes)",
-                    )
-
-                # Recompute derived flags for workouts whose base rows were upserted.
-                for wid in workout_ids_upserted:
-                    base_uuids = [
-                        f"{wid}|workout_distance_km",
-                        f"{wid}|workout_duration_min",
-                        f"{wid}|workout_energy_kcal",
-                    ]
-                    rows = session.execute(
-                        text(
-                            """
-                                SELECT hk_uuid, event_type, value, unit, source, timestamp,
-                                   hk_source_bundle_id, hk_source_name, hk_source_version, hk_metadata
-                            FROM health_events
-                            WHERE user_id = :user_id
-                              AND hk_uuid = ANY(:uuids)
-                              AND deleted_at IS NULL
-                            """
-                        ),
-                        {"user_id": user_id, "uuids": base_uuids},
-                    ).mappings().all()
-
-                    # Default values if some rows missing.
-                    dist_km = 0.0
-                    dur_min = 0.0
-                    kcal = 0.0
-                    ts0 = None
-                    src0 = None
-                    prov = {
-                        "hk_source_bundle_id": None,
-                        "hk_source_name": None,
-                        "hk_source_version": None,
-                        "hk_metadata": None,
-                    }
-                    for rr in rows:
-                        et = rr.get("event_type")
-                        v = rr.get("value")
-                        if et == "workout_distance_km" and v is not None:
-                            dist_km = float(v)
-                        elif et == "workout_duration_min" and v is not None:
-                            dur_min = float(v)
-                        elif et == "workout_energy_kcal" and v is not None:
-                            kcal = float(v)
-                        if ts0 is None:
-                            ts0 = rr.get("timestamp")
-                        if src0 is None:
-                            src0 = rr.get("source")
-                        for k in prov.keys():
-                            if prov[k] is None and rr.get(k) is not None:
-                                prov[k] = rr.get(k)
-
-                    if ts0 is None:
-                        continue
-
-                    def _upsert_flag(*, hk_uuid: str, event_type: str, value: float, unit: str) -> None:
-                        hk_metadata = prov.get("hk_metadata")
-                        hk_metadata_json = json.dumps(hk_metadata) if isinstance(hk_metadata, dict) else hk_metadata
-                        session.execute(
-                            text(
-                                """
-                                INSERT INTO health_events
-                                    (user_id, hk_uuid, timestamp, end_ts, event_type, value, unit, source, created_at,
-                                     hk_source_bundle_id, hk_source_name, hk_source_version, hk_metadata, deleted_at)
-                                VALUES
-                                    (:user_id, :hk_uuid, :timestamp, NULL, :event_type, :value, :unit, :source, NOW(),
-                                     :hk_source_bundle_id, :hk_source_name, :hk_source_version, CAST(:hk_metadata AS jsonb), NULL)
-                                ON CONFLICT (user_id, hk_uuid, event_type) WHERE hk_uuid IS NOT NULL DO UPDATE
-                                SET
-                                    timestamp = EXCLUDED.timestamp,
-                                    value = EXCLUDED.value,
-                                    unit = EXCLUDED.unit,
-                                    source = COALESCE(EXCLUDED.source, health_events.source),
-                                    hk_source_bundle_id = COALESCE(EXCLUDED.hk_source_bundle_id, health_events.hk_source_bundle_id),
-                                    hk_source_name = COALESCE(EXCLUDED.hk_source_name, health_events.hk_source_name),
-                                    hk_source_version = COALESCE(EXCLUDED.hk_source_version, health_events.hk_source_version),
-                                    hk_metadata = COALESCE(EXCLUDED.hk_metadata, health_events.hk_metadata),
-                                    deleted_at = NULL
-                                """
-                            ),
-                            {
-                                "user_id": user_id,
-                                "hk_uuid": hk_uuid,
-                                "timestamp": ts0,
-                                "event_type": event_type,
-                                "value": float(value),
-                                "unit": unit,
-                                "source": src0,
-                                "hk_source_bundle_id": prov["hk_source_bundle_id"],
-                                "hk_source_name": prov["hk_source_name"],
-                                "hk_source_version": prov["hk_source_version"],
-                                "hk_metadata": hk_metadata_json,
-                            },
-                        )
-
-                    def _tombstone_flag(hk_uuid: str, event_type: str) -> None:
-                        session.execute(
-                            text(
-                                """
-                                UPDATE health_events
-                                SET deleted_at = NOW()
-                                WHERE user_id = :user_id AND hk_uuid = :hk_uuid AND event_type = :event_type
-                                """
-                            ),
-                            {"user_id": user_id, "hk_uuid": hk_uuid, "event_type": event_type},
-                        )
-
-                    # Long run flag
-                    hk_long = f"{wid}|event_long_run_km"
-                    if dist_km >= 10.0:
-                        _upsert_flag(hk_uuid=hk_long, event_type="event_long_run_km", value=dist_km, unit="km")
-                    else:
-                        _tombstone_flag(hk_long, "event_long_run_km")
-
-                    # Hard workout flag
-                    hk_hard = f"{wid}|event_hard_workout"
-                    if kcal >= 800.0 or dur_min >= 60.0:
-                        _upsert_flag(hk_uuid=hk_hard, event_type="event_hard_workout", value=1.0, unit="count")
-                    else:
-                        _tombstone_flag(hk_hard, "event_hard_workout")
-            except Exception:
-                logger.exception("process_csv_upload: derived workout flag recompute failed user_id=%s", user_id)
+            # Keep derived workout flags only on `workouts` (not in health_events) to avoid duplication.
+            # Still clean up derived tables on workout deletes (best-effort).
+            if workout_ids_deleted:
+                # Remove any precomputed segments and workout rows for deleted workouts.
+                _exec(
+                    """
+                    DELETE FROM distance_workout_segments
+                    WHERE user_id = :user_id AND workout_uuid = ANY(:wids)
+                    """,
+                    {"user_id": user_id, "wids": sorted(list(workout_ids_deleted))},
+                    "delete distance_workout_segments (workout deletes)",
+                )
+                _exec(
+                    """
+                    DELETE FROM workouts
+                    WHERE user_id = :user_id AND workout_uuid = ANY(:wids)
+                    """,
+                    {"user_id": user_id, "wids": sorted(list(workout_ids_deleted))},
+                    "delete workouts (workout deletes)",
+                )
+                # Tombstone any legacy derived rows that may exist from older versions.
+                _exec(
+                    """
+                    UPDATE health_events
+                    SET deleted_at = NOW()
+                    WHERE user_id = :user_id
+                      AND deleted_at IS NULL
+                      AND hk_uuid = ANY(:uuids)
+                    """,
+                    {
+                        "user_id": user_id,
+                        "uuids": [
+                            f"{wid}|event_hard_workout" for wid in workout_ids_deleted
+                        ]
+                        + [
+                            f"{wid}|event_long_run_km" for wid in workout_ids_deleted
+                        ],
+                    },
+                    "tombstone legacy derived workout flags (deletes)",
+                )
 
         # Write to health_metrics table (HealthKit mirror-aware: raw samples + tombstone deletes)
         deleted_uuids: list[str] = []
@@ -802,22 +676,40 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                         ]
                     )
 
+                # Some environments may not have all provenance columns on health_events (e.g. hk_device dropped).
+                # Derivation should still work; we only select columns that exist.
+                try:
+                    cols = session.execute(
+                        text(
+                            """
+                            SELECT column_name
+                            FROM information_schema.columns
+                            WHERE table_schema = 'public'
+                              AND table_name = 'health_events'
+                            """
+                        )
+                    ).scalars().all()
+                    he_cols = {str(c) for c in cols}
+                except Exception:
+                    he_cols = set()
+
+                select_cols = ["hk_uuid", "event_type", "value", "source", "timestamp", "end_ts"]
+                for c in (
+                    "hk_source_bundle_id",
+                    "hk_source_name",
+                    "hk_source_version",
+                    "hk_device",
+                    "hk_metadata",
+                    "hk_was_user_entered",
+                ):
+                    if not he_cols or c in he_cols:
+                        select_cols.append(c)
+
                 base_rows = session.execute(
                     text(
-                        """
+                        f"""
                         SELECT
-                          hk_uuid,
-                          event_type,
-                          value,
-                          source,
-                          timestamp,
-                          end_ts,
-                          hk_source_bundle_id,
-                          hk_source_name,
-                          hk_source_version,
-                          hk_device,
-                          hk_metadata,
-                          hk_was_user_entered
+                          {", ".join(select_cols)}
                         FROM health_events
                         WHERE user_id = :user_id
                           AND hk_uuid = ANY(:uuids)
@@ -901,16 +793,6 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                         dist_km = w.get("dist_km")
                         dur_min = w.get("dur_min")
                         kcal = w.get("kcal")
-                        is_hard = None
-                        try:
-                            is_hard = bool((kcal is not None and float(kcal) >= 800.0) or (dur_min is not None and float(dur_min) >= 60.0))
-                        except Exception:
-                            is_hard = None
-                        is_long = None
-                        try:
-                            is_long = bool(dist_km is not None and float(dist_km) >= 10.0)
-                        except Exception:
-                            is_long = None
                         dw_rows.append(
                             {
                                 "user_id": user_id,
@@ -921,18 +803,13 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                                 "duration_min": float(dur_min) if dur_min is not None else None,
                                 "distance_km": float(dist_km) if dist_km is not None else None,
                                 "energy_kcal": float(kcal) if kcal is not None else None,
-                                "is_hard_workout": is_hard,
-                                "is_long_run": is_long,
-                                "features": json.dumps(
-                                    {
-                                        "hk_source_bundle_id": w.get("hk_source_bundle_id"),
-                                        "hk_source_name": w.get("hk_source_name"),
-                                        "hk_source_version": w.get("hk_source_version"),
-                                        "hk_was_user_entered": w.get("hk_was_user_entered"),
-                                        "hk_device": w.get("hk_device"),
-                                        "hk_metadata": w.get("hk_metadata"),
-                                    }
-                                ),
+                                "hk_source_bundle_id": w.get("hk_source_bundle_id"),
+                                "hk_source_name": w.get("hk_source_name"),
+                                "hk_source_version": w.get("hk_source_version"),
+                                "hk_was_user_entered": w.get("hk_was_user_entered"),
+                                "hk_device": json.dumps(w.get("hk_device")) if isinstance(w.get("hk_device"), (dict, list)) else w.get("hk_device"),
+                                "hk_metadata": json.dumps(w.get("hk_metadata")) if isinstance(w.get("hk_metadata"), (dict, list)) else w.get("hk_metadata"),
+                                "features": None,
                             }
                         )
                     if dw_rows:
@@ -941,10 +818,13 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                                 """
                                 INSERT INTO workouts
                                     (user_id, workout_uuid, workout_type, start_ts, end_ts, duration_min, distance_km, energy_kcal,
-                                     is_hard_workout, is_long_run, features, created_at, updated_at)
+                                     hk_source_bundle_id, hk_source_name, hk_source_version, hk_device, hk_metadata, hk_was_user_entered,
+                                     features, created_at, updated_at)
                                 VALUES
                                     (:user_id, :workout_uuid, :workout_type, :start_ts, :end_ts, :duration_min, :distance_km, :energy_kcal,
-                                     :is_hard_workout, :is_long_run, CAST(:features AS jsonb), NOW(), NOW())
+                                     :hk_source_bundle_id, :hk_source_name, :hk_source_version,
+                                     CAST(:hk_device AS jsonb), CAST(:hk_metadata AS jsonb), :hk_was_user_entered,
+                                     CAST(:features AS jsonb), NOW(), NOW())
                                 ON CONFLICT (user_id, workout_uuid) DO UPDATE
                                 SET
                                     workout_type = COALESCE(EXCLUDED.workout_type, workouts.workout_type),
@@ -953,8 +833,12 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                                     duration_min = COALESCE(EXCLUDED.duration_min, workouts.duration_min),
                                     distance_km = COALESCE(EXCLUDED.distance_km, workouts.distance_km),
                                     energy_kcal = COALESCE(EXCLUDED.energy_kcal, workouts.energy_kcal),
-                                    is_hard_workout = COALESCE(EXCLUDED.is_hard_workout, workouts.is_hard_workout),
-                                    is_long_run = COALESCE(EXCLUDED.is_long_run, workouts.is_long_run),
+                                    hk_source_bundle_id = COALESCE(EXCLUDED.hk_source_bundle_id, workouts.hk_source_bundle_id),
+                                    hk_source_name = COALESCE(EXCLUDED.hk_source_name, workouts.hk_source_name),
+                                    hk_source_version = COALESCE(EXCLUDED.hk_source_version, workouts.hk_source_version),
+                                    hk_device = COALESCE(EXCLUDED.hk_device, workouts.hk_device),
+                                    hk_metadata = COALESCE(EXCLUDED.hk_metadata, workouts.hk_metadata),
+                                    hk_was_user_entered = COALESCE(EXCLUDED.hk_was_user_entered, workouts.hk_was_user_entered),
                                     features = COALESCE(EXCLUDED.features, workouts.features),
                                     updated_at = NOW()
                                 """
