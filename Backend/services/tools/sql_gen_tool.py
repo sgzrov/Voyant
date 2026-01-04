@@ -90,6 +90,10 @@ async def execute_sql_gen_tool(*, user_id: str, question: str, tz_name: str) -> 
                     _rewrite_rollup_bucket_ts_inplace(session=session, user_id=user_id, rows=rows, request_tz=tz_name)
                 except Exception:
                     pass
+                try:
+                    _rewrite_sleep_daily_timestamps_inplace(session=session, user_id=user_id, rows=rows, request_tz=tz_name)
+                except Exception:
+                    pass
 
                 if not rows:
                     logger.warning("sql.exec.empty: question='%s'\nsql:\n%s", question, safe_sql)
@@ -499,4 +503,72 @@ def _rewrite_rollup_bucket_ts_inplace(*, session, user_id: str, rows: list[dict]
         rr[bucket_key] = formatted
         if tzv and "bucket_tz" not in rr:
             rr["bucket_tz"] = tzv
+
+
+def _rewrite_sleep_daily_timestamps_inplace(*, session, user_id: str, rows: list[dict], request_tz: str) -> None:
+    """Rewrite derived_sleep_daily timestamps to the timezone active when the sleep was recorded (from row meta tz_name)."""
+
+    candidate_keys = ("sleep_start_ts", "sleep_end_ts")
+    # Collect sleep_date keys we can use to fetch meta tz if the SQL row didn't include meta.
+    sleep_dates: set[object] = set()
+    for rr in rows:
+        sd = rr.get("sleep_date")
+        if sd is not None:
+            sleep_dates.add(sd)
+
+    tz_by_date: dict[object, str | None] = {}
+    if sleep_dates:
+        meta_rows = session.execute(
+            text(
+                """
+                SELECT sleep_date, meta
+                FROM derived_sleep_daily
+                WHERE user_id = :user_id
+                  AND sleep_date = ANY(:sleep_dates)
+                """
+            ),
+            {"user_id": user_id, "sleep_dates": list(sleep_dates)},
+        ).mappings().all()
+        for mr in meta_rows:
+            sd = mr.get("sleep_date")
+            meta = mr.get("meta")
+            tzv = None
+            if isinstance(meta, dict):
+                tz_raw = meta.get("tz_name") or meta.get("timezone")
+                if isinstance(tz_raw, str) and tz_raw.strip():
+                    tzv = tz_raw.strip()
+            if sd is not None:
+                tz_by_date[sd] = tzv
+
+    def _format_dt(dt, tzv: str | None):
+        try:
+            if tzv:
+                return dt.astimezone(ZoneInfo(tzv)).strftime("%Y-%m-%d %I:%M %p"), tzv
+        except Exception:
+            pass
+        try:
+            return dt.astimezone(ZoneInfo(request_tz)).strftime("%Y-%m-%d %I:%M %p"), None
+        except Exception:
+            return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %I:%M %p"), None
+
+    for rr in rows:
+        tzv = None
+        meta = rr.get("meta")
+        if isinstance(meta, dict):
+            tz_raw = meta.get("tz_name") or meta.get("timezone")
+            if isinstance(tz_raw, str) and tz_raw.strip():
+                tzv = tz_raw.strip()
+        if not tzv:
+            sd = rr.get("sleep_date")
+            if sd is not None:
+                tzv = tz_by_date.get(sd)
+
+        for k in candidate_keys:
+            v = rr.get(k)
+            if getattr(v, "tzinfo", None) is None or isinstance(v, str):
+                continue
+            formatted, tz_used = _format_dt(v, tzv)
+            rr[k] = formatted
+            if tz_used and "event_tz" not in rr:
+                rr["event_tz"] = tz_used
 

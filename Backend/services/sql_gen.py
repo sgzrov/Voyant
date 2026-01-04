@@ -514,6 +514,53 @@ def _rewrite_derived_workouts_to_user_scoped(sql: str) -> str:
         return sql
 
 
+# Replace references to derived_sleep_daily with a user-scoped derived table (alias-preserving).
+def _rewrite_derived_sleep_daily_to_user_scoped(sql: str) -> str:
+    try:
+        stripped = _strip_sql_strings_and_comments(sql)
+        if not re.search(r"(?is)\b(from|join)\s+derived_sleep_daily\b", stripped):
+            return sql
+
+        subquery = (
+            "(SELECT\n"
+            "   *\n"
+            " FROM derived_sleep_daily\n"
+            " WHERE user_id = :user_id)"
+        )
+
+        def _rewrite_from(m: re.Match) -> str:
+            alias = m.group("alias")
+            alias_out = alias if alias else "derived_sleep_daily"
+            return f"FROM {subquery} AS {alias_out}"
+
+        def _rewrite_join(m: re.Match) -> str:
+            alias = m.group("alias")
+            alias_out = alias if alias else "derived_sleep_daily"
+            return f"JOIN {subquery} AS {alias_out}"
+
+        _no_alias_keywords = (
+            r"where|group|order|limit|join|on|inner|left|right|full|cross|union|having|"
+            r"window|offset|fetch|for|into|values|select|from"
+        )
+
+        out = re.sub(
+            rf"(?is)\bfrom\s+derived_sleep_daily(?:\s+(?:as\s+)?(?P<alias>(?!({_no_alias_keywords})\b)[a-zA-Z_]\w*))?\b",
+            _rewrite_from,
+            sql,
+        )
+        out = re.sub(
+            rf"(?is)\bjoin\s+derived_sleep_daily(?:\s+(?:as\s+)?(?P<alias>(?!({_no_alias_keywords})\b)[a-zA-Z_]\w*))?\b",
+            _rewrite_join,
+            out,
+        )
+        if out != sql:
+            logger.info("sql.rewrite.sleep_daily: rewrote derived_sleep_daily to user-scoped derived table (alias-preserving)")
+        return out
+    except Exception:
+        logger.exception("sql.rewrite.sleep_daily.failed")
+        return sql
+
+
 # Extract a bare SQL statement from LLM output
 def _extract_sql_from_text(text: object) -> str:
     if not isinstance(text, str):
@@ -560,12 +607,13 @@ def _sanitize_sql(sql: str) -> str:
         allowed_sources={
             "derived_rollup_hourly",
             "derived_rollup_daily",
+            "derived_sleep_daily",
             "derived_workouts",
             "derived_workout_segments",
             "generate_series",
             "unnest",
         },
-        health_sources={"derived_rollup_hourly", "derived_rollup_daily", "derived_workouts", "derived_workout_segments"},
+        health_sources={"derived_rollup_hourly", "derived_rollup_daily", "derived_sleep_daily", "derived_workouts", "derived_workout_segments"},
     )
 
     # Allow multi-table ONLY for the specific combos:
@@ -574,15 +622,17 @@ def _sanitize_sql(sql: str) -> str:
             {"derived_workouts", "derived_workout_segments"},
             {"derived_workouts", "derived_rollup_hourly"},
             {"derived_workouts", "derived_rollup_daily"},
+            {"derived_workouts", "derived_sleep_daily"},
             {"derived_workouts", "derived_workout_segments", "derived_rollup_hourly"},
             {"derived_workouts", "derived_workout_segments", "derived_rollup_daily"},
+            {"derived_workouts", "derived_workout_segments", "derived_sleep_daily"},
         )
         if used_health_sources not in allowed_combos:
             raise ValueError(
-                "Query must use exactly one health table (derived_rollup_hourly OR derived_rollup_daily OR derived_workouts OR derived_workout_segments), "
+                "Query must use exactly one health table (derived_rollup_hourly OR derived_rollup_daily OR derived_sleep_daily OR derived_workouts OR derived_workout_segments), "
                 "or one of the allowed combos: "
-                "(derived_workouts + derived_workout_segments) / (derived_workouts + derived_rollup_hourly) / (derived_workouts + derived_rollup_daily) / "
-                "(derived_workouts + derived_workout_segments + derived_rollup_hourly) / (derived_workouts + derived_workout_segments + derived_rollup_daily)"
+                "(derived_workouts + derived_workout_segments) / (derived_workouts + derived_rollup_hourly) / (derived_workouts + derived_rollup_daily) / (derived_workouts + derived_sleep_daily) / "
+                "(derived_workouts + derived_workout_segments + derived_rollup_hourly) / (derived_workouts + derived_workout_segments + derived_rollup_daily) / (derived_workouts + derived_workout_segments + derived_sleep_daily)"
             )
 
     # Always rewrite to safe derived tables BEFORE further validation/rewrites:
@@ -593,6 +643,9 @@ def _sanitize_sql(sql: str) -> str:
         stripped = _strip_sql_strings_and_comments(s)
     if "derived_rollup_daily" in used_health_sources:
         s = _rewrite_rollup_daily_to_tz_derived(s)
+        stripped = _strip_sql_strings_and_comments(s)
+    if "derived_sleep_daily" in used_health_sources:
+        s = _rewrite_derived_sleep_daily_to_user_scoped(s)
         stripped = _strip_sql_strings_and_comments(s)
     if "derived_workouts" in used_health_sources:
         s = _rewrite_derived_workouts_to_user_scoped(s)

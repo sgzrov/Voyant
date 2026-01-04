@@ -1,8 +1,7 @@
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 
-from Backend.models.chat_data_model import ChatData
-from Backend.models.chat_conversation_model import ChatConversation
+from Backend.models.chat_models import ChatConversation, ChatData
 
 
 # Create a new chat message

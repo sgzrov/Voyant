@@ -547,7 +547,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                             'respiratory_rate','body_temperature'
                         ) THEN metric_value END) AS avg_value,
                         SUM(CASE WHEN metric_type IN (
-                            'steps','active_energy_burned','sleep_hours','active_time_minutes',
+                            'steps','active_energy_burned','active_time_minutes',
                             'distance_walking_running_km','distance_cycling_km','distance_swimming_km',
                             'dietary_water','mindfulness_minutes'
                         ) THEN metric_value END) AS sum_value,
@@ -602,6 +602,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                     WHERE user_id = :user_id
                       AND deleted_at IS NULL
                       AND timestamp >= :t0 AND timestamp < :t1
+                      AND metric_type NOT LIKE 'sleep_%'
                     GROUP BY 1,2,3
                     ON CONFLICT (user_id, metric_type, bucket_ts) DO UPDATE SET
                       avg_value = EXCLUDED.avg_value,
@@ -614,6 +615,20 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                     """,
                     {"user_id": user_id, "t0": t0, "t1": t1},
                     "upsert derived_rollup_hourly",
+                )
+                session.commit()
+
+                # Ensure stale hourly sleep rollup rows are removed (we no longer produce them).
+                _exec(
+                    """
+                    DELETE FROM derived_rollup_hourly
+                    WHERE user_id = :user_id
+                      AND bucket_ts >= date_trunc('hour', :t0)
+                      AND bucket_ts < date_trunc('hour', :t1)
+                      AND metric_type LIKE 'sleep_%'
+                    """,
+                    {"user_id": user_id, "t0": t0, "t1": t1},
+                    "delete derived_rollup_hourly sleep_* (stale cleanup)",
                 )
                 session.commit()
 
@@ -635,7 +650,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                             'respiratory_rate','body_temperature'
                         ) THEN metric_value END) AS avg_value,
                         SUM(CASE WHEN metric_type IN (
-                            'steps','active_energy_burned','sleep_hours','active_time_minutes',
+                            'steps','active_energy_burned','active_time_minutes',
                             'distance_walking_running_km','distance_cycling_km','distance_swimming_km',
                             'dietary_water','mindfulness_minutes'
                         ) THEN metric_value END) AS sum_value,
@@ -690,6 +705,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                     WHERE user_id = :user_id
                       AND deleted_at IS NULL
                       AND timestamp >= :t0 AND timestamp < :t1
+                      AND metric_type NOT LIKE 'sleep_%'
                     GROUP BY 1,2,3
                     ON CONFLICT (user_id, metric_type, bucket_ts) DO UPDATE SET
                       avg_value = EXCLUDED.avg_value,
@@ -704,6 +720,109 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                     "upsert derived_rollup_daily",
                 )
                 session.commit()
+
+                # Ensure stale daily sleep rollup rows are removed (sleep lives in derived_sleep_daily).
+                _exec(
+                    """
+                    DELETE FROM derived_rollup_daily
+                    WHERE user_id = :user_id
+                      AND bucket_ts >= date_trunc('day', :t0)
+                      AND bucket_ts < date_trunc('day', :t1)
+                      AND metric_type LIKE 'sleep_%'
+                    """,
+                    {"user_id": user_id, "t0": d0, "t1": d1},
+                    "delete derived_rollup_daily sleep_* (stale cleanup)",
+                )
+                session.commit()
+
+                # Recompute derived_sleep_daily (best-effort) for the same affected window.
+                # Sleep "day" is labeled like Apple Health: we attribute sleep segments to the next day if they start after ~6pm local.
+                try:
+                    _exec(
+                        """
+                        WITH base AS (
+                          SELECT
+                            user_id,
+                            timestamp,
+                            COALESCE(end_ts, timestamp) AS end_ts,
+                            metric_type,
+                            metric_value,
+                            hk_source_name,
+                            hk_source_version,
+                            meta,
+                            hk_metadata,
+                            COALESCE(
+                              meta->>'tz_name',
+                              hk_metadata->>'HKTimeZone',
+                              hk_metadata->>'tz_name',
+                              hk_metadata->>'timezone',
+                              'UTC'
+                            ) AS tz_name_eff,
+                            ((timestamp AT TIME ZONE COALESCE(
+                              meta->>'tz_name',
+                              hk_metadata->>'HKTimeZone',
+                              hk_metadata->>'tz_name',
+                              hk_metadata->>'timezone',
+                              'UTC'
+                            )) + INTERVAL '6 hours')::date AS sleep_date
+                          FROM main_health_metrics
+                          WHERE user_id = :user_id
+                            AND deleted_at IS NULL
+                            AND metric_type LIKE 'sleep_%'
+                            AND metric_type <> 'sleep_hours'
+                            AND timestamp >= (:t0 - INTERVAL '24 hours')
+                            AND timestamp < (:t1 + INTERVAL '24 hours')
+                        )
+                        INSERT INTO derived_sleep_daily
+                          (user_id, sleep_date, sleep_start_ts, sleep_end_ts,
+                           asleep_minutes, rem_minutes, core_minutes, deep_minutes, awake_minutes, in_bed_minutes, asleep_unspecified_minutes,
+                           hk_sources, meta)
+                        SELECT
+                          :user_id AS user_id,
+                          sleep_date,
+                          MIN(timestamp) AS sleep_start_ts,
+                          MAX(end_ts) AS sleep_end_ts,
+                          SUM(CASE WHEN metric_type IN ('sleep_rem_minutes','sleep_core_minutes','sleep_deep_minutes','sleep_asleep_unspecified_minutes') THEN metric_value END) AS asleep_minutes,
+                          SUM(CASE WHEN metric_type = 'sleep_rem_minutes' THEN metric_value END) AS rem_minutes,
+                          SUM(CASE WHEN metric_type = 'sleep_core_minutes' THEN metric_value END) AS core_minutes,
+                          SUM(CASE WHEN metric_type = 'sleep_deep_minutes' THEN metric_value END) AS deep_minutes,
+                          SUM(CASE WHEN metric_type = 'sleep_awake_minutes' THEN metric_value END) AS awake_minutes,
+                          SUM(CASE WHEN metric_type = 'sleep_in_bed_minutes' THEN metric_value END) AS in_bed_minutes,
+                          SUM(CASE WHEN metric_type = 'sleep_asleep_unspecified_minutes' THEN metric_value END) AS asleep_unspecified_minutes,
+                          COALESCE(
+                            jsonb_agg(DISTINCT jsonb_build_object('name', hk_source_name, 'version', hk_source_version))
+                              FILTER (WHERE hk_source_name IS NOT NULL),
+                            '[]'::jsonb
+                          ) AS hk_sources,
+                          (ARRAY_AGG(
+                            COALESCE(
+                              meta,
+                              NULLIF(jsonb_strip_nulls(jsonb_build_object('tz_name', tz_name_eff)), '{}'::jsonb)
+                            )
+                            ORDER BY timestamp DESC
+                          ) FILTER (WHERE COALESCE(meta, NULLIF(jsonb_strip_nulls(jsonb_build_object('tz_name', tz_name_eff)), '{}'::jsonb)) IS NOT NULL))[1] AS meta
+                        FROM base
+                        GROUP BY sleep_date
+                        ON CONFLICT (user_id, sleep_date) DO UPDATE SET
+                          sleep_start_ts = EXCLUDED.sleep_start_ts,
+                          sleep_end_ts = EXCLUDED.sleep_end_ts,
+                          asleep_minutes = EXCLUDED.asleep_minutes,
+                          rem_minutes = EXCLUDED.rem_minutes,
+                          core_minutes = EXCLUDED.core_minutes,
+                          deep_minutes = EXCLUDED.deep_minutes,
+                          awake_minutes = EXCLUDED.awake_minutes,
+                          in_bed_minutes = EXCLUDED.in_bed_minutes,
+                          asleep_unspecified_minutes = EXCLUDED.asleep_unspecified_minutes,
+                          hk_sources = EXCLUDED.hk_sources,
+                          meta = EXCLUDED.meta
+                        """,
+                        {"user_id": user_id, "t0": d0, "t1": d1},
+                        "upsert derived_sleep_daily",
+                    )
+                    session.commit()
+                except Exception:
+                    # Best-effort: avoid failing the whole ingest if the table isn't migrated yet.
+                    logger.exception("process_csv_upload: failed to upsert derived_sleep_daily user_id=%s", user_id)
         # --- Derive derived_workout_segments (best-effort).
         # We persist segments in a dedicated table (not in main_health_events) to keep the event surface clean.
         try:

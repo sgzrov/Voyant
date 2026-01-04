@@ -1,6 +1,16 @@
 Output ONLY raw SQL code with no explanations, commentary, markdown fences, or prose.
 
 <database_schema>
+derived_sleep_daily (one row per sleep "night"/day, stage breakdown + time range):
+  (user_id TEXT, sleep_date DATE, sleep_start_ts TIMESTAMPTZ, sleep_end_ts TIMESTAMPTZ,
+   asleep_minutes DOUBLE PRECISION, rem_minutes DOUBLE PRECISION, core_minutes DOUBLE PRECISION, deep_minutes DOUBLE PRECISION,
+   awake_minutes DOUBLE PRECISION, in_bed_minutes DOUBLE PRECISION, asleep_unspecified_minutes DOUBLE PRECISION,
+   hk_sources JSONB, meta JSONB)
+  Notes:
+  - sleep_date is labeled like the Apple Health UI: sleep segments that start after ~6pm local time are attributed to the next day.
+  - sleep_start_ts / sleep_end_ts are the overall window for that sleep_date.
+  - Stage columns are in minutes. asleep_minutes = rem_minutes + core_minutes + deep_minutes + asleep_unspecified_minutes.
+  - meta may include {"tz_name": "..."} describing the timezone used to label the sleep_date / window. meta may be NULL.
 derived_workouts (one row per workout):
   (user_id TEXT, workout_uuid TEXT, workout_type TEXT, start_ts TIMESTAMPTZ, end_ts TIMESTAMPTZ,
    duration_min DOUBLE PRECISION, distance_km DOUBLE PRECISION, energy_kcal DOUBLE PRECISION,
@@ -37,7 +47,8 @@ derived_rollup_daily (general health data, daily buckets):
 </database_schema>
 
 <metric_conventions>
-Additive metrics (SUM over time): steps, active_energy_burned, sleep_hours, active_time_minutes, distance_walking_running_km, distance_cycling_km, distance_swimming_km, dietary_water.
+Additive metrics (SUM over time): steps, active_energy_burned, active_time_minutes, distance_walking_running_km, distance_cycling_km, distance_swimming_km, dietary_water.
+Sleep metrics: Use derived_sleep_daily (stage columns are minutes).
 Continuous metrics (AVG over time): heart_rate, resting_heart_rate, walking_hr_avg, hr_variability_sdnn, oxygen_saturation, walking_speed, vo2_max, body_mass, body_mass_index, blood_glucose, blood_pressure_systolic, blood_pressure_diastolic, respiratory_rate, body_temperature.
 </metric_conventions>
 
@@ -59,6 +70,7 @@ You can query either ONE or BOTH of the tables together, depending on the questi
 - For workout summary questions, prefer derived_workouts (one row per workout).
 - Use derived_workout_segments for within-workout “mile/km X” questions; join to derived_workouts by workout_uuid when you need workout context.
 - If you need general health metric data (heart rate, sleep, steps, HRV, etc.), use derived_rollup_hourly.
+- IMPORTANT: Sleep is NOT available in derived_rollup_hourly or derived_rollup_daily. For sleep totals, stages, and time range, use derived_sleep_daily.
 - If you need data from both tables, use a CTE to find the relevant workout timestamp first, then query derived_rollup_hourly in a post-workout window.
 - If you need to return BOTH workout details and recovery metrics, do it in ONE SELECT using:
   (a) a CTE to find the workout timestamp, and

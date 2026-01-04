@@ -246,11 +246,11 @@ struct HealthCSVExporter {
         ]
     }
 
-    private static func mirrorRowForSample(userId: String,
-                                           sample: HKSample,
-                                                spec: MetricSpec,
-                                           createdAt: String,
-                                           iso: ISO8601DateFormatter) -> String? {
+    private static func mirrorRowsForSample(userId: String,
+                                            sample: HKSample,
+                                            spec: MetricSpec,
+                                            createdAt: String,
+                                            iso: ISO8601DateFormatter) -> [String] {
         let start = sample.startDate
         let end = sample.endDate
 
@@ -268,61 +268,188 @@ struct HealthCSVExporter {
 
         let hkUUID = sample.uuid.uuidString
 
-        var value: Double?
-        var unitLabel: String = spec.unitLabel
         var endTs: String = ""
 
         if let qs = sample as? HKQuantitySample, let unit = spec.unit {
-            value = qs.quantity.doubleValue(for: unit)
+            var value = qs.quantity.doubleValue(for: unit)
             // Oxygen saturation is commonly represented as a fraction (0..1). Convert to percentage points (0..100)
             if qs.quantityType.identifier == HKQuantityTypeIdentifier.oxygenSaturation.rawValue {
-                value = (value ?? 0) * 100.0
-                unitLabel = "percent"
+                value = value * 100.0
             }
             if end != start {
                 endTs = iso.string(from: end)
             }
+            guard value.isFinite else { return [] }
+            let line = [
+                userId,
+                iso.string(from: start),
+                spec.name,
+                formatValue(value),
+                (qs.quantityType.identifier == HKQuantityTypeIdentifier.oxygenSaturation.rawValue) ? "percent" : spec.unitLabel,
+                csvField(sourceName),
+                tzName,
+                offsetMin,
+                place.country,
+                place.region,
+                place.city,
+                createdAt,
+                "upsert",
+                hkUUID,
+                endTs,
+                csvField(bundleId),
+                csvField(sourceName),
+                csvField(version),
+                metaJson
+            ].joined(separator: ",")
+            return [line]
         } else if sample is HKCategorySample {
-            // Represent category samples as a duration in the spec's unit.
+            // Represent category samples as a duration. Special-case sleep to emit stage-specific metrics.
             endTs = iso.string(from: end)
             let seconds = max(0, end.timeIntervalSince(start))
-            if unitLabel == "hours" {
-                value = seconds / 3600.0
-            } else if unitLabel == "min" {
-                value = seconds / 60.0
+            let minutes = seconds / 60.0
+            guard minutes.isFinite else { return [] }
+
+            // Sleep stages: emit per-stage minutes (daily rollups can sum these). Also emit sleep_hours as "time asleep"
+            // (excluding awake/inBed) for backward compatibility.
+            if spec.name == "sleep_hours",
+               let cs = sample as? HKCategorySample,
+               cs.categoryType.identifier == HKCategoryTypeIdentifier.sleepAnalysis.rawValue {
+                let stageMetric: String? = {
+                    if #available(iOS 16.0, *) {
+                        switch HKCategoryValueSleepAnalysis(rawValue: cs.value) {
+                        case .asleepREM: return "sleep_rem_minutes"
+                        case .asleepCore: return "sleep_core_minutes"
+                        case .asleepDeep: return "sleep_deep_minutes"
+                        case .awake: return "sleep_awake_minutes"
+                        case .inBed: return "sleep_in_bed_minutes"
+                        case .asleepUnspecified: return "sleep_asleep_unspecified_minutes"
+                        @unknown default: return nil
+                        }
+                    } else {
+                        // Older OS: only coarse values exist; treat "asleep" as unspecified asleep minutes.
+                        switch HKCategoryValueSleepAnalysis(rawValue: cs.value) {
+                        case .asleep: return "sleep_asleep_unspecified_minutes"
+                        case .awake: return "sleep_awake_minutes"
+                        case .inBed: return "sleep_in_bed_minutes"
+                        @unknown default: return nil
+                        }
+                    }
+                }()
+
+                var lines: [String] = []
+
+                if let stageMetric = stageMetric {
+                    let stageLine = [
+                        userId,
+                        iso.string(from: start),
+                        stageMetric,
+                        formatValue(minutes),
+                        "min",
+                        csvField(sourceName),
+                        tzName,
+                        offsetMin,
+                        place.country,
+                        place.region,
+                        place.city,
+                        createdAt,
+                        "upsert",
+                        hkUUID,
+                        endTs,
+                        csvField(bundleId),
+                        csvField(sourceName),
+                        csvField(version),
+                        metaJson
+                    ].joined(separator: ",")
+                    lines.append(stageLine)
+                }
+
+                // Emit total sleep_hours only for asleep stages (exclude awake/inBed).
+                let isAsleep: Bool = {
+                    if #available(iOS 16.0, *) {
+                        switch HKCategoryValueSleepAnalysis(rawValue: cs.value) {
+                        case .asleepREM, .asleepCore, .asleepDeep, .asleepUnspecified: return true
+                        case .awake, .inBed: return false
+                        @unknown default: return false
+                        }
+                    } else {
+                        switch HKCategoryValueSleepAnalysis(rawValue: cs.value) {
+                        case .asleep: return true
+                        case .awake, .inBed: return false
+                        @unknown default: return false
+                        }
+                    }
+                }()
+
+                if isAsleep {
+                    let hours = minutes / 60.0
+                    if hours.isFinite {
+                        let totalLine = [
+                            userId,
+                            iso.string(from: start),
+                            "sleep_hours",
+                            formatValue(hours),
+                            "hours",
+                            csvField(sourceName),
+                            tzName,
+                            offsetMin,
+                            place.country,
+                            place.region,
+                            place.city,
+                            createdAt,
+                            "upsert",
+                            hkUUID,
+                            endTs,
+                            csvField(bundleId),
+                            csvField(sourceName),
+                            csvField(version),
+                            metaJson
+                        ].joined(separator: ",")
+                        lines.append(totalLine)
+                    }
+                }
+
+                return lines
+            }
+
+            // Default category behavior: emit duration in the spec's unit.
+            let value: Double
+            let unitLabel: String
+            if spec.unitLabel == "hours" {
+                value = minutes / 60.0
+                unitLabel = "hours"
+            } else if spec.unitLabel == "min" {
+                value = minutes
+                unitLabel = "min"
             } else {
-                // Fallback: seconds as minutes.
-                value = seconds / 60.0
+                value = minutes
                 unitLabel = "min"
             }
+            guard value.isFinite else { return [] }
+            let line = [
+                userId,
+                iso.string(from: start),
+                spec.name,
+                formatValue(value),
+                unitLabel,
+                csvField(sourceName),
+                tzName,
+                offsetMin,
+                place.country,
+                place.region,
+                place.city,
+                createdAt,
+                "upsert",
+                hkUUID,
+                endTs,
+                csvField(bundleId),
+                csvField(sourceName),
+                csvField(version),
+                metaJson
+            ].joined(separator: ",")
+            return [line]
         } else {
-            return nil
+            return []
         }
-
-        guard let v = value, v.isFinite else { return nil }
-
-        let line = [
-            userId,
-            iso.string(from: start),
-            spec.name,
-            formatValue(v),
-            unitLabel,
-            csvField(sourceName),
-            tzName,
-            offsetMin,
-            place.country,
-            place.region,
-            place.city,
-            createdAt,
-            "upsert",
-            hkUUID,
-            endTs,
-            csvField(bundleId),
-            csvField(sourceName),
-            csvField(version),
-            metaJson
-        ].joined(separator: ",")
-        return line
     }
 
     static func generateMirrorDeltaCSV(for userId: String,
@@ -353,7 +480,7 @@ struct HealthCSVExporter {
                 continue
             }
             guard let spec = specMap[key] else { continue }
-            if let line = mirrorRowForSample(userId: userId, sample: s, spec: spec, createdAt: createdAt, iso: iso) {
+            for line in mirrorRowsForSample(userId: userId, sample: s, spec: spec, createdAt: createdAt, iso: iso) {
                 appendRow(line)
             }
         }
@@ -448,7 +575,7 @@ struct HealthCSVExporter {
                     for s in ss {
                         let key = (s as? HKQuantitySample)?.quantityType.identifier ?? qt.identifier
                         guard let eff = specMap[key] else { continue }
-                        if let line = mirrorRowForSample(userId: userId, sample: s, spec: eff, createdAt: createdAt, iso: iso) {
+                        for line in mirrorRowsForSample(userId: userId, sample: s, spec: eff, createdAt: createdAt, iso: iso) {
                             appendRow(line)
                         }
                     }
@@ -463,7 +590,7 @@ struct HealthCSVExporter {
                     for s in ss {
                         let key = (s as? HKCategorySample)?.categoryType.identifier ?? ct.identifier
                         guard let eff = specMap[key] else { continue }
-                        if let line = mirrorRowForSample(userId: userId, sample: s, spec: eff, createdAt: createdAt, iso: iso) {
+                        for line in mirrorRowsForSample(userId: userId, sample: s, spec: eff, createdAt: createdAt, iso: iso) {
                             appendRow(line)
                         }
                     }

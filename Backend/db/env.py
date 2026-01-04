@@ -19,6 +19,8 @@ except Exception:
     pass
 
 from Backend.database import Base  # type: ignore  # After sys.path adjustment
+# Import all models so Alembic autogenerate can see tables in Base.metadata.
+import Backend.models  # noqa: F401  # side-effect import
 
 # Alembic Config object
 config = context.config
@@ -60,6 +62,8 @@ def run_migrations_offline() -> None:
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
+        compare_type=True,
+        compare_server_default=True,
     )
 
     with context.begin_transaction():
@@ -73,7 +77,12 @@ def run_migrations_online() -> None:
     connectable = create_engine(url, poolclass=pool.NullPool)
 
     with connectable.connect() as connection:
-        context.configure(connection=connection, target_metadata=target_metadata)
+        context.configure(
+            connection=connection,
+            target_metadata=target_metadata,
+            compare_type=True,
+            compare_server_default=True,
+        )
 
         with context.begin_transaction():
             context.run_migrations()

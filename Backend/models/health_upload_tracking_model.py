@@ -2,6 +2,7 @@ from sqlalchemy import Column, DateTime, Integer, String, Text, func
 
 from Backend.database import Base
 
+
 # Stores CSV uploads for tracking/deduplication purposes
 class HealthUploadTracking(Base):
     __tablename__ = "health_upload_tracking"
