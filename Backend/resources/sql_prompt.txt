@@ -4,12 +4,12 @@ Output ONLY raw SQL code with no explanations, commentary, markdown fences, or p
 derived_sleep_daily (one row per sleep "night"/day, stage breakdown + time range):
   (user_id TEXT, sleep_date DATE, sleep_start_ts TIMESTAMPTZ, sleep_end_ts TIMESTAMPTZ,
    asleep_minutes DOUBLE PRECISION, rem_minutes DOUBLE PRECISION, core_minutes DOUBLE PRECISION, deep_minutes DOUBLE PRECISION,
-   awake_minutes DOUBLE PRECISION, in_bed_minutes DOUBLE PRECISION, asleep_unspecified_minutes DOUBLE PRECISION,
+   awake_minutes DOUBLE PRECISION,
    hk_sources JSONB, meta JSONB)
   Notes:
   - sleep_date is labeled like the Apple Health UI: sleep segments that start after ~6pm local time are attributed to the next day.
   - sleep_start_ts / sleep_end_ts are the overall window for that sleep_date.
-  - Stage columns are in minutes. asleep_minutes = rem_minutes + core_minutes + deep_minutes + asleep_unspecified_minutes.
+  - Stage columns are in minutes. asleep_minutes = rem_minutes + core_minutes + deep_minutes + (any unclassified asleep minutes).
   - meta may include {"tz_name": "..."} describing the timezone used to label the sleep_date / window. meta may be NULL.
 derived_workouts (one row per workout):
   (user_id TEXT, workout_uuid TEXT, workout_type TEXT, start_ts TIMESTAMPTZ, end_ts TIMESTAMPTZ,

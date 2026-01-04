@@ -309,8 +309,11 @@ struct HealthCSVExporter {
             let minutes = seconds / 60.0
             guard minutes.isFinite else { return [] }
 
-            // Sleep stages: emit per-stage minutes (daily rollups can sum these). Also emit sleep_hours as "time asleep"
-            // (excluding awake/inBed) for backward compatibility.
+            // Sleep stages: emit per-stage minutes (daily rollups can sum these).
+            //
+            // IMPORTANT: Do NOT also emit a separate `sleep_hours` row for the same HK sample UUID.
+            // The backend uses (user_id, hk_uuid) as an upsert key for main_health_metrics, so emitting
+            // two rows with the same hk_uuid would cause one to overwrite the other (dropping stages).
             if spec.name == "sleep_hours",
                let cs = sample as? HKCategorySample,
                cs.categoryType.identifier == HKCategoryTypeIdentifier.sleepAnalysis.rawValue {
@@ -373,59 +376,6 @@ struct HealthCSVExporter {
                         metaJson
                     ].joined(separator: ",")
                     lines.append(stageLine)
-                }
-
-                // Emit total sleep_hours only for asleep stages (exclude awake/inBed).
-                let isAsleep: Bool = {
-                    if #available(iOS 16.0, *) {
-                        guard let v = HKCategoryValueSleepAnalysis(rawValue: cs.value) else {
-                            return true
-                        }
-                        switch v {
-                        case .asleepREM, .asleepCore, .asleepDeep, .asleepUnspecified: return true
-                        case .asleep: return true
-                        case .awake, .inBed: return false
-                        // Future-proof: default to counting unknown values as asleep so we don't undercount.
-                        @unknown default: return true
-                        }
-                    } else {
-                        guard let v = HKCategoryValueSleepAnalysis(rawValue: cs.value) else {
-                            return true
-                        }
-                        switch v {
-                        case .asleep: return true
-                        case .awake, .inBed: return false
-                        @unknown default: return true
-                        }
-                    }
-                }()
-
-                if isAsleep {
-                    let hours = minutes / 60.0
-                    if hours.isFinite {
-                        let totalLine = [
-                            userId,
-                            iso.string(from: start),
-                            "sleep_hours",
-                            formatValue(hours),
-                            "hours",
-                            csvField(sourceName),
-                            tzName,
-                            offsetMin,
-                            place.country,
-                            place.region,
-                            place.city,
-                            createdAt,
-                            "upsert",
-                            hkUUID,
-                            endTs,
-                            csvField(bundleId),
-                            csvField(sourceName),
-                            csvField(version),
-                            metaJson
-                        ].joined(separator: ",")
-                        lines.append(totalLine)
-                    }
                 }
 
                 return lines

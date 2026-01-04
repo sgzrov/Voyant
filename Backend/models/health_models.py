@@ -144,10 +144,28 @@ class DerivedSleepDaily(Base):
     core_minutes = Column(Float, nullable=True)
     deep_minutes = Column(Float, nullable=True)
     awake_minutes = Column(Float, nullable=True)
-    in_bed_minutes = Column(Float, nullable=True)
-    asleep_unspecified_minutes = Column(Float, nullable=True)
 
     hk_sources = Column(JSONB, nullable=True)
+    meta = Column(JSONB, nullable=True)
+
+
+class DerivedSleepSegment(Base):
+    __tablename__ = "derived_sleep_segments"
+
+    user_id = Column(Text, primary_key=True)
+    hk_uuid = Column(Text, primary_key=True)
+
+    sleep_date = Column(Date, nullable=False, index=True)
+    stage = Column(Text, nullable=False)  # awake|in_bed|rem|core|deep|asleep_unspecified
+
+    segment_start_ts = Column(DateTime(timezone=True), nullable=False, index=True)
+    segment_end_ts = Column(DateTime(timezone=True), nullable=False)
+    minutes = Column(Float, nullable=False)
+
+    hk_source_bundle_id = Column(Text, nullable=True)
+    hk_source_name = Column(Text, nullable=True)
+    hk_source_version = Column(Text, nullable=True)
+    hk_metadata = Column(JSONB, nullable=True)
     meta = Column(JSONB, nullable=True)
 
 
