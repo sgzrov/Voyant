@@ -316,22 +316,34 @@ struct HealthCSVExporter {
                cs.categoryType.identifier == HKCategoryTypeIdentifier.sleepAnalysis.rawValue {
                 let stageMetric: String? = {
                     if #available(iOS 16.0, *) {
-                        switch HKCategoryValueSleepAnalysis(rawValue: cs.value) {
+                        guard let v = HKCategoryValueSleepAnalysis(rawValue: cs.value) else {
+                            // If we can't decode the value, don't drop the sample.
+                            return "sleep_asleep_unspecified_minutes"
+                        }
+                        switch v {
                         case .asleepREM: return "sleep_rem_minutes"
                         case .asleepCore: return "sleep_core_minutes"
                         case .asleepDeep: return "sleep_deep_minutes"
-                        case .awake: return "sleep_awake_minutes"
-                        case .inBed: return "sleep_in_bed_minutes"
-                        case .asleepUnspecified: return "sleep_asleep_unspecified_minutes"
-                        @unknown default: return nil
-                        }
-                    } else {
-                        // Older OS: only coarse values exist; treat "asleep" as unspecified asleep minutes.
-                        switch HKCategoryValueSleepAnalysis(rawValue: cs.value) {
+                        // Some OS versions still surface a coarse "asleep" value.
                         case .asleep: return "sleep_asleep_unspecified_minutes"
                         case .awake: return "sleep_awake_minutes"
                         case .inBed: return "sleep_in_bed_minutes"
-                        @unknown default: return nil
+                        case .asleepUnspecified: return "sleep_asleep_unspecified_minutes"
+                        // Future-proof: if Apple adds new asleep stages/values, don't drop the sample.
+                        // Treat unknowns as "asleep unspecified" so the backend can still compute totals.
+                        @unknown default: return "sleep_asleep_unspecified_minutes"
+                        }
+                    } else {
+                        // Older OS: only coarse values exist; treat "asleep" as unspecified asleep minutes.
+                        guard let v = HKCategoryValueSleepAnalysis(rawValue: cs.value) else {
+                            return "sleep_asleep_unspecified_minutes"
+                        }
+                        switch v {
+                        case .asleep: return "sleep_asleep_unspecified_minutes"
+                        case .awake: return "sleep_awake_minutes"
+                        case .inBed: return "sleep_in_bed_minutes"
+                        // Future-proof: don't drop unknown values.
+                        @unknown default: return "sleep_asleep_unspecified_minutes"
                         }
                     }
                 }()
@@ -366,16 +378,24 @@ struct HealthCSVExporter {
                 // Emit total sleep_hours only for asleep stages (exclude awake/inBed).
                 let isAsleep: Bool = {
                     if #available(iOS 16.0, *) {
-                        switch HKCategoryValueSleepAnalysis(rawValue: cs.value) {
-                        case .asleepREM, .asleepCore, .asleepDeep, .asleepUnspecified: return true
-                        case .awake, .inBed: return false
-                        @unknown default: return false
+                        guard let v = HKCategoryValueSleepAnalysis(rawValue: cs.value) else {
+                            return true
                         }
-                    } else {
-                        switch HKCategoryValueSleepAnalysis(rawValue: cs.value) {
+                        switch v {
+                        case .asleepREM, .asleepCore, .asleepDeep, .asleepUnspecified: return true
                         case .asleep: return true
                         case .awake, .inBed: return false
-                        @unknown default: return false
+                        // Future-proof: default to counting unknown values as asleep so we don't undercount.
+                        @unknown default: return true
+                        }
+                    } else {
+                        guard let v = HKCategoryValueSleepAnalysis(rawValue: cs.value) else {
+                            return true
+                        }
+                        switch v {
+                        case .asleep: return true
+                        case .awake, .inBed: return false
+                        @unknown default: return true
                         }
                     }
                 }()
