@@ -2,7 +2,7 @@ import asyncio
 import logging
 import pathlib
 from datetime import timezone
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from zoneinfo import ZoneInfo
 
 from Backend.database import SessionLocal
@@ -80,6 +80,10 @@ async def execute_sql_gen_tool(*, user_id: str, question: str, tz_name: str) -> 
                 # Post-processing: keep output travel-proof by formatting timestamps in the timezone active when recorded.
                 try:
                     _rewrite_event_timestamps_inplace(session=session, user_id=user_id, rows=rows, request_tz=tz_name)
+                except Exception:
+                    pass
+                try:
+                    _rewrite_workout_timestamps_inplace(session=session, user_id=user_id, rows=rows, request_tz=tz_name)
                 except Exception:
                     pass
                 try:
@@ -206,6 +210,160 @@ def _rewrite_event_timestamps_inplace(*, session, user_id: str, rows: list[dict]
                 if tzv and "event_tz" not in rr:
                     rr["event_tz"] = tzv
                 break
+
+
+def _rewrite_workout_timestamps_inplace(*, session, user_id: str, rows: list[dict], request_tz: str) -> None:
+    """Rewrite derived workout timestamps (start_ts/end_ts/segment timestamps) to the timezone active when recorded.
+
+    - For derived_workouts, timezone comes from derived_workouts.hk_metadata ("HKTimeZone" or injected "tz_name"/"timezone").
+    - For derived_workout_segments, timezone comes from the parent workout (derived_workouts.hk_metadata) via workout_uuid.
+    - Fallback: request_tz.
+    """
+
+    def _tz_from_meta(meta_obj) -> str | None:
+        if isinstance(meta_obj, dict):
+            tz_raw = meta_obj.get("HKTimeZone") or meta_obj.get("tz_name") or meta_obj.get("timezone")
+            if isinstance(tz_raw, str) and tz_raw.strip():
+                return tz_raw.strip()
+        return None
+
+    # Collect workout_uuids and/or candidate workout start_ts values we might use to look up hk_metadata.
+    workout_uuids: set[str] = set()
+    workout_start_ts_vals: set[object] = set()
+    start_ts_vals: set[object] = set()
+
+    for rr in rows:
+        # Heuristic: segment rows have many per-segment columns; their start_ts is not the workout start_ts.
+        is_segment = any(k in rr for k in ("segment_index", "segment_unit", "pace_s_per_unit", "start_offset_min", "end_offset_min"))
+        wid = rr.get("workout_uuid")
+        if isinstance(wid, str) and wid.strip():
+            workout_uuids.add(wid.strip())
+        wst = rr.get("workout_start_ts")
+        if getattr(wst, "tzinfo", None) is not None:
+            workout_start_ts_vals.add(wst)
+        if not is_segment:
+            st = rr.get("start_ts")
+            if getattr(st, "tzinfo", None) is not None:
+                start_ts_vals.add(st)
+
+    # If we already have hk_metadata in-row for workouts, prefer it and avoid DB lookups.
+    uuid_tz: dict[str, str | None] = {}
+    start_tz: dict[object, str | None] = {}
+
+    for rr in rows:
+        meta = rr.get("hk_metadata")
+        tzv = _tz_from_meta(meta)
+        wid = rr.get("workout_uuid")
+        if tzv and isinstance(wid, str) and wid.strip():
+            uuid_tz.setdefault(wid.strip(), tzv)
+        st = rr.get("start_ts")
+        if tzv and getattr(st, "tzinfo", None) is not None:
+            start_tz.setdefault(st, tzv)
+
+    # Look up remaining workout_uuids in derived_workouts.
+    missing_uuids = [u for u in workout_uuids if u not in uuid_tz]
+    if missing_uuids:
+        meta_rows = session.execute(
+            text(
+                """
+                SELECT workout_uuid, hk_metadata
+                FROM derived_workouts
+                WHERE user_id = :user_id
+                  AND workout_uuid IN :uuids
+                """
+            ).bindparams(bindparam("uuids", expanding=True)),
+            {"user_id": user_id, "uuids": missing_uuids},
+        ).mappings().all()
+        for mr in meta_rows:
+            wid = mr.get("workout_uuid")
+            tzv = _tz_from_meta(mr.get("hk_metadata"))
+            if isinstance(wid, str) and wid.strip():
+                uuid_tz.setdefault(wid.strip(), tzv)
+
+    # Look up remaining start_ts values in derived_workouts (covers queries that only returned start_ts).
+    missing_start_ts = [dt for dt in start_ts_vals if dt not in start_tz]
+    if missing_start_ts:
+        meta_rows = session.execute(
+            text(
+                """
+                SELECT start_ts, hk_metadata
+                FROM derived_workouts
+                WHERE user_id = :user_id
+                  AND start_ts IN :start_ts_vals
+                """
+            ).bindparams(bindparam("start_ts_vals", expanding=True)),
+            {"user_id": user_id, "start_ts_vals": missing_start_ts},
+        ).mappings().all()
+        for mr in meta_rows:
+            st = mr.get("start_ts")
+            if getattr(st, "tzinfo", None) is None:
+                continue
+            tzv = _tz_from_meta(mr.get("hk_metadata"))
+            start_tz.setdefault(st, tzv)
+
+    # Look up workout_start_ts values (covers segment-only result sets without workout_uuid).
+    missing_workout_start_ts = [dt for dt in workout_start_ts_vals if dt not in start_tz]
+    if missing_workout_start_ts:
+        meta_rows = session.execute(
+            text(
+                """
+                SELECT start_ts, hk_metadata
+                FROM derived_workouts
+                WHERE user_id = :user_id
+                  AND start_ts IN :start_ts_vals
+                """
+            ).bindparams(bindparam("start_ts_vals", expanding=True)),
+            {"user_id": user_id, "start_ts_vals": missing_workout_start_ts},
+        ).mappings().all()
+        for mr in meta_rows:
+            st = mr.get("start_ts")
+            if getattr(st, "tzinfo", None) is None:
+                continue
+            tzv = _tz_from_meta(mr.get("hk_metadata"))
+            start_tz.setdefault(st, tzv)
+
+    def _format_dt(dt, tzv: str | None):
+        # Prefer per-row timezone when valid; fallback to request_tz.
+        try:
+            if tzv:
+                return dt.astimezone(ZoneInfo(tzv)).strftime("%Y-%m-%d %I:%M %p"), tzv
+        except Exception:
+            pass
+        try:
+            return dt.astimezone(ZoneInfo(request_tz)).strftime("%Y-%m-%d %I:%M %p"), None
+        except Exception:
+            return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %I:%M %p"), None
+
+    # Rewrite timestamps in-place.
+    candidate_ts_keys = ("start_ts", "end_ts", "workout_start_ts")
+    for rr in rows:
+        is_segment = any(k in rr for k in ("segment_index", "segment_unit", "pace_s_per_unit", "start_offset_min", "end_offset_min"))
+        tzv = _tz_from_meta(rr.get("hk_metadata"))
+        if not tzv:
+            wid = rr.get("workout_uuid")
+            if isinstance(wid, str) and wid.strip():
+                tzv = uuid_tz.get(wid.strip())
+        if not tzv:
+            wst = rr.get("workout_start_ts")
+            if getattr(wst, "tzinfo", None) is not None:
+                tzv = start_tz.get(wst)
+        if not tzv and not is_segment:
+            st = rr.get("start_ts")
+            if getattr(st, "tzinfo", None) is not None:
+                tzv = start_tz.get(st)
+
+        for k in candidate_ts_keys:
+            v = rr.get(k)
+            if getattr(v, "tzinfo", None) is None:
+                continue
+            # If already formatted as a string upstream, leave as-is.
+            if isinstance(v, str):
+                continue
+            formatted, tz_used = _format_dt(v, tzv)
+            rr[k] = formatted
+            # Optional: expose tz for the model to mention if helpful
+            if tz_used and "event_tz" not in rr:
+                rr["event_tz"] = tz_used
 
 
 def _rewrite_rollup_bucket_ts_inplace(*, session, user_id: str, rows: list[dict], request_tz: str) -> None:

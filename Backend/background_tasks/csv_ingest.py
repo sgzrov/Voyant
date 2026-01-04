@@ -559,7 +559,45 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                               FILTER (WHERE hk_source_name IS NOT NULL),
                             '[]'::jsonb
                           ) AS hk_sources
-                        , (ARRAY_AGG(meta ORDER BY timestamp DESC) FILTER (WHERE meta IS NOT NULL))[1] AS meta
+                        , (
+                            ARRAY_AGG(
+                              COALESCE(
+                                meta,
+                                NULLIF(
+                                  jsonb_strip_nulls(
+                                    jsonb_build_object(
+                                      'tz_name',
+                                      COALESCE(
+                                        hk_metadata->>'HKTimeZone',
+                                        hk_metadata->>'tz_name',
+                                        hk_metadata->>'timezone'
+                                      )
+                                    )
+                                  ),
+                                  '{}'::jsonb
+                                )
+                              )
+                              ORDER BY timestamp DESC
+                            )
+                            FILTER (
+                              WHERE COALESCE(
+                                meta,
+                                NULLIF(
+                                  jsonb_strip_nulls(
+                                    jsonb_build_object(
+                                      'tz_name',
+                                      COALESCE(
+                                        hk_metadata->>'HKTimeZone',
+                                        hk_metadata->>'tz_name',
+                                        hk_metadata->>'timezone'
+                                      )
+                                    )
+                                  ),
+                                  '{}'::jsonb
+                                )
+                              ) IS NOT NULL
+                            )
+                          )[1] AS meta
                     FROM main_health_metrics
                     WHERE user_id = :user_id
                       AND deleted_at IS NULL
@@ -609,7 +647,45 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                               FILTER (WHERE hk_source_name IS NOT NULL),
                             '[]'::jsonb
                           ) AS hk_sources
-                        , (ARRAY_AGG(meta ORDER BY timestamp DESC) FILTER (WHERE meta IS NOT NULL))[1] AS meta
+                        , (
+                            ARRAY_AGG(
+                              COALESCE(
+                                meta,
+                                NULLIF(
+                                  jsonb_strip_nulls(
+                                    jsonb_build_object(
+                                      'tz_name',
+                                      COALESCE(
+                                        hk_metadata->>'HKTimeZone',
+                                        hk_metadata->>'tz_name',
+                                        hk_metadata->>'timezone'
+                                      )
+                                    )
+                                  ),
+                                  '{}'::jsonb
+                                )
+                              )
+                              ORDER BY timestamp DESC
+                            )
+                            FILTER (
+                              WHERE COALESCE(
+                                meta,
+                                NULLIF(
+                                  jsonb_strip_nulls(
+                                    jsonb_build_object(
+                                      'tz_name',
+                                      COALESCE(
+                                        hk_metadata->>'HKTimeZone',
+                                        hk_metadata->>'tz_name',
+                                        hk_metadata->>'timezone'
+                                      )
+                                    )
+                                  ),
+                                  '{}'::jsonb
+                                )
+                              ) IS NOT NULL
+                            )
+                          )[1] AS meta
                     FROM main_health_metrics
                     WHERE user_id = :user_id
                       AND deleted_at IS NULL

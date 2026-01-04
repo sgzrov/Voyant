@@ -10,7 +10,10 @@ derived_workouts (one row per workout):
   - This is the preferred table for workout summary queries (one row per workout).
   - workout_uuid is the HealthKit HKWorkout UUID string.
   - HealthKit provenance is stored in the hk_* columns (similar to mirrored raw tables).
+  - hk_metadata may include timezone context for when the workout was recorded (e.g., "HKTimeZone" or "tz_name"). It may be NULL.
   - hk_sources is a JSONB array like rollups, e.g. [{"name":"Apple Watch","version":"11.6.1"}]. It may be [].
+  - hk_sources is provenance/context. Only use it when the user asks about device/source. Refer to sources by their "name".
+    Do NOT cite source/software version fields unless the user explicitly asks.
 derived_workout_segments (per-workout distance splits):
   (user_id TEXT, workout_uuid TEXT, workout_start_ts TIMESTAMPTZ, segment_unit TEXT, segment_index INTEGER,
    start_ts TIMESTAMPTZ, end_ts TIMESTAMPTZ, start_offset_min DOUBLE PRECISION, end_offset_min DOUBLE PRECISION,
@@ -23,7 +26,11 @@ derived_rollup_hourly (general health data):
   (user_id TEXT, bucket_ts TIMESTAMPTZ, metric_type TEXT, avg_value DOUBLE PRECISION, sum_value DOUBLE PRECISION, min_value DOUBLE PRECISION, max_value DOUBLE PRECISION, n BIGINT, hk_sources JSONB, meta JSONB)
   EAV model: filter by metric_type (e.g., WHERE metric_type = 'steps'). For continuous metrics read avg_value; for additive metrics read sum_value.
   meta may include {"tz_name": "...", "utc_offset_min": ...} describing the timezone active when that bucket occurred (used for display). meta may be NULL.
+  meta is timezone context/provenance. Usually you do not need to select meta at all.
+  Only select meta->>'tz_name' / meta->>'utc_offset_min' if the user explicitly asks about timezone/travel or "what timezone was I in".
   hk_sources is a JSONB array describing the contributing sources, e.g. [{"name":"Stephan’s Apple Watch","version":"11.6.1"},{"name":"iPad","version":"26.1"}]. It may be [].
+  hk_sources is provenance/context. Only select/filter it if the user asks about device/source. Refer to sources by their "name".
+  Do NOT cite source/software version fields unless the user explicitly asks.
 derived_rollup_daily (general health data, daily buckets):
   (user_id TEXT, bucket_ts TIMESTAMPTZ, metric_type TEXT, avg_value DOUBLE PRECISION, sum_value DOUBLE PRECISION, min_value DOUBLE PRECISION, max_value DOUBLE PRECISION, n BIGINT, hk_sources JSONB, meta JSONB)
   Same conventions as hourly; bucket_ts is day bucket start.
@@ -39,10 +46,11 @@ Continuous metrics (AVG over time): heart_rate, resting_heart_rate, walking_hr_a
 - Do NOT use UNION or UNION ALL (complex queries are not allowed).
 - Do NOT use ORDER BY unless absolutely necessary; for "most recent" use MAX(start_ts) for derived_workouts.
 - Always filter by user_id = :user_id.
-- Do NOT use main_health_metrics or main_health_events tables. They are not part of the supported SQL tool surface area.
 - Do NOT select columns that do not exist on the chosen table (e.g., do NOT select unit from rollup tables).
 - Do NOT use AT TIME ZONE in queries; the backend localizes timestamps using :tz_name.
-- Do NOT do timezone formatting in SQL. Select raw TIMESTAMPTZ columns (timestamp, bucket_ts). The backend formats them for display, using per-row meta tz when available.
+- Do NOT do timezone formatting in SQL. Select raw TIMESTAMPTZ columns (timestamp, bucket_ts, start_ts, end_ts).
+  The backend formats them for display using per-row timezone context when available (rollups: meta.tz_name; workouts: hk_metadata.HKTimeZone / hk_metadata.tz_name); otherwise it uses :tz_name (user's current/request timezone).
+- If the user explicitly asks what timezone a workout occurred in, you may select hk_metadata->>'HKTimeZone' (or hk_metadata->>'tz_name') from derived_workouts as a plain string.
 - Do NOT introduce custom bind parameters (e.g., :start, :end, :yesterday_start). Only :user_id and :tz_name are allowed. Use plain comparisons; the backend rewrites ranges.
 - IMPORTANT: When aggregating continuous metrics across multiple buckets from derived_rollup_hourly, use a weighted average by n: SUM(avg_value * n) / NULLIF(SUM(n), 0)  (not AVG(avg_value)).
 
