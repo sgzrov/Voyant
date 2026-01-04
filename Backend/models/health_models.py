@@ -65,8 +65,8 @@ class DerivedRollupHourly(Base):
     max_value = Column(Float, nullable=True)
     n = Column(BigInteger, nullable=True)
 
-    hk_sources = Column(JSONB, nullable=True)
     meta = Column(JSONB, nullable=True)
+    hk_sources = Column(JSONB, nullable=True)
 
 
 class DerivedRollupDaily(Base):
@@ -82,8 +82,8 @@ class DerivedRollupDaily(Base):
     max_value = Column(Float, nullable=True)
     n = Column(BigInteger, nullable=True)
 
-    hk_sources = Column(JSONB, nullable=True)
     meta = Column(JSONB, nullable=True)
+    hk_sources = Column(JSONB, nullable=True)
 
 
 class DerivedWorkout(Base):
@@ -145,8 +145,8 @@ class DerivedSleepDaily(Base):
     deep_minutes = Column(Float, nullable=True)
     awake_minutes = Column(Float, nullable=True)
 
-    hk_sources = Column(JSONB, nullable=True)
     meta = Column(JSONB, nullable=True)
+    hk_sources = Column(JSONB, nullable=True)
 
 
 class DerivedSleepSegment(Base):
@@ -165,7 +165,7 @@ class DerivedSleepSegment(Base):
     hk_source_bundle_id = Column(Text, nullable=True)
     hk_source_name = Column(Text, nullable=True)
     hk_source_version = Column(Text, nullable=True)
-    hk_metadata = Column(JSONB, nullable=True)
     meta = Column(JSONB, nullable=True)
+    hk_sources = Column(JSONB, nullable=True)
 
 

@@ -29,8 +29,8 @@ def upgrade() -> None:
         sa.Column("hk_source_bundle_id", sa.Text(), nullable=True),
         sa.Column("hk_source_name", sa.Text(), nullable=True),
         sa.Column("hk_source_version", sa.Text(), nullable=True),
-        sa.Column("hk_metadata", postgresql.JSONB(), nullable=True),
         sa.Column("meta", postgresql.JSONB(), nullable=True),
+        sa.Column("hk_sources", postgresql.JSONB(), nullable=True),
         sa.PrimaryKeyConstraint("user_id", "hk_uuid", name="pk_derived_sleep_segments"),
     )
 

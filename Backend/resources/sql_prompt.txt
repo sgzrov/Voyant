@@ -5,7 +5,7 @@ derived_sleep_daily (one row per sleep "night"/day, stage breakdown + time range
   (user_id TEXT, sleep_date DATE, sleep_start_ts TIMESTAMPTZ, sleep_end_ts TIMESTAMPTZ,
    asleep_minutes DOUBLE PRECISION, rem_minutes DOUBLE PRECISION, core_minutes DOUBLE PRECISION, deep_minutes DOUBLE PRECISION,
    awake_minutes DOUBLE PRECISION,
-   hk_sources JSONB, meta JSONB)
+   meta JSONB, hk_sources JSONB)
   Notes:
   - sleep_date is labeled like the Apple Health UI: sleep segments that start after ~6pm local time are attributed to the next day.
   - sleep_start_ts / sleep_end_ts are the overall window for that sleep_date.
@@ -33,7 +33,7 @@ derived_workout_segments (per-workout distance splits):
     plus heart_rate samples, for each workout_uuid (HKWorkout UUID).
   - segment_unit is 'km' or 'mi'. segment_index is 1..N based on the workout distance.
 derived_rollup_hourly (general health data):
-  (user_id TEXT, bucket_ts TIMESTAMPTZ, metric_type TEXT, avg_value DOUBLE PRECISION, sum_value DOUBLE PRECISION, min_value DOUBLE PRECISION, max_value DOUBLE PRECISION, n BIGINT, hk_sources JSONB, meta JSONB)
+  (user_id TEXT, bucket_ts TIMESTAMPTZ, metric_type TEXT, avg_value DOUBLE PRECISION, sum_value DOUBLE PRECISION, min_value DOUBLE PRECISION, max_value DOUBLE PRECISION, n BIGINT, meta JSONB, hk_sources JSONB)
   EAV model: filter by metric_type (e.g., WHERE metric_type = 'steps'). For continuous metrics read avg_value; for additive metrics read sum_value.
   meta may include {"tz_name": "...", "utc_offset_min": ...} describing the timezone active when that bucket occurred (used for display). meta may be NULL.
   meta is timezone context/provenance. Usually you do not need to select meta at all.
@@ -42,7 +42,7 @@ derived_rollup_hourly (general health data):
   hk_sources is provenance/context. Only select/filter it if the user asks about device/source. Refer to sources by their "name".
   Do NOT cite source/software version fields unless the user explicitly asks.
 derived_rollup_daily (general health data, daily buckets):
-  (user_id TEXT, bucket_ts TIMESTAMPTZ, metric_type TEXT, avg_value DOUBLE PRECISION, sum_value DOUBLE PRECISION, min_value DOUBLE PRECISION, max_value DOUBLE PRECISION, n BIGINT, hk_sources JSONB, meta JSONB)
+  (user_id TEXT, bucket_ts TIMESTAMPTZ, metric_type TEXT, avg_value DOUBLE PRECISION, sum_value DOUBLE PRECISION, min_value DOUBLE PRECISION, max_value DOUBLE PRECISION, n BIGINT, meta JSONB, hk_sources JSONB)
   Same conventions as hourly; bucket_ts is day bucket start.
 </database_schema>
 
