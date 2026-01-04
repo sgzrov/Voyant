@@ -3,7 +3,7 @@
 
 
 # App-domain tables
-from .chat_models import ChatConversation, ChatData  # noqa: F401
+from .chat_models import ChatMessage, ChatSession  # noqa: F401
 from .health_upload_tracking_model import HealthUploadTracking  # noqa: F401
 
 # Health tables (main_* and derived_*)

@@ -1,12 +1,12 @@
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 
-from Backend.models.chat_models import ChatConversation, ChatData
+from Backend.models.chat_models import ChatMessage, ChatSession
 
 
 # Create a new chat message
 def create_chat_message(session, conversation_id, user_id, role, content):
-    msg = ChatData(
+    msg = ChatMessage(
         conversation_id = conversation_id,
         user_id = user_id,
         role = role,
@@ -24,22 +24,22 @@ def create_chat_message(session, conversation_id, user_id, role, content):
 # Get chat history for a conversation
 def get_chat_history(session, conversation_id, user_id):
     return (
-        session.query(ChatData)
+        session.query(ChatMessage)
         .filter_by(conversation_id=conversation_id, user_id=user_id)
-        .order_by(ChatData.timestamp, ChatData.id)
+        .order_by(ChatMessage.timestamp, ChatMessage.id)
         .all()
     )
 
 
 # Get existing conversation or create a new one
 def get_or_create_conversation(session, conversation_id, user_id):
-    conv = session.query(ChatConversation).filter_by(
+    conv = session.query(ChatSession).filter_by(
         conversation_id=conversation_id,
         user_id=user_id
     ).first()
 
     if not conv:
-        conv = ChatConversation(conversation_id=conversation_id, user_id=user_id, title=None)
+        conv = ChatSession(conversation_id=conversation_id, user_id=user_id, title=None)
         # Use a nested transaction so an IntegrityError here doesn't blow away the caller's transaction.
         try:
             with session.begin_nested():
@@ -51,7 +51,7 @@ def get_or_create_conversation(session, conversation_id, user_id):
                     pass
         except IntegrityError:
             # Another request likely created it concurrently for the same user_id.
-            existing = session.query(ChatConversation).filter_by(conversation_id=conversation_id, user_id=user_id).first()
+            existing = session.query(ChatSession).filter_by(conversation_id=conversation_id, user_id=user_id).first()
             return existing
 
     return conv
@@ -59,7 +59,7 @@ def get_or_create_conversation(session, conversation_id, user_id):
 
 # Update the title of a conversation
 def update_conversation_title(session, conversation_id, user_id, title):
-    conv = session.query(ChatConversation).filter_by(conversation_id=conversation_id, user_id=user_id).first()
+    conv = session.query(ChatSession).filter_by(conversation_id=conversation_id, user_id=user_id).first()
     if not conv:
         conv = get_or_create_conversation(session, conversation_id, user_id)
         if not conv:
@@ -77,25 +77,25 @@ def update_conversation_title(session, conversation_id, user_id, title):
 def get_chat_sessions(session, user_id):
     subquery = (
         session.query(
-            ChatData.conversation_id,
-            func.max(ChatData.timestamp).label("last_message_at"),
+            ChatMessage.conversation_id,
+            func.max(ChatMessage.timestamp).label("last_message_at"),
         )
-        .filter(ChatData.user_id == user_id)
-        .group_by(ChatData.conversation_id)
+        .filter(ChatMessage.user_id == user_id)
+        .group_by(ChatMessage.conversation_id)
         .subquery()
     )
 
     latest_messages = (
-        session.query(ChatData)
+        session.query(ChatMessage)
         .join(
             subquery,
-            (ChatData.conversation_id == subquery.c.conversation_id) & (ChatData.timestamp == subquery.c.last_message_at),
+            (ChatMessage.conversation_id == subquery.c.conversation_id) & (ChatMessage.timestamp == subquery.c.last_message_at),
         )
-        .filter(ChatData.user_id == user_id)
+        .filter(ChatMessage.user_id == user_id)
         .all()
     )
 
-    conversations = session.query(ChatConversation).filter_by(user_id=user_id).all()
+    conversations = session.query(ChatSession).filter_by(user_id=user_id).all()
     titles = {conv.conversation_id: conv.title for conv in conversations}
     return [
         {
