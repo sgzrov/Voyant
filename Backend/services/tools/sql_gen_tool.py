@@ -109,7 +109,7 @@ def localize_health_rows(rows: list[dict], tz: str) -> list[dict]:
     for r in rows:
         rr = dict(r)
         # Localize any timestamp-like fields into the user's current timezone for display.
-        # Note: workout timestamps may be further rewritten upstream using per-event timezone in health_events.hk_metadata (HKTimeZone).
+        # Note: workout timestamps may be further rewritten upstream using per-event timezone in main_health_events.hk_metadata (HKTimeZone).
         for key in ("timestamp", "start_ts", "end_ts", "bucket_ts", "workout_ts", "workout_timestamp"):
             if key in rr and rr[key]:
                 dt = rr[key]
@@ -134,7 +134,7 @@ def localize_health_rows(rows: list[dict], tz: str) -> list[dict]:
 
 
 def _rewrite_event_timestamps_inplace(*, session, user_id: str, rows: list[dict], request_tz: str) -> None:
-    """Rewrite workout/event timestamps to the timezone active when the event occurred (from health_events.hk_metadata['HKTimeZone'])."""
+    """Rewrite workout/event timestamps to the timezone active when the event occurred (from main_health_events.hk_metadata['HKTimeZone'])."""
     candidate_keys = ("workout_ts", "workout_timestamp", "timestamp")
 
     ts_vals = []
@@ -165,7 +165,7 @@ def _rewrite_event_timestamps_inplace(*, session, user_id: str, rows: list[dict]
             text(
                 """
                 SELECT hk_metadata
-                FROM health_events
+                FROM main_health_events
                 WHERE user_id = :user_id
                   AND timestamp = :ts
                   AND event_type LIKE 'workout_%'
@@ -258,7 +258,7 @@ def _rewrite_rollup_bucket_ts_inplace(*, session, user_id: str, rows: list[dict]
                 text(
                     """
                     SELECT meta
-                    FROM health_rollup_hourly
+                    FROM derived_rollup_hourly
                     WHERE user_id = :user_id
                       AND bucket_ts = :ts
                       AND metric_type = :mt
@@ -272,7 +272,7 @@ def _rewrite_rollup_bucket_ts_inplace(*, session, user_id: str, rows: list[dict]
                     text(
                         """
                         SELECT meta
-                        FROM health_rollup_daily
+                        FROM derived_rollup_daily
                         WHERE user_id = :user_id
                           AND bucket_ts = :ts
                           AND metric_type = :mt
@@ -286,7 +286,7 @@ def _rewrite_rollup_bucket_ts_inplace(*, session, user_id: str, rows: list[dict]
                 text(
                     """
                     SELECT meta
-                    FROM health_rollup_hourly
+                    FROM derived_rollup_hourly
                     WHERE user_id = :user_id
                       AND bucket_ts = :ts
                     LIMIT 1
@@ -299,7 +299,7 @@ def _rewrite_rollup_bucket_ts_inplace(*, session, user_id: str, rows: list[dict]
                     text(
                         """
                         SELECT meta
-                        FROM health_rollup_daily
+                        FROM derived_rollup_daily
                         WHERE user_id = :user_id
                           AND bucket_ts = :ts
                         LIMIT 1

@@ -1,7 +1,7 @@
 Output ONLY raw SQL code with no explanations, commentary, markdown fences, or prose.
 
 <database_schema>
-all_workouts (one row per workout):
+derived_workouts (one row per workout):
   (user_id TEXT, workout_uuid TEXT, workout_type TEXT, start_ts TIMESTAMPTZ, end_ts TIMESTAMPTZ,
    duration_min DOUBLE PRECISION, distance_km DOUBLE PRECISION, energy_kcal DOUBLE PRECISION,
    hk_source_bundle_id TEXT,
@@ -11,7 +11,7 @@ all_workouts (one row per workout):
   - workout_uuid is the HealthKit HKWorkout UUID string.
   - HealthKit provenance is stored in the hk_* columns (similar to mirrored raw tables).
   - hk_sources is a JSONB array like rollups, e.g. [{"name":"Apple Watch","version":"11.6.1"}]. It may be [].
-distance_workout_segments (per-workout distance splits):
+derived_workout_segments (per-workout distance splits):
   (user_id TEXT, workout_uuid TEXT, workout_start_ts TIMESTAMPTZ, segment_unit TEXT, segment_index INTEGER,
    start_ts TIMESTAMPTZ, end_ts TIMESTAMPTZ, start_offset_min DOUBLE PRECISION, end_offset_min DOUBLE PRECISION,
    duration_min DOUBLE PRECISION, pace_s_per_unit DOUBLE PRECISION, avg_hr_bpm DOUBLE PRECISION, created_at TIMESTAMPTZ)
@@ -19,12 +19,12 @@ distance_workout_segments (per-workout distance splits):
   - Rows are computed server-side from raw distance samples (distance_walking_running_km / distance_cycling_km / distance_swimming_km)
     plus heart_rate samples, for each workout_uuid (HKWorkout UUID).
   - segment_unit is 'km' or 'mi'. segment_index is 1..N based on the workout distance.
-health_rollup_hourly (general health data):
+derived_rollup_hourly (general health data):
   (user_id TEXT, bucket_ts TIMESTAMPTZ, metric_type TEXT, avg_value DOUBLE PRECISION, sum_value DOUBLE PRECISION, min_value DOUBLE PRECISION, max_value DOUBLE PRECISION, n BIGINT, hk_sources JSONB, meta JSONB)
   EAV model: filter by metric_type (e.g., WHERE metric_type = 'steps'). For continuous metrics read avg_value; for additive metrics read sum_value.
   meta may include {"tz_name": "...", "utc_offset_min": ...} describing the timezone active when that bucket occurred (used for display). meta may be NULL.
   hk_sources is a JSONB array describing the contributing sources, e.g. [{"name":"Stephan’s Apple Watch","version":"11.6.1"},{"name":"iPad","version":"26.1"}]. It may be [].
-health_rollup_daily (general health data, daily buckets):
+derived_rollup_daily (general health data, daily buckets):
   (user_id TEXT, bucket_ts TIMESTAMPTZ, metric_type TEXT, avg_value DOUBLE PRECISION, sum_value DOUBLE PRECISION, min_value DOUBLE PRECISION, max_value DOUBLE PRECISION, n BIGINT, hk_sources JSONB, meta JSONB)
   Same conventions as hourly; bucket_ts is day bucket start.
 </database_schema>
@@ -37,21 +37,21 @@ Continuous metrics (AVG over time): heart_rate, resting_heart_rate, walking_hr_a
 <sql_query_rules>
 - SELECT-only; never modify data.
 - Do NOT use UNION or UNION ALL (complex queries are not allowed).
-- Do NOT use ORDER BY unless absolutely necessary; for "most recent" use MAX(start_ts) for all_workouts.
+- Do NOT use ORDER BY unless absolutely necessary; for "most recent" use MAX(start_ts) for derived_workouts.
 - Always filter by user_id = :user_id.
-- Do NOT use health_metrics table. It is not part of the supported SQL tool surface area.
+- Do NOT use main_health_metrics or main_health_events tables. They are not part of the supported SQL tool surface area.
 - Do NOT select columns that do not exist on the chosen table (e.g., do NOT select unit from rollup tables).
 - Do NOT use AT TIME ZONE in queries; the backend localizes timestamps using :tz_name.
 - Do NOT do timezone formatting in SQL. Select raw TIMESTAMPTZ columns (timestamp, bucket_ts). The backend formats them for display, using per-row meta tz when available.
 - Do NOT introduce custom bind parameters (e.g., :start, :end, :yesterday_start). Only :user_id and :tz_name are allowed. Use plain comparisons; the backend rewrites ranges.
-- IMPORTANT: When aggregating continuous metrics across multiple buckets from health_rollup_hourly, use a weighted average by n: SUM(avg_value * n) / NULLIF(SUM(n), 0)  (not AVG(avg_value)).
+- IMPORTANT: When aggregating continuous metrics across multiple buckets from derived_rollup_hourly, use a weighted average by n: SUM(avg_value * n) / NULLIF(SUM(n), 0)  (not AVG(avg_value)).
 
 <table_mapping_rules>
 You can query either ONE or BOTH of the tables together, depending on the question.
-- For workout summary questions, prefer all_workouts (one row per workout).
-- Use distance_workout_segments for within-workout “mile/km X” questions; join to all_workouts by workout_uuid when you need workout context.
-- If you need general health metric data (heart rate, sleep, steps, HRV, etc.), use health_rollup_hourly.
-- If you need data from both tables, use a CTE to find the relevant workout timestamp first, then query health_rollup_hourly in a post-workout window.
+- For workout summary questions, prefer derived_workouts (one row per workout).
+- Use derived_workout_segments for within-workout “mile/km X” questions; join to derived_workouts by workout_uuid when you need workout context.
+- If you need general health metric data (heart rate, sleep, steps, HRV, etc.), use derived_rollup_hourly.
+- If you need data from both tables, use a CTE to find the relevant workout timestamp first, then query derived_rollup_hourly in a post-workout window.
 - If you need to return BOTH workout details and recovery metrics, do it in ONE SELECT using:
   (a) a CTE to find the workout timestamp, and
   (b) either scalar subqueries for recovery metrics, or LEFT JOINs + conditional aggregation.
@@ -59,12 +59,12 @@ You can query either ONE or BOTH of the tables together, depending on the questi
 - If you use CTEs/derived tables, do NOT reference columns that are not selected into them. If you need user_id for joins, either:
   (a) select user_id into the CTE, or
   (b) join/filter with user_id = :user_id (preferred, since user_id is constant).
-- For "most recent" / "latest" workout, do NOT use ORDER BY; use MAX(start_ts) from all_workouts.
+- For "most recent" / "latest" workout, do NOT use ORDER BY; use MAX(start_ts) from derived_workouts.
 </table_mapping_rules>
 
 <date_filtering_rules>
 - ALWAYS include date predicates when the user mentions ANY time period (specific or vague):
-  * For all_workouts, filter on start_ts. For rollups, filter on bucket_ts.
+  * For derived_workouts, filter on start_ts. For rollups, filter on bucket_ts.
   * Prefer placeholders (must be quoted strings; backend rewrites them): 'today_start'/'today_end', 'yesterday_start'/'yesterday_end'.
     Examples:
     - start_ts >= 'today_start' AND start_ts < 'today_end'

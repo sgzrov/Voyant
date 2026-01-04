@@ -302,16 +302,16 @@ def _validate_sql_sources(sql: str, allowed_sources: set[str], health_sources: s
     # Require that the query references at least one health data source
     if not used_health:
         raise ValueError(
-            "Query must reference a health table (health_rollup_hourly, health_rollup_daily, all_workouts, and/or distance_workout_segments)"
+            "Query must reference a health table (derived_rollup_hourly, derived_rollup_daily, derived_workouts, and/or derived_workout_segments)"
         )
     return used_health
 
 
-# Replace references to health_rollup_hourly table with a tz-normalized derived table
+# Replace references to derived_rollup_hourly table with a tz-normalized derived table
 def _rewrite_rollup_hourly_to_tz_derived(sql: str) -> str:
     try:
         stripped = _strip_sql_strings_and_comments(sql)
-        if not re.search(r"(?is)\b(from|join)\s+health_rollup_hourly\b", stripped):
+        if not re.search(r"(?is)\b(from|join)\s+derived_rollup_hourly\b", stripped):
             return sql
 
         hourly_subquery = (
@@ -325,50 +325,50 @@ def _rewrite_rollup_hourly_to_tz_derived(sql: str) -> str:
             "   MIN(min_value) AS min_value,\n"
             "   MAX(max_value) AS max_value,\n"
             "   SUM(n) AS n\n"
-            " FROM health_rollup_hourly\n"
+            " FROM derived_rollup_hourly\n"
             " WHERE user_id = :user_id\n"
             " GROUP BY 1,2,3)"
         )
 
         def _rewrite_from(m: re.Match) -> str:
             alias = m.group("alias")
-            alias_out = alias if alias else "health_rollup_hourly"
+            alias_out = alias if alias else "derived_rollup_hourly"
             return f"FROM {hourly_subquery} AS {alias_out}"
 
         def _rewrite_join(m: re.Match) -> str:
             alias = m.group("alias")
-            alias_out = alias if alias else "health_rollup_hourly"
+            alias_out = alias if alias else "derived_rollup_hourly"
             return f"JOIN {hourly_subquery} AS {alias_out}"
 
-        # Avoid treating SQL keywords as aliases (e.g. "FROM health_rollup_hourly WHERE ...")
+        # Avoid treating SQL keywords as aliases (e.g. "FROM derived_rollup_hourly WHERE ...")
         _no_alias_keywords = (
             r"where|group|order|limit|join|on|inner|left|right|full|cross|union|having|"
             r"window|offset|fetch|for|into|values|select|from"
         )
 
         out = re.sub(
-            rf"(?is)\bfrom\s+health_rollup_hourly(?:\s+(?:as\s+)?(?P<alias>(?!({_no_alias_keywords})\b)[a-zA-Z_]\w*))?\b",
+            rf"(?is)\bfrom\s+derived_rollup_hourly(?:\s+(?:as\s+)?(?P<alias>(?!({_no_alias_keywords})\b)[a-zA-Z_]\w*))?\b",
             _rewrite_from,
             sql,
         )
         out = re.sub(
-            rf"(?is)\bjoin\s+health_rollup_hourly(?:\s+(?:as\s+)?(?P<alias>(?!({_no_alias_keywords})\b)[a-zA-Z_]\w*))?\b",
+            rf"(?is)\bjoin\s+derived_rollup_hourly(?:\s+(?:as\s+)?(?P<alias>(?!({_no_alias_keywords})\b)[a-zA-Z_]\w*))?\b",
             _rewrite_join,
             out,
         )
         if out != sql:
-            logger.info("sql.rewrite.hourly: rewrote health_rollup_hourly to tz-localized derived table (alias-preserving)")
+            logger.info("sql.rewrite.hourly: rewrote derived_rollup_hourly to tz-localized derived table (alias-preserving)")
         return out
     except Exception:
         logger.exception("sql.rewrite.hourly.failed")
         return sql
 
 
-# Replace references to health_rollup_daily table with a tz-normalized derived table (day buckets).
+# Replace references to derived_rollup_daily table with a tz-normalized derived table (day buckets).
 def _rewrite_rollup_daily_to_tz_derived(sql: str) -> str:
     try:
         stripped = _strip_sql_strings_and_comments(sql)
-        if not re.search(r"(?is)\b(from|join)\s+health_rollup_daily\b", stripped):
+        if not re.search(r"(?is)\b(from|join)\s+derived_rollup_daily\b", stripped):
             return sql
 
         daily_subquery = (
@@ -382,19 +382,19 @@ def _rewrite_rollup_daily_to_tz_derived(sql: str) -> str:
             "   MIN(min_value) AS min_value,\n"
             "   MAX(max_value) AS max_value,\n"
             "   SUM(n) AS n\n"
-            " FROM health_rollup_daily\n"
+            " FROM derived_rollup_daily\n"
             " WHERE user_id = :user_id\n"
             " GROUP BY 1,2,3)"
         )
 
         def _rewrite_from(m: re.Match) -> str:
             alias = m.group("alias")
-            alias_out = alias if alias else "health_rollup_daily"
+            alias_out = alias if alias else "derived_rollup_daily"
             return f"FROM {daily_subquery} AS {alias_out}"
 
         def _rewrite_join(m: re.Match) -> str:
             alias = m.group("alias")
-            alias_out = alias if alias else "health_rollup_daily"
+            alias_out = alias if alias else "derived_rollup_daily"
             return f"JOIN {daily_subquery} AS {alias_out}"
 
         _no_alias_keywords = (
@@ -403,93 +403,45 @@ def _rewrite_rollup_daily_to_tz_derived(sql: str) -> str:
         )
 
         out = re.sub(
-            rf"(?is)\bfrom\s+health_rollup_daily(?:\s+(?:as\s+)?(?P<alias>(?!({_no_alias_keywords})\b)[a-zA-Z_]\w*))?\b",
+            rf"(?is)\bfrom\s+derived_rollup_daily(?:\s+(?:as\s+)?(?P<alias>(?!({_no_alias_keywords})\b)[a-zA-Z_]\w*))?\b",
             _rewrite_from,
             sql,
         )
         out = re.sub(
-            rf"(?is)\bjoin\s+health_rollup_daily(?:\s+(?:as\s+)?(?P<alias>(?!({_no_alias_keywords})\b)[a-zA-Z_]\w*))?\b",
+            rf"(?is)\bjoin\s+derived_rollup_daily(?:\s+(?:as\s+)?(?P<alias>(?!({_no_alias_keywords})\b)[a-zA-Z_]\w*))?\b",
             _rewrite_join,
             out,
         )
         if out != sql:
-            logger.info("sql.rewrite.daily: rewrote health_rollup_daily to tz-localized derived table (alias-preserving)")
+            logger.info("sql.rewrite.daily: rewrote derived_rollup_daily to tz-localized derived table (alias-preserving)")
         return out
     except Exception:
         logger.exception("sql.rewrite.daily.failed")
         return sql
 
 
-# Replace references to health_events table with a user-scoped derived table (alias-preserving).
-# This avoids requiring the LLM to remember a user_id predicate in multi-table queries.
-def _rewrite_health_events_to_user_scoped(sql: str) -> str:
+# Replace references to derived_workout_segments with a user-scoped derived table (alias-preserving).
+def _rewrite_derived_workout_segments_to_user_scoped(sql: str) -> str:
     try:
         stripped = _strip_sql_strings_and_comments(sql)
-        if not re.search(r"(?is)\b(from|join)\s+health_events\b", stripped):
-            return sql
-
-        events_subquery = (
-            "(SELECT\n"
-            "   *\n"
-            " FROM health_events\n"
-            " WHERE user_id = :user_id)"
-        )
-
-        def _rewrite_from(m: re.Match) -> str:
-            alias = m.group("alias")
-            alias_out = alias if alias else "health_events"
-            return f"FROM {events_subquery} AS {alias_out}"
-
-        def _rewrite_join(m: re.Match) -> str:
-            alias = m.group("alias")
-            alias_out = alias if alias else "health_events"
-            return f"JOIN {events_subquery} AS {alias_out}"
-
-        _no_alias_keywords = (
-            r"where|group|order|limit|join|on|inner|left|right|full|cross|union|having|"
-            r"window|offset|fetch|for|into|values|select|from"
-        )
-
-        out = re.sub(
-            rf"(?is)\bfrom\s+health_events(?:\s+(?:as\s+)?(?P<alias>(?!({_no_alias_keywords})\b)[a-zA-Z_]\w*))?\b",
-            _rewrite_from,
-            sql,
-        )
-        out = re.sub(
-            rf"(?is)\bjoin\s+health_events(?:\s+(?:as\s+)?(?P<alias>(?!({_no_alias_keywords})\b)[a-zA-Z_]\w*))?\b",
-            _rewrite_join,
-            out,
-        )
-        if out != sql:
-            logger.info("sql.rewrite.events: rewrote health_events to user-scoped derived table (alias-preserving)")
-        return out
-    except Exception:
-        logger.exception("sql.rewrite.events.failed")
-        return sql
-
-
-# Replace references to distance_workout_segments with a user-scoped derived table (alias-preserving).
-def _rewrite_distance_workout_segments_to_user_scoped(sql: str) -> str:
-    try:
-        stripped = _strip_sql_strings_and_comments(sql)
-        if not re.search(r"(?is)\b(from|join)\s+distance_workout_segments\b", stripped):
+        if not re.search(r"(?is)\b(from|join)\s+derived_workout_segments\b", stripped):
             return sql
 
         seg_subquery = (
             "(SELECT\n"
             "   *\n"
-            " FROM distance_workout_segments\n"
+            " FROM derived_workout_segments\n"
             " WHERE user_id = :user_id)"
         )
 
         def _rewrite_from(m: re.Match) -> str:
             alias = m.group("alias")
-            alias_out = alias if alias else "distance_workout_segments"
+            alias_out = alias if alias else "derived_workout_segments"
             return f"FROM {seg_subquery} AS {alias_out}"
 
         def _rewrite_join(m: re.Match) -> str:
             alias = m.group("alias")
-            alias_out = alias if alias else "distance_workout_segments"
+            alias_out = alias if alias else "derived_workout_segments"
             return f"JOIN {seg_subquery} AS {alias_out}"
 
         _no_alias_keywords = (
@@ -498,45 +450,45 @@ def _rewrite_distance_workout_segments_to_user_scoped(sql: str) -> str:
         )
 
         out = re.sub(
-            rf"(?is)\bfrom\s+distance_workout_segments(?:\s+(?:as\s+)?(?P<alias>(?!({_no_alias_keywords})\b)[a-zA-Z_]\w*))?\b",
+            rf"(?is)\bfrom\s+derived_workout_segments(?:\s+(?:as\s+)?(?P<alias>(?!({_no_alias_keywords})\b)[a-zA-Z_]\w*))?\b",
             _rewrite_from,
             sql,
         )
         out = re.sub(
-            rf"(?is)\bjoin\s+distance_workout_segments(?:\s+(?:as\s+)?(?P<alias>(?!({_no_alias_keywords})\b)[a-zA-Z_]\w*))?\b",
+            rf"(?is)\bjoin\s+derived_workout_segments(?:\s+(?:as\s+)?(?P<alias>(?!({_no_alias_keywords})\b)[a-zA-Z_]\w*))?\b",
             _rewrite_join,
             out,
         )
         if out != sql:
-            logger.info("sql.rewrite.segments: rewrote distance_workout_segments to user-scoped derived table (alias-preserving)")
+            logger.info("sql.rewrite.segments: rewrote derived_workout_segments to user-scoped derived table (alias-preserving)")
         return out
     except Exception:
         logger.exception("sql.rewrite.segments.failed")
         return sql
 
 
-# Replace references to all_workouts with a user-scoped derived table (alias-preserving).
-def _rewrite_all_workouts_to_user_scoped(sql: str) -> str:
+# Replace references to derived_workouts with a user-scoped derived table (alias-preserving).
+def _rewrite_derived_workouts_to_user_scoped(sql: str) -> str:
     try:
         stripped = _strip_sql_strings_and_comments(sql)
-        if not re.search(r"(?is)\b(from|join)\s+all_workouts\b", stripped):
+        if not re.search(r"(?is)\b(from|join)\s+derived_workouts\b", stripped):
             return sql
 
         w_subquery = (
             "(SELECT\n"
             "   *\n"
-            " FROM all_workouts\n"
+            " FROM derived_workouts\n"
             " WHERE user_id = :user_id)"
         )
 
         def _rewrite_from(m: re.Match) -> str:
             alias = m.group("alias")
-            alias_out = alias if alias else "all_workouts"
+            alias_out = alias if alias else "derived_workouts"
             return f"FROM {w_subquery} AS {alias_out}"
 
         def _rewrite_join(m: re.Match) -> str:
             alias = m.group("alias")
-            alias_out = alias if alias else "all_workouts"
+            alias_out = alias if alias else "derived_workouts"
             return f"JOIN {w_subquery} AS {alias_out}"
 
         _no_alias_keywords = (
@@ -545,17 +497,17 @@ def _rewrite_all_workouts_to_user_scoped(sql: str) -> str:
         )
 
         out = re.sub(
-            rf"(?is)\bfrom\s+all_workouts(?:\s+(?:as\s+)?(?P<alias>(?!({_no_alias_keywords})\b)[a-zA-Z_]\w*))?\b",
+            rf"(?is)\bfrom\s+derived_workouts(?:\s+(?:as\s+)?(?P<alias>(?!({_no_alias_keywords})\b)[a-zA-Z_]\w*))?\b",
             _rewrite_from,
             sql,
         )
         out = re.sub(
-            rf"(?is)\bjoin\s+all_workouts(?:\s+(?:as\s+)?(?P<alias>(?!({_no_alias_keywords})\b)[a-zA-Z_]\w*))?\b",
+            rf"(?is)\bjoin\s+derived_workouts(?:\s+(?:as\s+)?(?P<alias>(?!({_no_alias_keywords})\b)[a-zA-Z_]\w*))?\b",
             _rewrite_join,
             out,
         )
         if out != sql:
-            logger.info("sql.rewrite.workouts: rewrote all_workouts to user-scoped derived table (alias-preserving)")
+            logger.info("sql.rewrite.workouts: rewrote derived_workouts to user-scoped derived table (alias-preserving)")
         return out
     except Exception:
         logger.exception("sql.rewrite.workouts.failed")
@@ -606,47 +558,47 @@ def _sanitize_sql(sql: str) -> str:
     used_health_sources = _validate_sql_sources(
         s,
         allowed_sources={
-            "health_rollup_hourly",
-            "health_rollup_daily",
-            "all_workouts",
-            "distance_workout_segments",
+            "derived_rollup_hourly",
+            "derived_rollup_daily",
+            "derived_workouts",
+            "derived_workout_segments",
             "generate_series",
             "unnest",
         },
-        health_sources={"health_rollup_hourly", "health_rollup_daily", "all_workouts", "distance_workout_segments"},
+        health_sources={"derived_rollup_hourly", "derived_rollup_daily", "derived_workouts", "derived_workout_segments"},
     )
 
     # Allow multi-table ONLY for the specific combos:
     if len(used_health_sources) > 1:
         allowed_combos = (
-            {"all_workouts", "distance_workout_segments"},
-            {"all_workouts", "health_rollup_hourly"},
-            {"all_workouts", "health_rollup_daily"},
-            {"all_workouts", "distance_workout_segments", "health_rollup_hourly"},
-            {"all_workouts", "distance_workout_segments", "health_rollup_daily"},
+            {"derived_workouts", "derived_workout_segments"},
+            {"derived_workouts", "derived_rollup_hourly"},
+            {"derived_workouts", "derived_rollup_daily"},
+            {"derived_workouts", "derived_workout_segments", "derived_rollup_hourly"},
+            {"derived_workouts", "derived_workout_segments", "derived_rollup_daily"},
         )
         if used_health_sources not in allowed_combos:
             raise ValueError(
-                "Query must use exactly one health table (health_rollup_hourly OR health_rollup_daily OR all_workouts OR distance_workout_segments), "
+                "Query must use exactly one health table (derived_rollup_hourly OR derived_rollup_daily OR derived_workouts OR derived_workout_segments), "
                 "or one of the allowed combos: "
-                "(all_workouts + distance_workout_segments) / (all_workouts + health_rollup_hourly) / (all_workouts + health_rollup_daily) / "
-                "(all_workouts + distance_workout_segments + health_rollup_hourly) / (all_workouts + distance_workout_segments + health_rollup_daily)"
+                "(derived_workouts + derived_workout_segments) / (derived_workouts + derived_rollup_hourly) / (derived_workouts + derived_rollup_daily) / "
+                "(derived_workouts + derived_workout_segments + derived_rollup_hourly) / (derived_workouts + derived_workout_segments + derived_rollup_daily)"
             )
 
     # Always rewrite to safe derived tables BEFORE further validation/rewrites:
     # - hourly rollups get tz-normalized and scoped to user_id
     # - events get scoped to user_id
-    if "health_rollup_hourly" in used_health_sources:
+    if "derived_rollup_hourly" in used_health_sources:
         s = _rewrite_rollup_hourly_to_tz_derived(s)
         stripped = _strip_sql_strings_and_comments(s)
-    if "health_rollup_daily" in used_health_sources:
+    if "derived_rollup_daily" in used_health_sources:
         s = _rewrite_rollup_daily_to_tz_derived(s)
         stripped = _strip_sql_strings_and_comments(s)
-    if "all_workouts" in used_health_sources:
-        s = _rewrite_all_workouts_to_user_scoped(s)
+    if "derived_workouts" in used_health_sources:
+        s = _rewrite_derived_workouts_to_user_scoped(s)
         stripped = _strip_sql_strings_and_comments(s)
-    if "distance_workout_segments" in used_health_sources:
-        s = _rewrite_distance_workout_segments_to_user_scoped(s)
+    if "derived_workout_segments" in used_health_sources:
+        s = _rewrite_derived_workout_segments_to_user_scoped(s)
         stripped = _strip_sql_strings_and_comments(s)
 
     scan = _scan_top_level_sql(stripped)
@@ -681,7 +633,7 @@ def _sanitize_sql(sql: str) -> str:
     ))
 
     # Ensure queries are scoped to the authenticated user (unless already scoped elsewhere).
-    # For health_events and health_rollup_hourly we rewrite to user-scoped derived tables above,
+    # For derived_workouts and rollups we rewrite to user-scoped derived tables above,
     # which prevents ambiguous `user_id` injection in multi-table queries.
     if not has_user_predicate_anywhere:
         if where_idx >= 0:
@@ -827,8 +779,10 @@ def _sanitize_sql(sql: str) -> str:
 
     # Block direct queries to the raw metrics table (keep the tool limited to events + rollups).
     stripped_final = _strip_sql_strings_and_comments(s)
-    if re.search(r"\b(from|join)\s+health_metrics\b", stripped_final, flags=re.IGNORECASE):
-        raise ValueError("Raw metrics table is not available; use health_rollup_hourly and/or health_events")
+    if re.search(r"\b(from|join)\s+main_health_metrics\b", stripped_final, flags=re.IGNORECASE):
+        raise ValueError("Raw metrics table is not available; use derived_rollup_hourly and/or derived_rollup_daily")
+    if re.search(r"\b(from|join)\s+main_health_events\b", stripped_final, flags=re.IGNORECASE):
+        raise ValueError("Raw events table is not available; use derived_workouts and/or derived_workout_segments")
 
     if re.search(r"(?is)\b(insert|update|delete|drop|alter|create|truncate|grant|revoke)\b", stripped_final):
         raise ValueError("Forbidden tokens in SQL")

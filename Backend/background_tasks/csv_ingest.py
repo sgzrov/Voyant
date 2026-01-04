@@ -81,11 +81,11 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
     else:
         df = df[df["timestamp"] >= cutoff_ts]
 
-    # Split event/workout rows for separate health_events table. Remaining rows are raw metrics for health_metrics table
+    # Split event/workout rows for separate main_health_events table. Remaining rows are raw metrics for main_health_metrics table
     df_events = df[df["metric_type"].str.startswith(("event_", "workout_"), na = False)].copy()
     df_metrics = df[~df["metric_type"].str.startswith(("event_", "workout_"), na = False)].copy()
 
-    # Write to health_events and health_metrics table
+    # Write to main_health_events and main_health_metrics table
     with SessionLocal() as session:
         def _py_dt(x):
             return pd.Timestamp(x).to_pydatetime()
@@ -135,17 +135,17 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
         )
         if cutoff_dt is not None:
             _exec(
-                "DELETE FROM health_events WHERE user_id = :user_id AND timestamp < :cutoff",
+                "DELETE FROM main_health_events WHERE user_id = :user_id AND timestamp < :cutoff",
                 {"user_id": user_id, "cutoff": cutoff_dt},
-                "prune health_events",
+                "prune main_health_events",
             )
             _exec(
-                "DELETE FROM health_metrics WHERE user_id = :user_id AND timestamp < :cutoff",
+                "DELETE FROM main_health_metrics WHERE user_id = :user_id AND timestamp < :cutoff",
                 {"user_id": user_id, "cutoff": cutoff_dt},
-                "prune health_metrics",
+                "prune main_health_metrics",
             )
 
-        # Write to health_events table (mirror-only; require hk_uuid)
+        # Write to main_health_events table (mirror-only; require hk_uuid)
         deleted_event_uuids: list[str] = []
         workout_ids_deleted: set[str] = set()
         workout_ids_upserted: set[str] = set()
@@ -159,10 +159,10 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
             # Fail fast: mirror mode requires hk_uuid for any upsert row.
             if not df_ev_up.empty:
                 if "hk_uuid" not in df_ev_up.columns:
-                    raise ValueError("Mirror ingest requires hk_uuid for health_events upserts")
+                    raise ValueError("Mirror ingest requires hk_uuid for main_health_events upserts")
                 missing = df_ev_up["hk_uuid"].isna() | df_ev_up["hk_uuid"].astype(str).str.strip().eq("")
                 if bool(missing.any()):
-                    raise ValueError("Mirror ingest found health_events upsert rows missing hk_uuid")
+                    raise ValueError("Mirror ingest found main_health_events upsert rows missing hk_uuid")
 
             if not df_ev_del.empty and "hk_uuid" in df_ev_del.columns:
                 deleted_event_uuids = (
@@ -177,12 +177,12 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                                 workout_ids_deleted.add(wid)
                     _exec(
                         """
-                        UPDATE health_events
+                        UPDATE main_health_events
                         SET deleted_at = NOW()
                         WHERE user_id = :user_id AND hk_uuid = ANY(:uuids)
                         """,
                         {"user_id": user_id, "uuids": deleted_event_uuids},
-                        "tombstone health_events deletes",
+                        "tombstone main_health_events deletes",
                     )
 
             # Upserts require metric_value + hk_uuid
@@ -291,7 +291,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
             if params:
                 _execmany(
                     """
-                    INSERT INTO health_events
+                    INSERT INTO main_health_events
                         (user_id, hk_uuid, timestamp, end_ts, event_type, value, unit, source, created_at,
                          hk_source_bundle_id, hk_source_name, hk_source_version, hk_metadata, deleted_at)
                     VALUES
@@ -300,46 +300,46 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                     ON CONFLICT (user_id, hk_uuid, event_type) WHERE hk_uuid IS NOT NULL DO UPDATE
                     SET
                         timestamp = EXCLUDED.timestamp,
-                        end_ts = COALESCE(EXCLUDED.end_ts, health_events.end_ts),
+                        end_ts = COALESCE(EXCLUDED.end_ts, main_health_events.end_ts),
                         value = EXCLUDED.value,
-                        unit = COALESCE(EXCLUDED.unit, health_events.unit),
-                        source = COALESCE(EXCLUDED.source, health_events.source),
-                        created_at = COALESCE(EXCLUDED.created_at, health_events.created_at),
-                        hk_source_bundle_id = COALESCE(EXCLUDED.hk_source_bundle_id, health_events.hk_source_bundle_id),
-                        hk_source_name = COALESCE(EXCLUDED.hk_source_name, health_events.hk_source_name),
-                        hk_source_version = COALESCE(EXCLUDED.hk_source_version, health_events.hk_source_version),
-                        hk_metadata = COALESCE(EXCLUDED.hk_metadata, health_events.hk_metadata),
+                        unit = COALESCE(EXCLUDED.unit, main_health_events.unit),
+                        source = COALESCE(EXCLUDED.source, main_health_events.source),
+                        created_at = COALESCE(EXCLUDED.created_at, main_health_events.created_at),
+                        hk_source_bundle_id = COALESCE(EXCLUDED.hk_source_bundle_id, main_health_events.hk_source_bundle_id),
+                        hk_source_name = COALESCE(EXCLUDED.hk_source_name, main_health_events.hk_source_name),
+                        hk_source_version = COALESCE(EXCLUDED.hk_source_version, main_health_events.hk_source_version),
+                        hk_metadata = COALESCE(EXCLUDED.hk_metadata, main_health_events.hk_metadata),
                         deleted_at = NULL
                     """,
                     params,
-                    "bulk upsert health_events (hk_uuid)",
+                    "bulk upsert main_health_events (hk_uuid)",
                     delay=0.2,
                 )
 
-            # Keep derived workout flags only on `workouts` (not in health_events) to avoid duplication.
+            # Keep derived workout flags only on `derived_workouts` (not in main_health_events) to avoid duplication.
             # Still clean up derived tables on workout deletes (best-effort).
             if workout_ids_deleted:
                 # Remove any precomputed segments and workout rows for deleted workouts.
                 _exec(
                     """
-                    DELETE FROM distance_workout_segments
+                    DELETE FROM derived_workout_segments
                     WHERE user_id = :user_id AND workout_uuid = ANY(:wids)
                     """,
                     {"user_id": user_id, "wids": sorted(list(workout_ids_deleted))},
-                    "delete distance_workout_segments (workout deletes)",
+                    "delete derived_workout_segments (workout deletes)",
                 )
                 _exec(
                     """
-                    DELETE FROM all_workouts
+                    DELETE FROM derived_workouts
                     WHERE user_id = :user_id AND workout_uuid = ANY(:wids)
                     """,
                     {"user_id": user_id, "wids": sorted(list(workout_ids_deleted))},
-                    "delete all_workouts (workout deletes)",
+                    "delete derived_workouts (workout deletes)",
                 )
                 # Tombstone any legacy derived rows that may exist from older versions.
                 _exec(
                     """
-                    UPDATE health_events
+                    UPDATE main_health_events
                     SET deleted_at = NOW()
                     WHERE user_id = :user_id
                       AND deleted_at IS NULL
@@ -357,7 +357,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                     "tombstone legacy derived workout flags (deletes)",
                 )
 
-        # Write to health_metrics table (HealthKit mirror-aware: raw samples + tombstone deletes)
+        # Write to main_health_metrics table (HealthKit mirror-aware: raw samples + tombstone deletes)
         deleted_uuids: list[str] = []
         if not df_metrics.empty:
             if "op" not in df_metrics.columns:
@@ -369,10 +369,10 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
             # Fail fast: mirror mode requires hk_uuid for any upsert row.
             if not df_up.empty:
                 if "hk_uuid" not in df_up.columns:
-                    raise ValueError("Mirror ingest requires hk_uuid for health_metrics upserts")
+                    raise ValueError("Mirror ingest requires hk_uuid for main_health_metrics upserts")
                 missing = df_up["hk_uuid"].isna() | df_up["hk_uuid"].astype(str).str.strip().eq("")
                 if bool(missing.any()):
-                    raise ValueError("Mirror ingest found health_metrics upsert rows missing hk_uuid")
+                    raise ValueError("Mirror ingest found main_health_metrics upsert rows missing hk_uuid")
 
             # Tombstone deletes by hk_uuid (if present)
             if not df_del.empty and "hk_uuid" in df_del.columns:
@@ -382,12 +382,12 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                 if deleted_uuids:
                     _exec(
                         """
-                        UPDATE health_metrics
+                        UPDATE main_health_metrics
                         SET deleted_at = NOW()
                         WHERE user_id = :user_id AND hk_uuid = ANY(:uuids)
                         """,
                         {"user_id": user_id, "uuids": deleted_uuids},
-                        "tombstone health_metrics deletes",
+                        "tombstone main_health_metrics deletes",
                     )
 
             def _meta_json_m(tz, off, c, r, ci):
@@ -461,7 +461,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
             if params_m_uuid:
                 _execmany(
                     """
-                    INSERT INTO health_metrics
+                    INSERT INTO main_health_metrics
                         (user_id, hk_uuid, timestamp, end_ts, metric_type, metric_value, unit, created_at, meta,
                          hk_source_bundle_id, hk_source_name, hk_source_version, hk_metadata, deleted_at)
                     VALUES
@@ -470,20 +470,20 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                     ON CONFLICT (user_id, hk_uuid) WHERE hk_uuid IS NOT NULL DO UPDATE
                     SET
                         timestamp = EXCLUDED.timestamp,
-                        end_ts = COALESCE(EXCLUDED.end_ts, health_metrics.end_ts),
+                        end_ts = COALESCE(EXCLUDED.end_ts, main_health_metrics.end_ts),
                         metric_type = EXCLUDED.metric_type,
                         metric_value = EXCLUDED.metric_value,
-                        unit = COALESCE(EXCLUDED.unit, health_metrics.unit),
-                        created_at = COALESCE(EXCLUDED.created_at, health_metrics.created_at),
+                        unit = COALESCE(EXCLUDED.unit, main_health_metrics.unit),
+                        created_at = COALESCE(EXCLUDED.created_at, main_health_metrics.created_at),
                         meta = EXCLUDED.meta,
-                        hk_source_bundle_id = COALESCE(EXCLUDED.hk_source_bundle_id, health_metrics.hk_source_bundle_id),
-                        hk_source_name = COALESCE(EXCLUDED.hk_source_name, health_metrics.hk_source_name),
-                        hk_source_version = COALESCE(EXCLUDED.hk_source_version, health_metrics.hk_source_version),
-                        hk_metadata = COALESCE(EXCLUDED.hk_metadata, health_metrics.hk_metadata),
+                        hk_source_bundle_id = COALESCE(EXCLUDED.hk_source_bundle_id, main_health_metrics.hk_source_bundle_id),
+                        hk_source_name = COALESCE(EXCLUDED.hk_source_name, main_health_metrics.hk_source_name),
+                        hk_source_version = COALESCE(EXCLUDED.hk_source_version, main_health_metrics.hk_source_version),
+                        hk_metadata = COALESCE(EXCLUDED.hk_metadata, main_health_metrics.hk_metadata),
                         deleted_at = NULL
                     """,
                     params_m_uuid,
-                    "bulk upsert health_metrics (hk_uuid)",
+                    "bulk upsert main_health_metrics (hk_uuid)",
                     delay=0.25,
                 )
 
@@ -496,7 +496,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
         metrics_t_min = None
         metrics_t_max = None
 
-        # Recompute hourly rollups (best-effort) for the affected time window from health_metrics table
+        # Recompute hourly rollups (best-effort) for the affected time window from main_health_metrics table
         if not df_metrics.empty:
             t_min = pd.to_datetime(df_metrics["timestamp"].min())
             t_max = pd.to_datetime(df_metrics["timestamp"].max())
@@ -506,7 +506,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                         text(
                             """
                             SELECT MIN(timestamp) AS tmin, MAX(timestamp) AS tmax
-                            FROM health_metrics
+                            FROM main_health_metrics
                             WHERE user_id = :user_id AND hk_uuid = ANY(:uuids)
                             """
                         ),
@@ -534,7 +534,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                 t1 = (pd.Timestamp(t_max).floor("H") + pd.Timedelta(hours = 1)).to_pydatetime()
                 _exec(
                     """
-                    INSERT INTO health_rollup_hourly
+                    INSERT INTO derived_rollup_hourly
                         (user_id, bucket_ts, metric_type, avg_value, sum_value, min_value, max_value, n, hk_sources, meta)
                     SELECT
                         :user_id AS user_id,
@@ -560,7 +560,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                             '[]'::jsonb
                           ) AS hk_sources
                         , (ARRAY_AGG(meta ORDER BY timestamp DESC) FILTER (WHERE meta IS NOT NULL))[1] AS meta
-                    FROM health_metrics
+                    FROM main_health_metrics
                     WHERE user_id = :user_id
                       AND deleted_at IS NULL
                       AND timestamp >= :t0 AND timestamp < :t1
@@ -575,7 +575,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                       meta = EXCLUDED.meta
                     """,
                     {"user_id": user_id, "t0": t0, "t1": t1},
-                    "upsert health_rollup_hourly",
+                    "upsert derived_rollup_hourly",
                 )
                 session.commit()
 
@@ -584,7 +584,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                 d1 = (pd.Timestamp(t_max).floor("D") + pd.Timedelta(days=1)).to_pydatetime()
                 _exec(
                     """
-                    INSERT INTO health_rollup_daily
+                    INSERT INTO derived_rollup_daily
                         (user_id, bucket_ts, metric_type, avg_value, sum_value, min_value, max_value, n, hk_sources, meta)
                     SELECT
                         :user_id AS user_id,
@@ -610,7 +610,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                             '[]'::jsonb
                           ) AS hk_sources
                         , (ARRAY_AGG(meta ORDER BY timestamp DESC) FILTER (WHERE meta IS NOT NULL))[1] AS meta
-                    FROM health_metrics
+                    FROM main_health_metrics
                     WHERE user_id = :user_id
                       AND deleted_at IS NULL
                       AND timestamp >= :t0 AND timestamp < :t1
@@ -625,11 +625,11 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                       meta = EXCLUDED.meta
                     """,
                     {"user_id": user_id, "t0": d0, "t1": d1},
-                    "upsert health_rollup_daily",
+                    "upsert derived_rollup_daily",
                 )
                 session.commit()
-        # --- Derive distance_workout_segments (best-effort).
-        # We persist segments in a dedicated table (not in health_events) to keep the event surface clean.
+        # --- Derive derived_workout_segments (best-effort).
+        # We persist segments in a dedicated table (not in main_health_events) to keep the event surface clean.
         try:
             target_wids: set[str] = set(workout_ids_upserted)
             # If metrics were updated, also recompute segments for workouts that overlap the affected window.
@@ -639,7 +639,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                         text(
                             """
                             SELECT hk_uuid
-                            FROM health_events
+                            FROM main_health_events
                             WHERE user_id = :user_id
                               AND deleted_at IS NULL
                               AND event_type = 'workout_duration_min'
@@ -676,7 +676,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                         ]
                     )
 
-                # Some environments may not have all provenance columns on health_events (e.g. hk_device dropped).
+                # Some environments may not have all provenance columns on main_health_events.
                 # Derivation should still work; we only select columns that exist.
                 try:
                     cols = session.execute(
@@ -685,7 +685,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                             SELECT column_name
                             FROM information_schema.columns
                             WHERE table_schema = 'public'
-                              AND table_name = 'health_events'
+                              AND table_name = 'main_health_events'
                             """
                         )
                     ).scalars().all()
@@ -708,7 +708,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                         f"""
                         SELECT
                           {", ".join(select_cols)}
-                        FROM health_events
+                        FROM main_health_events
                         WHERE user_id = :user_id
                           AND hk_uuid = ANY(:uuids)
                           AND deleted_at IS NULL
@@ -778,7 +778,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                                 except Exception:
                                     _w["end_ts"] = None
 
-                    # Upsert all_workouts (one row per workout uuid).
+                    # Upsert derived_workouts (one row per workout uuid).
                     # This is the preferred surface for workout summary queries (avoids EAV pivoting).
                     dw_rows: list[dict] = []
                     for wid, w in workouts.items():
@@ -812,7 +812,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                         session.execute(
                             text(
                                 """
-                                INSERT INTO all_workouts
+                                INSERT INTO derived_workouts
                                     (user_id, workout_uuid, workout_type, start_ts, end_ts, duration_min, distance_km, energy_kcal,
                                      hk_source_bundle_id, hk_sources, hk_metadata,
                                      created_at, updated_at)
@@ -823,15 +823,15 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                                      NOW(), NOW())
                                 ON CONFLICT (user_id, workout_uuid) DO UPDATE
                                 SET
-                                    workout_type = COALESCE(EXCLUDED.workout_type, all_workouts.workout_type),
+                                    workout_type = COALESCE(EXCLUDED.workout_type, derived_workouts.workout_type),
                                     start_ts = EXCLUDED.start_ts,
-                                    end_ts = COALESCE(EXCLUDED.end_ts, all_workouts.end_ts),
-                                    duration_min = COALESCE(EXCLUDED.duration_min, all_workouts.duration_min),
-                                    distance_km = COALESCE(EXCLUDED.distance_km, all_workouts.distance_km),
-                                    energy_kcal = COALESCE(EXCLUDED.energy_kcal, all_workouts.energy_kcal),
-                                    hk_source_bundle_id = COALESCE(EXCLUDED.hk_source_bundle_id, all_workouts.hk_source_bundle_id),
-                                    hk_metadata = COALESCE(EXCLUDED.hk_metadata, all_workouts.hk_metadata),
-                                    hk_sources = COALESCE(EXCLUDED.hk_sources, all_workouts.hk_sources),
+                                    end_ts = COALESCE(EXCLUDED.end_ts, derived_workouts.end_ts),
+                                    duration_min = COALESCE(EXCLUDED.duration_min, derived_workouts.duration_min),
+                                    distance_km = COALESCE(EXCLUDED.distance_km, derived_workouts.distance_km),
+                                    energy_kcal = COALESCE(EXCLUDED.energy_kcal, derived_workouts.energy_kcal),
+                                    hk_source_bundle_id = COALESCE(EXCLUDED.hk_source_bundle_id, derived_workouts.hk_source_bundle_id),
+                                    hk_metadata = COALESCE(EXCLUDED.hk_metadata, derived_workouts.hk_metadata),
+                                    hk_sources = COALESCE(EXCLUDED.hk_sources, derived_workouts.hk_sources),
                                     updated_at = NOW()
                                 """
                             ),
@@ -849,7 +849,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                         text(
                             """
                             SELECT metric_type, timestamp, end_ts, metric_value
-                            FROM health_metrics
+                            FROM main_health_metrics
                             WHERE user_id = :user_id
                               AND deleted_at IS NULL
                               AND metric_type = ANY(:metric_types)
@@ -870,7 +870,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                         text(
                             """
                             SELECT timestamp, metric_value
-                            FROM health_metrics
+                            FROM main_health_metrics
                             WHERE user_id = :user_id
                               AND deleted_at IS NULL
                               AND metric_type = 'heart_rate'
@@ -976,7 +976,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                     session.execute(
                         text(
                             """
-                            DELETE FROM distance_workout_segments
+                            DELETE FROM derived_workout_segments
                             WHERE user_id = :user_id AND workout_uuid = ANY(:wids)
                             """
                         ),
@@ -1065,7 +1065,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                         session.execute(
                             text(
                                 """
-                                INSERT INTO distance_workout_segments
+                                INSERT INTO derived_workout_segments
                                     (user_id, workout_uuid, workout_start_ts, segment_unit, segment_index,
                                      start_ts, end_ts, start_offset_min, end_offset_min, duration_min,
                                      pace_s_per_unit, avg_hr_bpm, created_at)
@@ -1090,11 +1090,11 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
 
                 session.commit()
         except Exception:
-            logger.exception("process_csv_upload: derive distance_workout_segments failed user_id=%s", user_id)
+            logger.exception("process_csv_upload: derive derived_workout_segments failed user_id=%s", user_id)
             try:
                 session.rollback()
             except Exception:
-                logger.exception("process_csv_upload: rollback failed after derive distance_workout_segments user_id=%s", user_id)
+                logger.exception("process_csv_upload: rollback failed after derive derived_workout_segments user_id=%s", user_id)
 
     logger.info("process_csv_upload: done user_id=%s metrics=%s events=%s", user_id, len(df_metrics), len(df_events))
     return {"inserted": int(len(df_metrics) + len(df_events))}
