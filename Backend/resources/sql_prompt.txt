@@ -1,10 +1,10 @@
 Output ONLY raw SQL code with no explanations, commentary, markdown fences, or prose.
 
 <database_schema>
-workouts (one row per workout):
+all_workouts (one row per workout):
   (user_id TEXT, workout_uuid TEXT, workout_type TEXT, start_ts TIMESTAMPTZ, end_ts TIMESTAMPTZ,
    duration_min DOUBLE PRECISION, distance_km DOUBLE PRECISION, energy_kcal DOUBLE PRECISION,
-   hk_source_bundle_id TEXT, hk_source_name TEXT, hk_source_version TEXT,
+   hk_source_bundle_id TEXT,
    hk_sources JSONB, hk_metadata JSONB, created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ)
   Notes:
   - This is the preferred table for workout summary queries (one row per workout).
@@ -37,7 +37,7 @@ Continuous metrics (AVG over time): heart_rate, resting_heart_rate, walking_hr_a
 <sql_query_rules>
 - SELECT-only; never modify data.
 - Do NOT use UNION or UNION ALL (complex queries are not allowed).
-- Do NOT use ORDER BY unless absolutely necessary; for "most recent" use MAX(start_ts) for workouts.
+- Do NOT use ORDER BY unless absolutely necessary; for "most recent" use MAX(start_ts) for all_workouts.
 - Always filter by user_id = :user_id.
 - Do NOT use health_metrics table. It is not part of the supported SQL tool surface area.
 - Do NOT select columns that do not exist on the chosen table (e.g., do NOT select unit from rollup tables).
@@ -48,8 +48,8 @@ Continuous metrics (AVG over time): heart_rate, resting_heart_rate, walking_hr_a
 
 <table_mapping_rules>
 You can query either ONE or BOTH of the tables together, depending on the question.
-- For workout summary questions, prefer workouts (one row per workout).
-- Use distance_workout_segments for within-workout “mile/km X” questions; join to workouts by workout_uuid when you need workout context.
+- For workout summary questions, prefer all_workouts (one row per workout).
+- Use distance_workout_segments for within-workout “mile/km X” questions; join to all_workouts by workout_uuid when you need workout context.
 - If you need general health metric data (heart rate, sleep, steps, HRV, etc.), use health_rollup_hourly.
 - If you need data from both tables, use a CTE to find the relevant workout timestamp first, then query health_rollup_hourly in a post-workout window.
 - If you need to return BOTH workout details and recovery metrics, do it in ONE SELECT using:
@@ -59,12 +59,12 @@ You can query either ONE or BOTH of the tables together, depending on the questi
 - If you use CTEs/derived tables, do NOT reference columns that are not selected into them. If you need user_id for joins, either:
   (a) select user_id into the CTE, or
   (b) join/filter with user_id = :user_id (preferred, since user_id is constant).
-- For "most recent" / "latest" workout, do NOT use ORDER BY; use MAX(start_ts) from workouts.
+- For "most recent" / "latest" workout, do NOT use ORDER BY; use MAX(start_ts) from all_workouts.
 </table_mapping_rules>
 
 <date_filtering_rules>
 - ALWAYS include date predicates when the user mentions ANY time period (specific or vague):
-  * For workouts, filter on start_ts. For rollups, filter on bucket_ts.
+  * For all_workouts, filter on start_ts. For rollups, filter on bucket_ts.
   * Prefer placeholders (must be quoted strings; backend rewrites them): 'today_start'/'today_end', 'yesterday_start'/'yesterday_end'.
     Examples:
     - start_ts >= 'today_start' AND start_ts < 'today_end'

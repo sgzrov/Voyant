@@ -330,11 +330,11 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                 )
                 _exec(
                     """
-                    DELETE FROM workouts
+                    DELETE FROM all_workouts
                     WHERE user_id = :user_id AND workout_uuid = ANY(:wids)
                     """,
                     {"user_id": user_id, "wids": sorted(list(workout_ids_deleted))},
-                    "delete workouts (workout deletes)",
+                    "delete all_workouts (workout deletes)",
                 )
                 # Tombstone any legacy derived rows that may exist from older versions.
                 _exec(
@@ -778,7 +778,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                                 except Exception:
                                     _w["end_ts"] = None
 
-                    # Upsert workouts (one row per workout uuid).
+                    # Upsert all_workouts (one row per workout uuid).
                     # This is the preferred surface for workout summary queries (avoids EAV pivoting).
                     dw_rows: list[dict] = []
                     for wid, w in workouts.items():
@@ -798,8 +798,6 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                                 "distance_km": float(dist_km) if dist_km is not None else None,
                                 "energy_kcal": float(kcal) if kcal is not None else None,
                                 "hk_source_bundle_id": w.get("hk_source_bundle_id"),
-                                "hk_source_name": w.get("hk_source_name"),
-                                "hk_source_version": w.get("hk_source_version"),
                                 "hk_sources": json.dumps(
                                     [
                                         {"name": w.get("hk_source_name"), "version": w.get("hk_source_version")}
@@ -814,28 +812,26 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                         session.execute(
                             text(
                                 """
-                                INSERT INTO workouts
+                                INSERT INTO all_workouts
                                     (user_id, workout_uuid, workout_type, start_ts, end_ts, duration_min, distance_km, energy_kcal,
-                                     hk_source_bundle_id, hk_source_name, hk_source_version, hk_sources, hk_metadata,
+                                     hk_source_bundle_id, hk_sources, hk_metadata,
                                      created_at, updated_at)
                                 VALUES
                                     (:user_id, :workout_uuid, :workout_type, :start_ts, :end_ts, :duration_min, :distance_km, :energy_kcal,
-                                     :hk_source_bundle_id, :hk_source_name, :hk_source_version,
+                                     :hk_source_bundle_id,
                                      CAST(:hk_sources AS jsonb), CAST(:hk_metadata AS jsonb),
                                      NOW(), NOW())
                                 ON CONFLICT (user_id, workout_uuid) DO UPDATE
                                 SET
-                                    workout_type = COALESCE(EXCLUDED.workout_type, workouts.workout_type),
+                                    workout_type = COALESCE(EXCLUDED.workout_type, all_workouts.workout_type),
                                     start_ts = EXCLUDED.start_ts,
-                                    end_ts = COALESCE(EXCLUDED.end_ts, workouts.end_ts),
-                                    duration_min = COALESCE(EXCLUDED.duration_min, workouts.duration_min),
-                                    distance_km = COALESCE(EXCLUDED.distance_km, workouts.distance_km),
-                                    energy_kcal = COALESCE(EXCLUDED.energy_kcal, workouts.energy_kcal),
-                                    hk_source_bundle_id = COALESCE(EXCLUDED.hk_source_bundle_id, workouts.hk_source_bundle_id),
-                                    hk_source_name = COALESCE(EXCLUDED.hk_source_name, workouts.hk_source_name),
-                                    hk_source_version = COALESCE(EXCLUDED.hk_source_version, workouts.hk_source_version),
-                                    hk_metadata = COALESCE(EXCLUDED.hk_metadata, workouts.hk_metadata),
-                                    hk_sources = COALESCE(EXCLUDED.hk_sources, workouts.hk_sources),
+                                    end_ts = COALESCE(EXCLUDED.end_ts, all_workouts.end_ts),
+                                    duration_min = COALESCE(EXCLUDED.duration_min, all_workouts.duration_min),
+                                    distance_km = COALESCE(EXCLUDED.distance_km, all_workouts.distance_km),
+                                    energy_kcal = COALESCE(EXCLUDED.energy_kcal, all_workouts.energy_kcal),
+                                    hk_source_bundle_id = COALESCE(EXCLUDED.hk_source_bundle_id, all_workouts.hk_source_bundle_id),
+                                    hk_metadata = COALESCE(EXCLUDED.hk_metadata, all_workouts.hk_metadata),
+                                    hk_sources = COALESCE(EXCLUDED.hk_sources, all_workouts.hk_sources),
                                     updated_at = NOW()
                                 """
                             ),
