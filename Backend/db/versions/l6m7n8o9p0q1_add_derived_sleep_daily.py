@@ -30,8 +30,8 @@ def upgrade() -> None:
         sa.Column("awake_minutes", sa.Float(), nullable=True),
         sa.Column("in_bed_minutes", sa.Float(), nullable=True),
         sa.Column("asleep_unspecified_minutes", sa.Float(), nullable=True),
-        sa.Column("hk_sources", postgresql.JSONB(), nullable=True),
         sa.Column("meta", postgresql.JSONB(), nullable=True),
+        sa.Column("hk_sources", postgresql.JSONB(), nullable=True),
         sa.PrimaryKeyConstraint("user_id", "sleep_date", name="pk_derived_sleep_daily"),
     )
     op.create_index(
