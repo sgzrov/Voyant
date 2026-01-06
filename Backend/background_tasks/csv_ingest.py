@@ -876,6 +876,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                             COALESCE(end_ts, timestamp) AS segment_end_ts,
                             metric_type,
                             metric_value,
+                            hk_source_bundle_id,
                             hk_source_name,
                             hk_source_version,
                             meta,
