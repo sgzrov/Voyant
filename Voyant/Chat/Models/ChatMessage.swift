@@ -34,7 +34,6 @@ struct ChatMessage: Identifiable, Equatable, Codable {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
 
-        // Convert the Int ID sent from the backend into a UUID
         let intId = try container.decode(Int.self, forKey: .id)
         let uuidString = "\(String(format: "%08d", intId))-0000-0000-0000-000000000000"
         guard let uuid = UUID(uuidString: uuidString) else {

@@ -736,17 +736,20 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                 session.commit()
 
                 # Recompute derived_sleep_daily (best-effort) for the same affected window.
-                # Sleep "day" is labeled like Apple Health: we attribute sleep segments to the next day if they start after ~6pm local.
+                # Pro labeling: assign a sleep_date per *sleep session* (episode) using the local-date of the session END
+                # (wake time) in the effective local timezone. This avoids midnight-splitting edge cases and handles
+                # early bedtimes / evening naps without relying on a fixed 6pm cutoff.
                 try:
                     _exec(
                         """
                         WITH base AS (
                           SELECT
                             user_id,
-                            timestamp,
-                            COALESCE(end_ts, timestamp) AS end_ts,
+                            timestamp AS segment_start_ts,
+                            COALESCE(end_ts, timestamp) AS segment_end_ts,
                             metric_type,
                             metric_value,
+                            hk_source_bundle_id,
                             hk_source_name,
                             hk_source_version,
                             meta,
@@ -757,14 +760,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                               hk_metadata->>'tz_name',
                               hk_metadata->>'timezone',
                               'UTC'
-                            ) AS tz_name_eff,
-                            ((timestamp AT TIME ZONE COALESCE(
-                              meta->>'tz_name',
-                              hk_metadata->>'HKTimeZone',
-                              hk_metadata->>'tz_name',
-                              hk_metadata->>'timezone',
-                              'UTC'
-                            )) + INTERVAL '6 hours')::date AS sleep_date
+                            ) AS tz_name_eff
                           FROM main_health_metrics
                           WHERE user_id = :user_id
                             AND deleted_at IS NULL
@@ -772,6 +768,48 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                             AND metric_type <> 'sleep_hours'
                             AND timestamp >= (:t0 - INTERVAL '24 hours')
                             AND timestamp < (:t1 + INTERVAL '24 hours')
+                            AND COALESCE(end_ts, timestamp) >= timestamp
+                        ),
+                        ordered AS (
+                          SELECT
+                            *,
+                            LAG(segment_end_ts) OVER (ORDER BY segment_start_ts) AS prev_end_ts
+                          FROM base
+                        ),
+                        sessionized AS (
+                          SELECT
+                            *,
+                            SUM(
+                              CASE
+                                WHEN prev_end_ts IS NULL THEN 1
+                                WHEN segment_start_ts - prev_end_ts > INTERVAL '2 hours' THEN 1
+                                ELSE 0
+                              END
+                            ) OVER (ORDER BY segment_start_ts) AS session_id
+                          FROM ordered
+                        ),
+                        sessions AS (
+                          SELECT
+                            session_id,
+                            MIN(segment_start_ts) AS session_start_ts,
+                            MAX(segment_end_ts) AS session_end_ts,
+                            -- Prefer the most recent tz_name within the session (handles missing tz on earlier rows).
+                            (ARRAY_AGG(tz_name_eff ORDER BY segment_start_ts DESC))[1] AS session_tz
+                          FROM sessionized
+                          GROUP BY 1
+                        ),
+                        labeled AS (
+                          SELECT
+                            s.*,
+                            (
+                              (
+                                (
+                                  ss.session_end_ts
+                                ) AT TIME ZONE ss.session_tz
+                              )
+                            )::date AS sleep_date
+                          FROM sessionized s
+                          JOIN sessions ss USING (session_id)
                         )
                         INSERT INTO derived_sleep_daily
                           (user_id, sleep_date, sleep_start_ts, sleep_end_ts,
@@ -780,8 +818,8 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                         SELECT
                           :user_id AS user_id,
                           sleep_date,
-                          MIN(timestamp) AS sleep_start_ts,
-                          MAX(end_ts) AS sleep_end_ts,
+                          MIN(segment_start_ts) AS sleep_start_ts,
+                          MAX(segment_end_ts) AS sleep_end_ts,
                           SUM(CASE WHEN metric_type IN ('sleep_rem_minutes','sleep_core_minutes','sleep_deep_minutes','sleep_asleep_unspecified_minutes') THEN metric_value ELSE 0 END) AS asleep_minutes,
                           SUM(CASE WHEN metric_type = 'sleep_rem_minutes' THEN metric_value ELSE 0 END) AS rem_minutes,
                           SUM(CASE WHEN metric_type = 'sleep_core_minutes' THEN metric_value ELSE 0 END) AS core_minutes,
@@ -792,14 +830,14 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                               meta,
                               NULLIF(jsonb_strip_nulls(jsonb_build_object('tz_name', tz_name_eff)), '{}'::jsonb)
                             )
-                            ORDER BY timestamp DESC
+                            ORDER BY segment_start_ts DESC
                           ) FILTER (WHERE COALESCE(meta, NULLIF(jsonb_strip_nulls(jsonb_build_object('tz_name', tz_name_eff)), '{}'::jsonb)) IS NOT NULL))[1] AS meta,
                           COALESCE(
                             jsonb_agg(DISTINCT jsonb_build_object('name', hk_source_name, 'version', hk_source_version))
                               FILTER (WHERE hk_source_name IS NOT NULL),
                             '[]'::jsonb
                           ) AS hk_sources
-                        FROM base
+                        FROM labeled
                         GROUP BY sleep_date
                         ON CONFLICT (user_id, sleep_date) DO UPDATE SET
                           sleep_start_ts = EXCLUDED.sleep_start_ts,
@@ -834,11 +872,10 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                           SELECT
                             user_id,
                             hk_uuid,
-                            timestamp,
-                            COALESCE(end_ts, timestamp) AS end_ts,
+                            timestamp AS segment_start_ts,
+                            COALESCE(end_ts, timestamp) AS segment_end_ts,
                             metric_type,
                             metric_value,
-                            hk_source_bundle_id,
                             hk_source_name,
                             hk_source_version,
                             meta,
@@ -849,14 +886,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                               hk_metadata->>'tz_name',
                               hk_metadata->>'timezone',
                               'UTC'
-                            ) AS tz_name_eff,
-                            ((timestamp AT TIME ZONE COALESCE(
-                              meta->>'tz_name',
-                              hk_metadata->>'HKTimeZone',
-                              hk_metadata->>'tz_name',
-                              hk_metadata->>'timezone',
-                              'UTC'
-                            )) + INTERVAL '6 hours')::date AS sleep_date
+                            ) AS tz_name_eff
                           FROM main_health_metrics
                           WHERE user_id = :user_id
                             AND deleted_at IS NULL
@@ -864,10 +894,51 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                             AND metric_type <> 'sleep_hours'
                             AND timestamp >= (:t0 - INTERVAL '24 hours')
                             AND timestamp < (:t1 + INTERVAL '24 hours')
+                            AND COALESCE(end_ts, timestamp) >= timestamp
+                        ),
+                        ordered AS (
+                          SELECT
+                            *,
+                            LAG(segment_end_ts) OVER (ORDER BY segment_start_ts) AS prev_end_ts
+                          FROM base
+                        ),
+                        sessionized AS (
+                          SELECT
+                            *,
+                            SUM(
+                              CASE
+                                WHEN prev_end_ts IS NULL THEN 1
+                                WHEN segment_start_ts - prev_end_ts > INTERVAL '2 hours' THEN 1
+                                ELSE 0
+                              END
+                            ) OVER (ORDER BY segment_start_ts) AS session_id
+                          FROM ordered
+                        ),
+                        sessions AS (
+                          SELECT
+                            session_id,
+                            MIN(segment_start_ts) AS session_start_ts,
+                            MAX(segment_end_ts) AS session_end_ts,
+                            (ARRAY_AGG(tz_name_eff ORDER BY segment_start_ts DESC))[1] AS session_tz
+                          FROM sessionized
+                          GROUP BY 1
+                        ),
+                        labeled AS (
+                          SELECT
+                            s.*,
+                            (
+                              (
+                                (
+                                  ss.session_end_ts
+                                ) AT TIME ZONE ss.session_tz
+                              )
+                            )::date AS sleep_date
+                          FROM sessionized s
+                          JOIN sessions ss USING (session_id)
                         )
                         INSERT INTO derived_sleep_segments
                           (user_id, hk_uuid, sleep_date, stage, segment_start_ts, segment_end_ts, minutes,
-                           hk_source_bundle_id, hk_source_name, hk_source_version, meta, hk_sources)
+                           hk_source_bundle_id, meta, hk_sources)
                         SELECT
                           user_id,
                           hk_uuid,
@@ -881,12 +952,10 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                             WHEN 'sleep_asleep_unspecified_minutes' THEN 'asleep_unspecified'
                             ELSE NULL
                           END AS stage,
-                          timestamp AS segment_start_ts,
-                          end_ts AS segment_end_ts,
+                          segment_start_ts,
+                          segment_end_ts,
                           COALESCE(metric_value, 0) AS minutes,
                           hk_source_bundle_id,
-                          hk_source_name,
-                          hk_source_version,
                           COALESCE(
                             meta,
                             NULLIF(jsonb_strip_nulls(jsonb_build_object('tz_name', tz_name_eff)), '{}'::jsonb)
@@ -896,9 +965,9 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                               THEN jsonb_build_array(jsonb_build_object('name', hk_source_name, 'version', hk_source_version))
                             ELSE '[]'::jsonb
                           END AS hk_sources
-                        FROM base
+                        FROM labeled
                         WHERE hk_uuid IS NOT NULL
-                          AND (COALESCE(end_ts, timestamp) > timestamp)
+                          AND (segment_end_ts > segment_start_ts)
                           AND metric_type IN (
                             'sleep_awake_minutes',
                             'sleep_in_bed_minutes',

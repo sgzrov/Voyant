@@ -163,8 +163,6 @@ class DerivedSleepSegment(Base):
     minutes = Column(Float, nullable=False)
 
     hk_source_bundle_id = Column(Text, nullable=True)
-    hk_source_name = Column(Text, nullable=True)
-    hk_source_version = Column(Text, nullable=True)
     meta = Column(JSONB, nullable=True)
     hk_sources = Column(JSONB, nullable=True)
 
