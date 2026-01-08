@@ -1,4 +1,4 @@
-Output ONLY raw SQL code with no explanations, commentary, markdown fences, or prose.
+Output ONLY raw SQL with no explanations/commentary/markdown/prose.
 
 <database_schema>
 derived_rollup_hourly (hourly data for ALL health metrics, not including sleep):
@@ -7,7 +7,7 @@ derived_rollup_hourly (hourly data for ALL health metrics, not including sleep):
 - ALWAYS select: metric_type, unit, meta, hk_sources.
     - If returning per-bucket rows: also select bucket_ts.
     - If aggregating across buckets: keep metric_type and include meta/hk_sources via an aggregate (e.g., (ARRAY_AGG(meta) FILTER (WHERE meta IS NOT NULL))[1] AS meta).
-  - Select value columns based on user input (select MULTIPLE if needed):
+- Select value columns based on user input (select multiple if needed):
     - totals over time: sum_value
     - typical level/average: avg_value
     - peaks/dips: min_value/max_value
@@ -35,86 +35,74 @@ derived_workout_segments (detailed workout data):
   (user_id TEXT, workout_uuid TEXT, workout_start_ts TIMESTAMPTZ, segment_unit TEXT, segment_index INTEGER, start_ts TIMESTAMPTZ, end_ts TIMESTAMPTZ, start_offset_min DOUBLE PRECISION, end_offset_min DOUBLE PRECISION, duration_min DOUBLE PRECISION, pace_s_per_unit DOUBLE PRECISION, avg_hr_bpm DOUBLE PRECISION, created_at TIMESTAMPTZ)
    - ALWAYS select workout_uuid for segments.
    - Select what you need (segment_unit/index, start_ts/end_ts, duration_min; workout_start_ts and start_offset_min/end_offset_min when you need relative timing; pace/hr if relevant). Never select created_at.
+
+<metric_context>
+- metric_type strings must match the database exactly. Do NOT guess metric_type names.
+- Existing metric_type strings: heart_rate, resting_heart_rate, walking_hr_avg, hr_variability_sdnn, steps, walking_speed, vo2_max, active_energy_burned, active_time_minutes, dietary_water, body_mass, body_mass_index, blood_glucose, oxygen_saturation, blood_pressure_systolic, blood_pressure_diastolic, respiratory_rate, body_temperature, mindfulness_minutes, distance_walking_running_km, distance_cycling_km, distance_swimming_km, sleep_hours, sleep_rem_minutes, sleep_core_minutes, sleep_deep_minutes, sleep_awake_minutes, sleep_asleep_unspecified_minutes.
+</metric_context>
 </database_schema>
 
 <sql_query_rules>
-- SELECT-only; never modify data.
-- Do NOT use UNION or UNION ALL (complex queries are not allowed).
-  - If you need multiple related slices (e.g., previous day / same day / next day, or multiple offsets around an anchor), you MUST do it in ONE query using conditional aggregates (pivot), not UNION.
-    Example: MAX(CASE WHEN DATE(bucket_ts AT TIME ZONE :tz_name)=anchor_date THEN avg_value END) AS same_day_x_avg (choose avg_value vs sum_value as appropriate).
-- Do NOT use ORDER BY unless absolutely necessary; for "most recent" use MAX(start_ts) for derived_workouts.
-- Always filter by user_id = :user_id.
-- Do NOT use SELECT *. Select only the columns needed to answer the question.
+- ALWAYS filter by user_id = :user_id.
+- SELECT-only, never modify data.
+- Do NOT use SELECT *. Select ONLY the columns needed to answer the question.
 - Do NOT select columns that do not exist on the chosen table.
-- Rollups: follow the `<database_schema>` ALWAYS-select rules so returned numbers are always labeled (metric_type/unit/meta/hk_sources).
-- Do NOT select bookkeeping timestamps (created_at, updated_at) unless the user explicitly asks.
-- You may use AT TIME ZONE, but ONLY with :tz_name, and only for date math / day boundaries (never for formatting).
-  - Do NOT use per-row timezone JSON (meta/hk_metadata) inside SQL expressions (e.g., do NOT write: bucket_ts AT TIME ZONE meta->>'tz_name' or bucket_ts AT TIME ZONE (meta->>'tz_name')).
-  - ALWAYS use EXACTLY: bucket_ts AT TIME ZONE :tz_name (or start_ts/timestamp similarly). `AT TIME ZONE` binds tighter than `->>`. So `ts AT TIME ZONE meta ->> 'tz_name'` is WRONG and will error.
-  - If you ever need JSON extraction in an AT TIME ZONE expression (avoid if possible), you MUST parenthesize it: ts AT TIME ZONE (meta->>'tz_name').
-- If you use now() or date_trunc for time windows, always use: (now() AT TIME ZONE :tz_name).
-- Do NOT do timezone formatting in SQL. Select raw TIMESTAMPTZ columns (timestamp, bucket_ts, start_ts, end_ts).
-  The backend formats them for display using per-row timezone context when available (rollups: meta.tz_name; workouts: hk_metadata.HKTimeZone / hk_metadata.tz_name); otherwise it uses :tz_name (user's current/request timezone).
-- If the user explicitly asks what timezone a workout occurred in, you may select hk_metadata->>'HKTimeZone' (or hk_metadata->>'tz_name') from derived_workouts as a plain string.
-- Do NOT introduce custom bind parameters (e.g., :start, :end, :yesterday_start). Only :user_id and :tz_name are allowed. Use plain comparisons; the backend rewrites ranges.
-- IMPORTANT: When aggregating continuous metrics across multiple buckets from derived_rollup_hourly, use a weighted average by n: SUM(avg_value * n) / NULLIF(SUM(n), 0)  (not AVG(avg_value)).
+- NEVER use UNION or UNION ALL.
+  - If multiple related slices are needed (e.g., previous day / same day / next day, or multiple offsets around an anchor), YOU MUST do it in ONE query using conditional aggregates (pivot), not UNION.
+    Example (pivot 3 days into columns, single row):
+      MAX(CASE WHEN DATE(bucket_ts AT TIME ZONE :tz_name) = anchor_date::date THEN sum_value END) AS day0_sum,
+      MAX(CASE WHEN DATE(bucket_ts AT TIME ZONE :tz_name) = (anchor_date - INTERVAL '1 day')::date THEN sum_value END) AS day_minus1_sum,
+      MAX(CASE WHEN DATE(bucket_ts AT TIME ZONE :tz_name) = (anchor_date + INTERVAL '1 day')::date THEN sum_value END) AS day_plus1_sum
+- Use ORDER BY ONLY when ranking results (top/bottom) or returning an ordered time-series. Avoid otherwise.
+- Use LIMIT ONLY when the user wants a short list (top‑K) or exactly one item. Avoid otherwise.
+  - NEVER use LIMIT for “last N days/weeks/months” trends; return all rows for the window or aggregate them.
+  - If you use LIMIT, you MUST also use a deterministic ORDER BY.
+- When aggregating continuous metrics across multiple buckets from derived_rollup_hourly, use a weighted average by n: SUM(avg_value * n) / NULLIF(SUM(n), 0)  (not AVG(avg_value)).
 
-<table_mapping_rules>
-Use only the tables needed for the question (prefer 1 table; add more only when required).
-- When joining tables, ALWAYS use explicit JOIN ... ON ... with a stable key (never FROM a, b without an ON; avoid cartesian products).
-- If you need workout context for segments, JOIN derived_workout_segments to derived_workouts by workout_uuid (and always filter user_id = :user_id).
-- For "most recent" / "latest" workout, do NOT use ORDER BY; use MAX(start_ts) from derived_workouts.
-- Whenever the question requires relating multiple signals (e.g., habits hurting/helping, drivers, “why is X worse/better”, correlations/associations, impacts/relationships), align them on ONE shared grain (night/day/hour/workout) and avoid exploding row counts:
-  - Choose ONE anchor grain: night (sleep_date), day (DATE(bucket_ts AT TIME ZONE :tz_name)), hour (bucket_ts), or workout (workout_uuid/start_ts).
-  - Align by stable keys:
-    - workouts↔segments: workout_uuid
-    - rollups↔rollups: same bucket_ts granularity + metric_type
-    - sleep_date↔daily rollups: sleep_date = DATE(bucket_ts AT TIME ZONE :tz_name)
-      - IMPORTANT: bucket_ts is TIMESTAMPTZ and sleep_date is DATE; always join via DATE(...).
-      - Do NOT write: sleep_date = (bucket_ts AT TIME ZONE meta->>'tz_name') or any variant using JSON tz in SQL.
-      - When shifting a DATE by an interval, always cast back to DATE: (sleep_date + INTERVAL '1 day')::date.
-  - If you need multiple rollup metric_types in one row, pivot with conditional aggregates (MAX(CASE WHEN metric_type='X' THEN avg_value/sum_value END) AS x).
-  - Keep joins to ≤ 4 derived health tables.
-- LEFT JOIN rule (to avoid “missing data”):
-  - If you LEFT JOIN optional context tables (rollups/workouts) and still want the anchor row even when context is missing, NEVER put right-table filters in the WHERE clause (e.g., do NOT write "WHERE dr.user_id = :user_id").
-  - Put those filters inside the JOIN ... ON (or in a subquery used in the JOIN) so the LEFT JOIN remains a LEFT JOIN.
-  - This includes metric_type filters: do NOT write "WHERE dr.metric_type IN (...)"; put that filter in the JOIN ... ON instead.
-</table_mapping_rules>
-
-<metric_type_rules>
-- metric_type strings must match the database exactly. Do NOT guess metric_type names.
-- If you are unsure what metric_type values exist for the requested window, do NOT filter by metric_type; return rows with metric_type and both avg_value + sum_value for the relevant window and let the assistant select what matters.
-- If the question is asking for drivers/“what changed” across days (or “what’s hurting/helping”), prefer returning per-metric_type rows with day-aligned values + deltas so the assistant can explain what drove the change without guessing.
-  - Use ONE query with conditional aggregates (no UNION), group by metric_type, and compute deltas. Example pattern:
-    SELECT
-      metric_type,
-      MAX(CASE WHEN DATE(bucket_ts AT TIME ZONE :tz_name) = anchor_date::date THEN avg_value END) AS same_day_avg,
-      MAX(CASE WHEN DATE(bucket_ts AT TIME ZONE :tz_name) = (anchor_date - INTERVAL '1 day')::date THEN avg_value END) AS prev_day_avg,
-      MAX(CASE WHEN DATE(bucket_ts AT TIME ZONE :tz_name) = (anchor_date + INTERVAL '1 day')::date THEN avg_value END) AS next_day_avg,
-      MAX(CASE WHEN DATE(bucket_ts AT TIME ZONE :tz_name) = anchor_date::date THEN sum_value END) AS same_day_sum,
-      MAX(CASE WHEN DATE(bucket_ts AT TIME ZONE :tz_name) = (anchor_date - INTERVAL '1 day')::date THEN sum_value END) AS prev_day_sum,
-      MAX(CASE WHEN DATE(bucket_ts AT TIME ZONE :tz_name) = (anchor_date + INTERVAL '1 day')::date THEN sum_value END) AS next_day_sum
-    FROM derived_rollup_daily
-    WHERE user_id = :user_id
-      AND DATE(bucket_ts AT TIME ZONE :tz_name) BETWEEN (anchor_date - INTERVAL '1 day')::date AND (anchor_date + INTERVAL '1 day')::date
-    GROUP BY metric_type
-    ORDER BY ABS(COALESCE(next_day_sum,0)-COALESCE(prev_day_sum,0)) DESC
-    LIMIT 10
-</metric_type_rules>
-
-<date_filtering_rules>
-- ALWAYS include date predicates when the user mentions ANY time period (specific or vague):
-  * For derived_workouts, filter on start_ts. For rollups, filter on bucket_ts.
-  * Do NOT use any quoted placeholder strings (e.g., 'today_start', '7_days_ago_start'). Write full SQL date math instead.
-    Canonical half-open day windows (use with start_ts / bucket_ts):
+<sql_timezone_rules>
+- ALLOWED binds: ONLY :user_id and :tz_name (no other bind params).
+- Use AT TIME ZONE ONLY for day boundaries/date math, and prefer :tz_name (never for formatting output).
+- Date/window rules:
+  - If the user mentions ANY time period (specific or vague), ALWAYS include a date predicate.
+  - For derived_workouts use start_ts. For rollups use bucket_ts. For derived_sleep_daily use sleep_date (DATE).
+  - Do NOT use quoted placeholder strings (e.g., 'today_start'). Use SQL date math.
+  - In the templates below, `ts` is a placeholder name. You MUST replace `ts` with the real column you are filtering (usually bucket_ts or start_ts).
+  - Canonical half-open day windows (use with start_ts / bucket_ts):
     - Today: ts >= date_trunc('day', (now() AT TIME ZONE :tz_name)) AND ts < date_trunc('day', (now() AT TIME ZONE :tz_name)) + INTERVAL '1 day'
     - Yesterday: ts >= date_trunc('day', (now() AT TIME ZONE :tz_name)) - INTERVAL '1 day' AND ts < date_trunc('day', (now() AT TIME ZONE :tz_name))
     - Last 7 days: ts >= date_trunc('day', (now() AT TIME ZONE :tz_name)) - INTERVAL '6 days' AND ts < date_trunc('day', (now() AT TIME ZONE :tz_name)) + INTERVAL '1 day'
-    For derived_sleep_daily.sleep_date: apply the same bounds but cast to ::date.
-  * When filtering for a specific day, ALWAYS use a half-open interval with matching boundaries for the same period. Do NOT mix a start from one period with an end from another (e.g., 'yesterday_start' with 'today_end').
-    Example ("day before yesterday"): timestamp >= date_trunc('day', now() - INTERVAL '2 days') AND timestamp < (date_trunc('day', now() - INTERVAL '2 days') + INTERVAL '1 day')
-  * Or use TIMESTAMP literals with half-open intervals: bucket_ts >= TIMESTAMP 'YYYY-MM-DD HH:MM' AND bucket_ts < TIMESTAMP '...'.
-  * If user implies a timeframe but none is given, default to last 7 days.
-  * If the user asks for the "most recent" / "latest" workout and gives no timeframe, search the last 60 days (data retention window).
-</date_filtering_rules>
+    - For derived_sleep_daily.sleep_date: apply the same bounds but cast to ::date.
+  - When filtering for a specific day, ALWAYS use a half-open interval with matching boundaries (do NOT mix periods).
+  - If the user asks for "most recent/latest" and gives no timeframe, search the last 60 days.
+- Do NOT use per-row timezone JSON (meta/hk_metadata) in SQL expressions.
+  - Exception (sleep alignment only): when anchoring on derived_sleep_daily.sleep_date, you MAY align rollup days with:
+    DATE(rollup.bucket_ts AT TIME ZONE COALESCE((sleep.meta->>'tz_name'), :tz_name)) = sleep.sleep_date
+- AT TIME ZONE precedence gotcha: `AT TIME ZONE` binds tighter than `->>`.
+  - WRONG: ts AT TIME ZONE meta ->> 'tz_name'
+  - If you must extract JSON inside AT TIME ZONE (avoid), parenthesize: ts AT TIME ZONE (meta->>'tz_name')
+- Do NOT format timestamps in SQL; select raw TIMESTAMPTZ columns. The backend handles presentation/localization.
+- If the user explicitly asks the workout timezone, you MAY select hk_metadata->>'HKTimeZone' (or hk_metadata->>'tz_name') from derived_workouts as a plain string.
+</sql_timezone_rules>
+
+<join_and_context_rules>
+- Join rules:
+  - When joining tables, ALWAYS use explicit JOIN ... ON ... with a stable key (never FROM a, b without an ON; avoid cartesian products).
+  - Keep joins to ≤ 4 derived health tables.
+  - LEFT JOIN rule (to avoid “missing data”):
+    - If you LEFT JOIN optional context tables (rollups/workouts) and still want the anchor row even when context is missing, NEVER put right-table filters in the WHERE clause (e.g., do NOT write "WHERE dr.user_id = :user_id").
+    - Put those filters inside the JOIN ... ON (or in a subquery used in the JOIN) so the LEFT JOIN remains a LEFT JOIN.
+    - This includes metric_type filters: do NOT write "WHERE dr.metric_type IN (...)"; put that filter in the JOIN ... ON instead.
+- Default context rules (sleep impact across days):
+  - When the user asks about impact/relationships across days, you MUST return day-before/day-of/day-after context.
+  - Anchor: latest sleep in derived_sleep_daily (ORDER BY sleep_date DESC LIMIT 1).
+  - Context: LEFT JOIN derived_rollup_daily for these metric_types:
+    steps, active_energy_burned, active_time_minutes, resting_heart_rate, hr_variability_sdnn
+  - Pivot rule: use MAX(CASE WHEN dr.metric_type='X' AND day=... THEN dr.sum_value/avg_value END) and DO NOT use aggregate FILTER syntax.
+  - Day alignment:
+    - Define day := DATE(dr.bucket_ts AT TIME ZONE :tz_name) (do NOT use JSON tz here).
+    - Compare to sleep_date using date casts: (ls.sleep_date ± INTERVAL '1 day')::date.
+  - GROUP BY rule:
+    - If you use ANY aggregate function in the SELECT list, you MUST GROUP BY every non-aggregated selected column (e.g., every ls.* you selected).
+  - Apply the LEFT JOIN rule above (keep rollup filters in JOIN ... ON, not WHERE).
+</join_and_context_rules>
 </sql_query_rules>

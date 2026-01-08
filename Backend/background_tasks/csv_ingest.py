@@ -536,7 +536,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                         :user_id AS user_id,
                         date_trunc('hour', timestamp) AS bucket_ts,
                         metric_type,
-                        (ARRAY_AGG(unit) FILTER (WHERE unit IS NOT NULL) ORDER BY timestamp DESC)[1] AS unit,
+                        (ARRAY_AGG(unit ORDER BY timestamp DESC) FILTER (WHERE unit IS NOT NULL))[1] AS unit,
                         AVG(CASE WHEN metric_type IN (
                             'heart_rate','resting_heart_rate','walking_hr_avg','hr_variability_sdnn',
                             'oxygen_saturation','walking_speed','vo2_max','body_mass','body_mass_index',
@@ -622,7 +622,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                         :user_id AS user_id,
                         date_trunc('day', timestamp) AS bucket_ts,
                         metric_type,
-                        (ARRAY_AGG(unit) FILTER (WHERE unit IS NOT NULL) ORDER BY timestamp DESC)[1] AS unit,
+                        (ARRAY_AGG(unit ORDER BY timestamp DESC) FILTER (WHERE unit IS NOT NULL))[1] AS unit,
                         AVG(CASE WHEN metric_type IN (
                             'heart_rate','resting_heart_rate','walking_hr_avg','hr_variability_sdnn',
                             'oxygen_saturation','walking_speed','vo2_max','body_mass','body_mass_index',
