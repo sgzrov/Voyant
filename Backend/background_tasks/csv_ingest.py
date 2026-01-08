@@ -704,6 +704,11 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                 try:
                     _exec(
                         """
+                        -- NOTE:
+                        -- We label sleep by local date-of-session-end (sleep_date), but segments can start on the prior UTC day
+                        -- for timezones ahead of UTC. To avoid truncating sessions at UTC midnight, we:
+                        -- - scan a wider timestamp window for sessionization
+                        -- - constrain the *write* window by computed sleep_date (UTC day range expanded by +/- 1 day)
                         WITH base AS (
                           SELECT
                             user_id,
@@ -727,8 +732,8 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                             AND deleted_at IS NULL
                             AND metric_type LIKE 'sleep_%'
                             AND metric_type <> 'sleep_hours'
-                            AND timestamp >= (:t0 - INTERVAL '24 hours')
-                            AND timestamp < (:t1 + INTERVAL '24 hours')
+                            AND timestamp >= (:t0 - INTERVAL '48 hours')
+                            AND timestamp < (:t1 + INTERVAL '48 hours')
                             AND COALESCE(end_ts, timestamp) >= timestamp
                         ),
                         ordered AS (
@@ -799,6 +804,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                             '[]'::jsonb
                           ) AS hk_sources
                         FROM labeled
+                        WHERE sleep_date BETWEEN ((:t0 AT TIME ZONE 'UTC')::date - 1) AND ((:t1 AT TIME ZONE 'UTC')::date + 1)
                         GROUP BY sleep_date
                         ON CONFLICT (user_id, sleep_date) DO UPDATE SET
                           sleep_start_ts = EXCLUDED.sleep_start_ts,
@@ -823,11 +829,10 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                 try:
                     _exec(
                         """
-                        -- Keep the materialization window aligned with derived_sleep_daily.
+                        -- Keep the materialization window aligned with derived_sleep_daily (by sleep_date, not UTC start_ts).
                         DELETE FROM derived_sleep_segments
                         WHERE user_id = :user_id
-                          AND segment_start_ts >= (:t0 - INTERVAL '24 hours')
-                          AND segment_start_ts < (:t1 + INTERVAL '24 hours');
+                          AND sleep_date BETWEEN ((:t0 AT TIME ZONE 'UTC')::date - 1) AND ((:t1 AT TIME ZONE 'UTC')::date + 1);
 
                         WITH base AS (
                           SELECT
@@ -853,8 +858,8 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                             AND deleted_at IS NULL
                             AND metric_type LIKE 'sleep_%'
                             AND metric_type <> 'sleep_hours'
-                            AND timestamp >= (:t0 - INTERVAL '24 hours')
-                            AND timestamp < (:t1 + INTERVAL '24 hours')
+                            AND timestamp >= (:t0 - INTERVAL '48 hours')
+                            AND timestamp < (:t1 + INTERVAL '48 hours')
                             AND COALESCE(end_ts, timestamp) >= timestamp
                         ),
                         ordered AS (
@@ -928,6 +933,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                         FROM labeled
                         WHERE hk_uuid IS NOT NULL
                           AND (segment_end_ts > segment_start_ts)
+                          AND sleep_date BETWEEN ((:t0 AT TIME ZONE 'UTC')::date - 1) AND ((:t1 AT TIME ZONE 'UTC')::date + 1)
                           AND metric_type IN (
                             'sleep_awake_minutes',
                             'sleep_in_bed_minutes',
@@ -950,8 +956,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                           SELECT *
                           FROM derived_sleep_segments
                           WHERE user_id = :user_id
-                            AND segment_start_ts >= (:t0 - INTERVAL '24 hours')
-                            AND segment_start_ts < (:t1 + INTERVAL '24 hours')
+                            AND sleep_date BETWEEN ((:t0 AT TIME ZONE 'UTC')::date - 1) AND ((:t1 AT TIME ZONE 'UTC')::date + 1)
                         ),
                         srcs AS (
                           SELECT
