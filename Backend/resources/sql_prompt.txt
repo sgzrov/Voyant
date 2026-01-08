@@ -1,91 +1,58 @@
 Output ONLY raw SQL code with no explanations, commentary, markdown fences, or prose.
 
 <database_schema>
-SELECT rules: select only what you need; do NOT SELECT *.
+derived_rollup_hourly (hourly data for ALL health metrics, not including sleep):
+  (user_id TEXT, bucket_ts TIMESTAMPTZ, metric_type TEXT, unit TEXT, avg_value DOUBLE PRECISION, sum_value DOUBLE PRECISION, min_value DOUBLE PRECISION, max_value DOUBLE PRECISION, n BIGINT, meta JSONB, hk_sources JSONB)
+  - EAV model: filter by metric_type.
+- ALWAYS select: metric_type, unit, meta, hk_sources.
+    - If returning per-bucket rows: also select bucket_ts.
+    - If aggregating across buckets: keep metric_type and include meta/hk_sources via an aggregate (e.g., (ARRAY_AGG(meta) FILTER (WHERE meta IS NOT NULL))[1] AS meta).
+  - Select value columns based on user input (select MULTIPLE if needed):
+    - totals over time: sum_value
+    - typical level/average: avg_value
+    - peaks/dips: min_value/max_value
+    - exploratory/diagnostic questions: MUST include BOTH avg_value + sum_value (and min/max/n if helpful).
 
-derived_rollup_hourly (ALL health metrics, not including sleep):
-  (user_id TEXT, bucket_ts TIMESTAMPTZ, metric_type TEXT, avg_value DOUBLE PRECISION, sum_value DOUBLE PRECISION, min_value DOUBLE PRECISION, max_value DOUBLE PRECISION, n BIGINT, meta JSONB, hk_sources JSONB)
-  - EAV model: filter by metric_type (e.g., WHERE metric_type = 'steps'). For continuous metrics read avg_value; for additive metrics read sum_value.
-  - bucket_ts is the timestamp that labels the start of the time "bucket" that a rollup row represents. ALWAYS select this.
-  - metric_type is the type of health metric that this row represents. ALWAYS select this.
-  - avg_value is the average value of the metric_type in this bucket. ALWAYS select this.
-  - sum_value is the sum of the metric_type in this bucket. ALWAYS select this.
-  - min_value is the minimum value of the metric_type in this bucket. ALWAYS select this.
-  - max_value is the maximum value of the metric_type in this bucket. ALWAYS select this.
-  - n is the number of raw samples aggregated into this bucket for this metric_type (COUNT(*) of rows from a healh-mirrored table in that time bucket). Select this, if by user request, you feel that you need to know how confident you are in the health data.
-  - meta is timezone context. It can be NULL, but when present, it has {"tz_name": "..."}. ALWAYS select this.
-  - hk_sources is device context, a JSONB array like [{"name":"Stephan’s Apple Watch","version":"11.6.1"},{"name":"iPad","version":"26.1"}]. ALWAYS select this.
-
-derived_rollup_daily (general health data, daily buckets):
-  (user_id TEXT, bucket_ts TIMESTAMPTZ, metric_type TEXT, avg_value DOUBLE PRECISION, sum_value DOUBLE PRECISION, min_value DOUBLE PRECISION, max_value DOUBLE PRECISION, n BIGINT, meta JSONB, hk_sources JSONB)
+derived_rollup_daily (daily data for ALL health metrics, not including sleep):
+  (user_id TEXT, bucket_ts TIMESTAMPTZ, metric_type TEXT, unit TEXT, avg_value DOUBLE PRECISION, sum_value DOUBLE PRECISION, min_value DOUBLE PRECISION, max_value DOUBLE PRECISION, n BIGINT, meta JSONB, hk_sources JSONB)
   - Same SELECT rules as in derived_rollup_hourly.
 
-derived_sleep_daily (one row per sleep "night"/day, stage breakdown + time range):
+derived_sleep_daily (basic sleep data):
   (user_id TEXT, sleep_date DATE, sleep_start_ts TIMESTAMPTZ, sleep_end_ts TIMESTAMPTZ, asleep_minutes DOUBLE PRECISION, rem_minutes DOUBLE PRECISION, core_minutes DOUBLE PRECISION, deep_minutes DOUBLE PRECISION, awake_minutes DOUBLE PRECISION, meta JSONB, hk_sources JSONB)
-  - sleep_date is the day label for that sleep session. ALWAYS select this.
-  - sleep_start_ts is the start time of the sleep period. ALWAYS select this.
-  - sleep_end_ts is the end time of the sleep period. ALWAYS select this.
-  - asleep_minutes is the total minutes of sleep. ALWAYS select this.
-  - rem_minutes is the minutes of REM sleep. ALWAYS select this.
-  - core_minutes is the minutes of core sleep. ALWAYS select this.
-  - deep_minutes is the minutes of deep sleep. ALWAYS select this.
-  - awake_minutes is the minutes of awake sleep. ALWAYS select this.
-  - meta is timezone context. It can be NULL, but when present, it has {"tz_name": "..."}. ALWAYS select this.
-  - hk_sources is device context, a JSONB array like [{"name":"Stephan’s Apple Watch","version":"11.6.1"},{"name":"iPad","version":"26.1"}]. ALWAYS select this.
-  Note: sleep_date is computed per sleep *session* using the local-date of the session END (wake time) in the session’s effective timezone. ALWAYS select this.
+  - ALWAYS select: sleep_date, asleep_minutes, ALL of stage minutes (rem/core/deep/awake), meta, hk_sources (and sleep_start_ts/sleep_end_ts when timing matters).
+  - Note: sleep_date is the local-date of the session END (wake time) in the session’s effective timezone.
 
-derived_sleep_segments (one row per sleep-stage segment / interval):
-  (user_id TEXT, hk_uuid TEXT, sleep_date DATE, stage TEXT, segment_start_ts TIMESTAMPTZ, segment_end_ts TIMESTAMPTZ, minutes DOUBLE PRECISION, hk_source_bundle_id TEXT, meta JSONB, hk_sources JSONB)
-  - hk_uuid is the HealthKit HKUUID string. Select this only if you need to uniquely identify segments (debugging/UI). Otherwise omit.
-  - sleep_date is the day label for that sleep session. ALWAYS select this.
-  - stage is the sleep stage (awake, core, rem, or deep). ALWAYS select this.
-  - segment_start_ts is the start time of the sleep stage segment. ALWAYS select this.
-  - segment_end_ts is the end time of the sleep stage segment. ALWAYS select this.
-  - minutes is the duration of the sleep stage segment in minutes. ALWAYS select this.
-  - Device/source provenance lives in hk_sources (JSONB). Do NOT select/filter hk_sources unless the user asks about device/source.
-  - hk_source_bundle_id is low-level provenance (app bundle id). Do NOT select it unless the user explicitly asks about bundle id / app source / debugging.
-  Notes:
-  - stage is one of: awake | in_bed | rem | core | deep | asleep_unspecified
-  - minutes is the segment duration in minutes (should match segment_end_ts - segment_start_ts).
-  - Use this table when the question is about *when* something happened during sleep (e.g., "when did I wake up?", "how many times did I wake up?").
-  - meta may include {"tz_name": "..."} describing the timezone used to label sleep_date. meta may be NULL.
-  - hk_sources is provenance/context. Only select/filter it if the user asks about device/source. Refer to sources by their "name".
-derived_workouts (one row per workout):
-  (user_id TEXT, workout_uuid TEXT, workout_type TEXT, start_ts TIMESTAMPTZ, end_ts TIMESTAMPTZ,
-   duration_min DOUBLE PRECISION, distance_km DOUBLE PRECISION, energy_kcal DOUBLE PRECISION,
-   hk_source_bundle_id TEXT,
-   hk_sources JSONB, hk_metadata JSONB, created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ)
-  Notes:
-  - This is the preferred table for workout summary queries (one row per workout).
-  - workout_uuid is the HealthKit HKWorkout UUID string.
-  - HealthKit provenance is stored in the hk_* columns (similar to mirrored raw tables).
-  - hk_metadata may include timezone context for when the workout was recorded (e.g., "HKTimeZone" or "tz_name"). It may be NULL.
-  - hk_sources is a JSONB array like rollups, e.g. [{"name":"Apple Watch","version":"11.6.1"}]. It may be [].
-  - hk_sources is provenance/context. Only use it when the user asks about device/source. Refer to sources by their "name".
-    Do NOT cite source/software version fields unless the user explicitly asks.
-derived_workout_segments (per-workout distance splits):
-  (user_id TEXT, workout_uuid TEXT, workout_start_ts TIMESTAMPTZ, segment_unit TEXT, segment_index INTEGER,
-   start_ts TIMESTAMPTZ, end_ts TIMESTAMPTZ, start_offset_min DOUBLE PRECISION, end_offset_min DOUBLE PRECISION,
-   duration_min DOUBLE PRECISION, pace_s_per_unit DOUBLE PRECISION, avg_hr_bpm DOUBLE PRECISION, created_at TIMESTAMPTZ)
-  Notes:
-  - Rows are computed server-side from raw distance samples (distance_walking_running_km / distance_cycling_km / distance_swimming_km)
-    plus heart_rate samples, for each workout_uuid (HKWorkout UUID).
-  - segment_unit is 'km' or 'mi'. segment_index is 1..N based on the workout distance.
+derived_sleep_segments (detailed data for sleep-stage intervals):
+  (user_id TEXT, hk_uuid TEXT, sleep_date DATE, stage TEXT, segment_start_ts TIMESTAMPTZ, segment_end_ts TIMESTAMPTZ, minutes DOUBLE PRECISION, meta JSONB, hk_sources JSONB)
+  - ALWAYS select: sleep_date, stage, segment_start_ts, segment_end_ts, minutes, meta, hk_sources.
+
+derived_workouts (basic workout data):
+  (user_id TEXT, workout_uuid TEXT, workout_type TEXT, start_ts TIMESTAMPTZ, end_ts TIMESTAMPTZ, duration_min DOUBLE PRECISION, distance_km DOUBLE PRECISION, energy_kcal DOUBLE PRECISION, hk_sources JSONB, hk_metadata JSONB, created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ)
+  - Select workout_uuid when joining to segments or returning per-workout rows.
+  - ALWAYS select: workout_type, start_ts, end_ts, duration_min, distance_km, energy_kcal, hk_metadata, hk_sources.
+
+derived_workout_segments (detailed workout data):
+  (user_id TEXT, workout_uuid TEXT, workout_start_ts TIMESTAMPTZ, segment_unit TEXT, segment_index INTEGER, start_ts TIMESTAMPTZ, end_ts TIMESTAMPTZ, start_offset_min DOUBLE PRECISION, end_offset_min DOUBLE PRECISION, duration_min DOUBLE PRECISION, pace_s_per_unit DOUBLE PRECISION, avg_hr_bpm DOUBLE PRECISION, created_at TIMESTAMPTZ)
+   - ALWAYS select workout_uuid for segments.
+   - Select what you need (segment_unit/index, start_ts/end_ts, duration_min; workout_start_ts and start_offset_min/end_offset_min when you need relative timing; pace/hr if relevant). Never select created_at.
 </database_schema>
-
-<metric_conventions>
-Additive metrics (SUM over time): steps, active_energy_burned, active_time_minutes, distance_walking_running_km, distance_cycling_km, distance_swimming_km, dietary_water.
-Sleep metrics: Use derived_sleep_daily (stage columns are minutes).
-Continuous metrics (AVG over time): heart_rate, resting_heart_rate, walking_hr_avg, hr_variability_sdnn, oxygen_saturation, walking_speed, vo2_max, body_mass, body_mass_index, blood_glucose, blood_pressure_systolic, blood_pressure_diastolic, respiratory_rate, body_temperature.
-</metric_conventions>
 
 <sql_query_rules>
 - SELECT-only; never modify data.
 - Do NOT use UNION or UNION ALL (complex queries are not allowed).
+  - If you need multiple related slices (e.g., previous day / same day / next day, or multiple offsets around an anchor), you MUST do it in ONE query using conditional aggregates (pivot), not UNION.
+    Example: MAX(CASE WHEN DATE(bucket_ts AT TIME ZONE :tz_name)=anchor_date THEN avg_value END) AS same_day_x_avg (choose avg_value vs sum_value as appropriate).
 - Do NOT use ORDER BY unless absolutely necessary; for "most recent" use MAX(start_ts) for derived_workouts.
 - Always filter by user_id = :user_id.
-- Do NOT select columns that do not exist on the chosen table (e.g., do NOT select unit from rollup tables).
-- Do NOT use AT TIME ZONE in queries; the backend localizes timestamps using :tz_name.
+- Do NOT use SELECT *. Select only the columns needed to answer the question.
+- Do NOT select columns that do not exist on the chosen table.
+- Rollups: follow the `<database_schema>` ALWAYS-select rules so returned numbers are always labeled (metric_type/unit/meta/hk_sources).
+- Do NOT select bookkeeping timestamps (created_at, updated_at) unless the user explicitly asks.
+- You may use AT TIME ZONE, but ONLY with :tz_name, and only for date math / day boundaries (never for formatting).
+  - Do NOT use per-row timezone JSON (meta/hk_metadata) inside SQL expressions (e.g., do NOT write: bucket_ts AT TIME ZONE meta->>'tz_name' or bucket_ts AT TIME ZONE (meta->>'tz_name')).
+  - ALWAYS use EXACTLY: bucket_ts AT TIME ZONE :tz_name (or start_ts/timestamp similarly). `AT TIME ZONE` binds tighter than `->>`. So `ts AT TIME ZONE meta ->> 'tz_name'` is WRONG and will error.
+  - If you ever need JSON extraction in an AT TIME ZONE expression (avoid if possible), you MUST parenthesize it: ts AT TIME ZONE (meta->>'tz_name').
+- If you use now() or date_trunc for time windows, always use: (now() AT TIME ZONE :tz_name).
 - Do NOT do timezone formatting in SQL. Select raw TIMESTAMPTZ columns (timestamp, bucket_ts, start_ts, end_ts).
   The backend formats them for display using per-row timezone context when available (rollups: meta.tz_name; workouts: hk_metadata.HKTimeZone / hk_metadata.tz_name); otherwise it uses :tz_name (user's current/request timezone).
 - If the user explicitly asks what timezone a workout occurred in, you may select hk_metadata->>'HKTimeZone' (or hk_metadata->>'tz_name') from derived_workouts as a plain string.
@@ -93,32 +60,57 @@ Continuous metrics (AVG over time): heart_rate, resting_heart_rate, walking_hr_a
 - IMPORTANT: When aggregating continuous metrics across multiple buckets from derived_rollup_hourly, use a weighted average by n: SUM(avg_value * n) / NULLIF(SUM(n), 0)  (not AVG(avg_value)).
 
 <table_mapping_rules>
-You can query either ONE or BOTH of the tables together, depending on the question.
-- For workout summary questions, prefer derived_workouts (one row per workout).
-- Use derived_workout_segments for within-workout “mile/km X” questions; join to derived_workouts by workout_uuid when you need workout context.
-- If you need general health metric data (heart rate, sleep, steps, HRV, etc.), use derived_rollup_hourly.
-- IMPORTANT: Sleep is NOT available in derived_rollup_hourly or derived_rollup_daily. For sleep totals, stages, and time range, use derived_sleep_daily.
-- For sleep stage intervals ("when did I wake up?", "how many awakenings?"), use derived_sleep_segments.
-- If you need data from both tables, use a CTE to find the relevant workout timestamp first, then query derived_rollup_hourly in a post-workout window.
-- If you need to return BOTH workout details and recovery metrics, do it in ONE SELECT using:
-  (a) a CTE to find the workout timestamp, and
-  (b) either scalar subqueries for recovery metrics, or LEFT JOINs + conditional aggregation.
-  Do NOT use UNION/UNION ALL to stitch different result shapes together.
-- If you use CTEs/derived tables, do NOT reference columns that are not selected into them. If you need user_id for joins, either:
-  (a) select user_id into the CTE, or
-  (b) join/filter with user_id = :user_id (preferred, since user_id is constant).
+Use only the tables needed for the question (prefer 1 table; add more only when required).
+- When joining tables, ALWAYS use explicit JOIN ... ON ... with a stable key (never FROM a, b without an ON; avoid cartesian products).
+- If you need workout context for segments, JOIN derived_workout_segments to derived_workouts by workout_uuid (and always filter user_id = :user_id).
 - For "most recent" / "latest" workout, do NOT use ORDER BY; use MAX(start_ts) from derived_workouts.
+- Whenever the question requires relating multiple signals (e.g., habits hurting/helping, drivers, “why is X worse/better”, correlations/associations, impacts/relationships), align them on ONE shared grain (night/day/hour/workout) and avoid exploding row counts:
+  - Choose ONE anchor grain: night (sleep_date), day (DATE(bucket_ts AT TIME ZONE :tz_name)), hour (bucket_ts), or workout (workout_uuid/start_ts).
+  - Align by stable keys:
+    - workouts↔segments: workout_uuid
+    - rollups↔rollups: same bucket_ts granularity + metric_type
+    - sleep_date↔daily rollups: sleep_date = DATE(bucket_ts AT TIME ZONE :tz_name)
+      - IMPORTANT: bucket_ts is TIMESTAMPTZ and sleep_date is DATE; always join via DATE(...).
+      - Do NOT write: sleep_date = (bucket_ts AT TIME ZONE meta->>'tz_name') or any variant using JSON tz in SQL.
+      - When shifting a DATE by an interval, always cast back to DATE: (sleep_date + INTERVAL '1 day')::date.
+  - If you need multiple rollup metric_types in one row, pivot with conditional aggregates (MAX(CASE WHEN metric_type='X' THEN avg_value/sum_value END) AS x).
+  - Keep joins to ≤ 4 derived health tables.
+- LEFT JOIN rule (to avoid “missing data”):
+  - If you LEFT JOIN optional context tables (rollups/workouts) and still want the anchor row even when context is missing, NEVER put right-table filters in the WHERE clause (e.g., do NOT write "WHERE dr.user_id = :user_id").
+  - Put those filters inside the JOIN ... ON (or in a subquery used in the JOIN) so the LEFT JOIN remains a LEFT JOIN.
+  - This includes metric_type filters: do NOT write "WHERE dr.metric_type IN (...)"; put that filter in the JOIN ... ON instead.
 </table_mapping_rules>
+
+<metric_type_rules>
+- metric_type strings must match the database exactly. Do NOT guess metric_type names.
+- If you are unsure what metric_type values exist for the requested window, do NOT filter by metric_type; return rows with metric_type and both avg_value + sum_value for the relevant window and let the assistant select what matters.
+- If the question is asking for drivers/“what changed” across days (or “what’s hurting/helping”), prefer returning per-metric_type rows with day-aligned values + deltas so the assistant can explain what drove the change without guessing.
+  - Use ONE query with conditional aggregates (no UNION), group by metric_type, and compute deltas. Example pattern:
+    SELECT
+      metric_type,
+      MAX(CASE WHEN DATE(bucket_ts AT TIME ZONE :tz_name) = anchor_date::date THEN avg_value END) AS same_day_avg,
+      MAX(CASE WHEN DATE(bucket_ts AT TIME ZONE :tz_name) = (anchor_date - INTERVAL '1 day')::date THEN avg_value END) AS prev_day_avg,
+      MAX(CASE WHEN DATE(bucket_ts AT TIME ZONE :tz_name) = (anchor_date + INTERVAL '1 day')::date THEN avg_value END) AS next_day_avg,
+      MAX(CASE WHEN DATE(bucket_ts AT TIME ZONE :tz_name) = anchor_date::date THEN sum_value END) AS same_day_sum,
+      MAX(CASE WHEN DATE(bucket_ts AT TIME ZONE :tz_name) = (anchor_date - INTERVAL '1 day')::date THEN sum_value END) AS prev_day_sum,
+      MAX(CASE WHEN DATE(bucket_ts AT TIME ZONE :tz_name) = (anchor_date + INTERVAL '1 day')::date THEN sum_value END) AS next_day_sum
+    FROM derived_rollup_daily
+    WHERE user_id = :user_id
+      AND DATE(bucket_ts AT TIME ZONE :tz_name) BETWEEN (anchor_date - INTERVAL '1 day')::date AND (anchor_date + INTERVAL '1 day')::date
+    GROUP BY metric_type
+    ORDER BY ABS(COALESCE(next_day_sum,0)-COALESCE(prev_day_sum,0)) DESC
+    LIMIT 10
+</metric_type_rules>
 
 <date_filtering_rules>
 - ALWAYS include date predicates when the user mentions ANY time period (specific or vague):
   * For derived_workouts, filter on start_ts. For rollups, filter on bucket_ts.
-  * Prefer placeholders (must be quoted strings; backend rewrites them): 'today_start'/'today_end', 'yesterday_start'/'yesterday_end'.
-    Examples:
-    - start_ts >= 'today_start' AND start_ts < 'today_end'
-    - start_ts >= 'yesterday_start' AND start_ts < 'yesterday_end'
-    - bucket_ts >= 'today_start' AND bucket_ts < 'today_end'
-    - bucket_ts >= 'yesterday_start' AND bucket_ts < 'yesterday_end'
+  * Do NOT use any quoted placeholder strings (e.g., 'today_start', '7_days_ago_start'). Write full SQL date math instead.
+    Canonical half-open day windows (use with start_ts / bucket_ts):
+    - Today: ts >= date_trunc('day', (now() AT TIME ZONE :tz_name)) AND ts < date_trunc('day', (now() AT TIME ZONE :tz_name)) + INTERVAL '1 day'
+    - Yesterday: ts >= date_trunc('day', (now() AT TIME ZONE :tz_name)) - INTERVAL '1 day' AND ts < date_trunc('day', (now() AT TIME ZONE :tz_name))
+    - Last 7 days: ts >= date_trunc('day', (now() AT TIME ZONE :tz_name)) - INTERVAL '6 days' AND ts < date_trunc('day', (now() AT TIME ZONE :tz_name)) + INTERVAL '1 day'
+    For derived_sleep_daily.sleep_date: apply the same bounds but cast to ::date.
   * When filtering for a specific day, ALWAYS use a half-open interval with matching boundaries for the same period. Do NOT mix a start from one period with an end from another (e.g., 'yesterday_start' with 'today_end').
     Example ("day before yesterday"): timestamp >= date_trunc('day', now() - INTERVAL '2 days') AND timestamp < (date_trunc('day', now() - INTERVAL '2 days') + INTERVAL '1 day')
   * Or use TIMESTAMP literals with half-open intervals: bucket_ts >= TIMESTAMP 'YYYY-MM-DD HH:MM' AND bucket_ts < TIMESTAMP '...'.

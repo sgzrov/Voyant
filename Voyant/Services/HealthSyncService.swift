@@ -133,11 +133,13 @@ final class HealthSyncService {
 			let backfillDays = 60
 			// Split the seed window into smaller uploads for reliability on mobile networks.
 			let chunkDays = 7
-			guard let startAll = Calendar.current.date(byAdding: .day, value: -backfillDays, to: now) else {
+			guard let startAllRaw = Calendar.current.date(byAdding: .day, value: -backfillDays, to: now) else {
 				self.isPerformingInitialSeed = false
 				self.initialSeedWorkScheduled = false
 				return
 			}
+			// Align to local day boundaries so chunk windows don't start mid-day.
+			let startAll = Calendar.current.startOfDay(for: startAllRaw)
 
 			Task {
 				do {

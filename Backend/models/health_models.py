@@ -24,7 +24,6 @@ class MainHealthMetric(Base):
     meta = Column(JSONB, nullable=True)
     hk_uuid = Column(Text, nullable=True)
     deleted_at = Column(DateTime(timezone=True), nullable=True)
-    hk_source_bundle_id = Column(Text, nullable=True)
     hk_source_name = Column(Text, nullable=True)
     hk_source_version = Column(Text, nullable=True)
     hk_metadata = Column(JSONB, nullable=True)
@@ -46,7 +45,6 @@ class MainHealthEvent(Base):
 
     hk_uuid = Column(Text, nullable=True)
     deleted_at = Column(DateTime(timezone=True), nullable=True)
-    hk_source_bundle_id = Column(Text, nullable=True)
     hk_source_name = Column(Text, nullable=True)
     hk_source_version = Column(Text, nullable=True)
     hk_metadata = Column(JSONB, nullable=True)
@@ -59,6 +57,7 @@ class DerivedRollupHourly(Base):
     metric_type = Column(Text, primary_key=True)
     bucket_ts = Column(DateTime(timezone=True), primary_key=True)
 
+    unit = Column(Text, nullable=True)
     avg_value = Column(Float, nullable=True)
     sum_value = Column(Float, nullable=True)
     min_value = Column(Float, nullable=True)
@@ -76,6 +75,7 @@ class DerivedRollupDaily(Base):
     metric_type = Column(Text, primary_key=True)
     bucket_ts = Column(DateTime(timezone=True), primary_key=True)
 
+    unit = Column(Text, nullable=True)
     avg_value = Column(Float, nullable=True)
     sum_value = Column(Float, nullable=True)
     min_value = Column(Float, nullable=True)
@@ -100,7 +100,6 @@ class DerivedWorkout(Base):
     distance_km = Column(Float, nullable=True)
     energy_kcal = Column(Float, nullable=True)
 
-    hk_source_bundle_id = Column(Text, nullable=True)
     hk_sources = Column(JSONB, nullable=True)
     hk_metadata = Column(JSONB, nullable=True)
 
@@ -162,7 +161,6 @@ class DerivedSleepSegment(Base):
     segment_end_ts = Column(DateTime(timezone=True), nullable=False)
     minutes = Column(Float, nullable=False)
 
-    hk_source_bundle_id = Column(Text, nullable=True)
     meta = Column(JSONB, nullable=True)
     hk_sources = Column(JSONB, nullable=True)
 

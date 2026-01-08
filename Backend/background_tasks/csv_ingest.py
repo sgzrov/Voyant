@@ -281,7 +281,6 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                             "unit": _str_or_none(r.get("unit")) if "unit" in df_ev_up.columns else None,
                             "source": _str_or_none(r.get("source")) if "source" in df_ev_up.columns else None,
                             "created_at": _py_dt_or_none(r.get("created_at")) if "created_at" in df_ev_up.columns else None,
-                            "hk_source_bundle_id": _str_or_none(r.get("hk_source_bundle_id")) if "hk_source_bundle_id" in df_ev_up.columns else None,
                             "hk_source_name": _str_or_none(r.get("hk_source_name")) if "hk_source_name" in df_ev_up.columns else None,
                             "hk_source_version": _str_or_none(r.get("hk_source_version")) if "hk_source_version" in df_ev_up.columns else None,
                             "hk_metadata": hk_meta if "hk_metadata" in df_ev_up.columns else None,
@@ -293,10 +292,10 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                     """
                     INSERT INTO main_health_events
                         (user_id, hk_uuid, timestamp, end_ts, event_type, value, unit, source, created_at,
-                         hk_source_bundle_id, hk_source_name, hk_source_version, hk_metadata, deleted_at)
+                         hk_source_name, hk_source_version, hk_metadata, deleted_at)
                     VALUES
                         (:user_id, :hk_uuid, :timestamp, :end_ts, :event_type, :value, :unit, :source, :created_at,
-                         :hk_source_bundle_id, :hk_source_name, :hk_source_version, CAST(:hk_metadata AS jsonb), NULL)
+                         :hk_source_name, :hk_source_version, CAST(:hk_metadata AS jsonb), NULL)
                     ON CONFLICT (user_id, hk_uuid, event_type) WHERE hk_uuid IS NOT NULL DO UPDATE
                     SET
                         timestamp = EXCLUDED.timestamp,
@@ -305,7 +304,6 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                         unit = COALESCE(EXCLUDED.unit, main_health_events.unit),
                         source = COALESCE(EXCLUDED.source, main_health_events.source),
                         created_at = COALESCE(EXCLUDED.created_at, main_health_events.created_at),
-                        hk_source_bundle_id = COALESCE(EXCLUDED.hk_source_bundle_id, main_health_events.hk_source_bundle_id),
                         hk_source_name = COALESCE(EXCLUDED.hk_source_name, main_health_events.hk_source_name),
                         hk_source_version = COALESCE(EXCLUDED.hk_source_version, main_health_events.hk_source_version),
                         hk_metadata = COALESCE(EXCLUDED.hk_metadata, main_health_events.hk_metadata),
@@ -446,7 +444,6 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                         "created_at": _py_dt_or_none(r.get("created_at")) if "created_at" in df_up.columns else None,
                     "meta": meta,
                         "hk_uuid": _str_or_none(r.get("hk_uuid")) if "hk_uuid" in df_up.columns else None,
-                        "hk_source_bundle_id": _str_or_none(r.get("hk_source_bundle_id")) if "hk_source_bundle_id" in df_up.columns else None,
                         "hk_source_name": _str_or_none(r.get("hk_source_name")) if "hk_source_name" in df_up.columns else None,
                         "hk_source_version": _str_or_none(r.get("hk_source_version")) if "hk_source_version" in df_up.columns else None,
                         "hk_metadata": _str_or_none(r.get("hk_metadata")) if "hk_metadata" in df_up.columns else None,
@@ -463,10 +460,10 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                     """
                     INSERT INTO main_health_metrics
                         (user_id, hk_uuid, timestamp, end_ts, metric_type, metric_value, unit, created_at, meta,
-                         hk_source_bundle_id, hk_source_name, hk_source_version, hk_metadata, deleted_at)
+                         hk_source_name, hk_source_version, hk_metadata, deleted_at)
                     VALUES
                         (:user_id, :hk_uuid, :timestamp, :end_ts, :metric_type, :metric_value, :unit, :created_at, CAST(:meta AS jsonb),
-                         :hk_source_bundle_id, :hk_source_name, :hk_source_version, CAST(:hk_metadata AS jsonb), NULL)
+                         :hk_source_name, :hk_source_version, CAST(:hk_metadata AS jsonb), NULL)
                     ON CONFLICT (user_id, hk_uuid) WHERE hk_uuid IS NOT NULL DO UPDATE
                     SET
                         timestamp = EXCLUDED.timestamp,
@@ -476,7 +473,6 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                         unit = COALESCE(EXCLUDED.unit, main_health_metrics.unit),
                         created_at = COALESCE(EXCLUDED.created_at, main_health_metrics.created_at),
                         meta = EXCLUDED.meta,
-                        hk_source_bundle_id = COALESCE(EXCLUDED.hk_source_bundle_id, main_health_metrics.hk_source_bundle_id),
                         hk_source_name = COALESCE(EXCLUDED.hk_source_name, main_health_metrics.hk_source_name),
                         hk_source_version = COALESCE(EXCLUDED.hk_source_version, main_health_metrics.hk_source_version),
                         hk_metadata = COALESCE(EXCLUDED.hk_metadata, main_health_metrics.hk_metadata),
@@ -535,11 +531,12 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                 _exec(
                     """
                     INSERT INTO derived_rollup_hourly
-                        (user_id, bucket_ts, metric_type, avg_value, sum_value, min_value, max_value, n, meta, hk_sources)
+                        (user_id, bucket_ts, metric_type, unit, avg_value, sum_value, min_value, max_value, n, meta, hk_sources)
                     SELECT
                         :user_id AS user_id,
                         date_trunc('hour', timestamp) AS bucket_ts,
                         metric_type,
+                        (ARRAY_AGG(unit) FILTER (WHERE unit IS NOT NULL) ORDER BY timestamp DESC)[1] AS unit,
                         AVG(CASE WHEN metric_type IN (
                             'heart_rate','resting_heart_rate','walking_hr_avg','hr_variability_sdnn',
                             'oxygen_saturation','walking_speed','vo2_max','body_mass','body_mass_index',
@@ -556,42 +553,24 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                         COUNT(*) AS n
                         , (
                             ARRAY_AGG(
-                              COALESCE(
-                                meta,
-                                NULLIF(
-                                  jsonb_strip_nulls(
-                                    jsonb_build_object(
-                                      'tz_name',
-                                      COALESCE(
-                                        hk_metadata->>'HKTimeZone',
-                                        hk_metadata->>'tz_name',
-                                        hk_metadata->>'timezone'
-                                      )
+                              NULLIF(
+                                jsonb_strip_nulls(
+                                  COALESCE(meta, '{}'::jsonb)
+                                  || jsonb_build_object(
+                                    'tz_name',
+                                    COALESCE(
+                                      meta->>'tz_name',
+                                      hk_metadata->>'HKTimeZone',
+                                      hk_metadata->>'tz_name',
+                                      hk_metadata->>'timezone'
                                     )
-                                  ),
-                                  '{}'::jsonb
-                                )
+                                  )
+                                ),
+                                '{}'::jsonb
                               )
                               ORDER BY timestamp DESC
                             )
-                            FILTER (
-                              WHERE COALESCE(
-                                meta,
-                                NULLIF(
-                                  jsonb_strip_nulls(
-                                    jsonb_build_object(
-                                      'tz_name',
-                                      COALESCE(
-                                        hk_metadata->>'HKTimeZone',
-                                        hk_metadata->>'tz_name',
-                                        hk_metadata->>'timezone'
-                                      )
-                                    )
-                                  ),
-                                  '{}'::jsonb
-                                )
-                              ) IS NOT NULL
-                            )
+                            FILTER (WHERE meta IS NOT NULL OR hk_metadata IS NOT NULL)
                           )[1] AS meta
                         , COALESCE(
                             jsonb_agg(DISTINCT jsonb_build_object('name', hk_source_name, 'version', hk_source_version))
@@ -638,11 +617,12 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                 _exec(
                     """
                     INSERT INTO derived_rollup_daily
-                        (user_id, bucket_ts, metric_type, avg_value, sum_value, min_value, max_value, n, meta, hk_sources)
+                        (user_id, bucket_ts, metric_type, unit, avg_value, sum_value, min_value, max_value, n, meta, hk_sources)
                     SELECT
                         :user_id AS user_id,
                         date_trunc('day', timestamp) AS bucket_ts,
                         metric_type,
+                        (ARRAY_AGG(unit) FILTER (WHERE unit IS NOT NULL) ORDER BY timestamp DESC)[1] AS unit,
                         AVG(CASE WHEN metric_type IN (
                             'heart_rate','resting_heart_rate','walking_hr_avg','hr_variability_sdnn',
                             'oxygen_saturation','walking_speed','vo2_max','body_mass','body_mass_index',
@@ -659,42 +639,24 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                         COUNT(*) AS n
                         , (
                             ARRAY_AGG(
-                              COALESCE(
-                                meta,
-                                NULLIF(
-                                  jsonb_strip_nulls(
-                                    jsonb_build_object(
-                                      'tz_name',
-                                      COALESCE(
-                                        hk_metadata->>'HKTimeZone',
-                                        hk_metadata->>'tz_name',
-                                        hk_metadata->>'timezone'
-                                      )
+                              NULLIF(
+                                jsonb_strip_nulls(
+                                  COALESCE(meta, '{}'::jsonb)
+                                  || jsonb_build_object(
+                                    'tz_name',
+                                    COALESCE(
+                                      meta->>'tz_name',
+                                      hk_metadata->>'HKTimeZone',
+                                      hk_metadata->>'tz_name',
+                                      hk_metadata->>'timezone'
                                     )
-                                  ),
-                                  '{}'::jsonb
-                                )
+                                  )
+                                ),
+                                '{}'::jsonb
                               )
                               ORDER BY timestamp DESC
                             )
-                            FILTER (
-                              WHERE COALESCE(
-                                meta,
-                                NULLIF(
-                                  jsonb_strip_nulls(
-                                    jsonb_build_object(
-                                      'tz_name',
-                                      COALESCE(
-                                        hk_metadata->>'HKTimeZone',
-                                        hk_metadata->>'tz_name',
-                                        hk_metadata->>'timezone'
-                                      )
-                                    )
-                                  ),
-                                  '{}'::jsonb
-                                )
-                              ) IS NOT NULL
-                            )
+                            FILTER (WHERE meta IS NOT NULL OR hk_metadata IS NOT NULL)
                           )[1] AS meta
                         , COALESCE(
                             jsonb_agg(DISTINCT jsonb_build_object('name', hk_source_name, 'version', hk_source_version))
@@ -749,7 +711,6 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                             COALESCE(end_ts, timestamp) AS segment_end_ts,
                             metric_type,
                             metric_value,
-                            hk_source_bundle_id,
                             hk_source_name,
                             hk_source_version,
                             meta,
@@ -876,7 +837,6 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                             COALESCE(end_ts, timestamp) AS segment_end_ts,
                             metric_type,
                             metric_value,
-                            hk_source_bundle_id,
                             hk_source_name,
                             hk_source_version,
                             meta,
@@ -939,7 +899,7 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                         )
                         INSERT INTO derived_sleep_segments
                           (user_id, hk_uuid, sleep_date, stage, segment_start_ts, segment_end_ts, minutes,
-                           hk_source_bundle_id, meta, hk_sources)
+                           meta, hk_sources)
                         SELECT
                           user_id,
                           hk_uuid,
@@ -956,7 +916,6 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                           segment_start_ts,
                           segment_end_ts,
                           COALESCE(metric_value, 0) AS minutes,
-                          hk_source_bundle_id,
                           COALESCE(
                             meta,
                             NULLIF(jsonb_strip_nulls(jsonb_build_object('tz_name', tz_name_eff)), '{}'::jsonb)
@@ -980,6 +939,70 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                         """,
                         {"user_id": user_id, "t0": d0, "t1": d1},
                         "upsert derived_sleep_segments",
+                    )
+                    session.commit()
+
+                    # Reconcile derived_sleep_daily from derived_sleep_segments so the daily rollup can't drift
+                    # from the segment materialization (e.g., when late-arriving segments extend a session across UTC-midnight).
+                    _exec(
+                        """
+                        WITH seg AS (
+                          SELECT *
+                          FROM derived_sleep_segments
+                          WHERE user_id = :user_id
+                            AND segment_start_ts >= (:t0 - INTERVAL '24 hours')
+                            AND segment_start_ts < (:t1 + INTERVAL '24 hours')
+                        ),
+                        srcs AS (
+                          SELECT
+                            sleep_date,
+                            jsonb_build_object('name', e->>'name', 'version', e->>'version') AS src
+                          FROM seg
+                          CROSS JOIN LATERAL jsonb_array_elements(COALESCE(seg.hk_sources, '[]'::jsonb)) AS e
+                          WHERE e ? 'name'
+                        ),
+                        srcs_agg AS (
+                          SELECT
+                            sleep_date,
+                            COALESCE(jsonb_agg(DISTINCT src) FILTER (WHERE src IS NOT NULL), '[]'::jsonb) AS hk_sources
+                          FROM srcs
+                          GROUP BY sleep_date
+                        )
+                        INSERT INTO derived_sleep_daily
+                          (user_id, sleep_date, sleep_start_ts, sleep_end_ts,
+                           asleep_minutes, rem_minutes, core_minutes, deep_minutes, awake_minutes,
+                           meta, hk_sources)
+                        SELECT
+                          :user_id AS user_id,
+                          seg.sleep_date,
+                          MIN(seg.segment_start_ts) AS sleep_start_ts,
+                          MAX(seg.segment_end_ts) AS sleep_end_ts,
+                          SUM(CASE WHEN seg.stage IN ('rem','core','deep','asleep_unspecified') THEN seg.minutes ELSE 0 END) AS asleep_minutes,
+                          SUM(CASE WHEN seg.stage = 'rem' THEN seg.minutes ELSE 0 END) AS rem_minutes,
+                          SUM(CASE WHEN seg.stage = 'core' THEN seg.minutes ELSE 0 END) AS core_minutes,
+                          SUM(CASE WHEN seg.stage = 'deep' THEN seg.minutes ELSE 0 END) AS deep_minutes,
+                          SUM(CASE WHEN seg.stage = 'awake' THEN seg.minutes ELSE 0 END) AS awake_minutes,
+                          (ARRAY_AGG(seg.meta ORDER BY seg.segment_start_ts DESC) FILTER (WHERE seg.meta IS NOT NULL))[1] AS meta,
+                          COALESCE(srcs_agg.hk_sources, '[]'::jsonb) AS hk_sources
+                        FROM seg
+                        LEFT JOIN srcs_agg USING (sleep_date)
+                        GROUP BY seg.sleep_date, srcs_agg.hk_sources
+                        ON CONFLICT (user_id, sleep_date) DO UPDATE SET
+                          sleep_start_ts = EXCLUDED.sleep_start_ts,
+                          sleep_end_ts = EXCLUDED.sleep_end_ts,
+                          asleep_minutes = EXCLUDED.asleep_minutes,
+                          rem_minutes = EXCLUDED.rem_minutes,
+                          core_minutes = EXCLUDED.core_minutes,
+                          deep_minutes = EXCLUDED.deep_minutes,
+                          awake_minutes = EXCLUDED.awake_minutes,
+                          meta = COALESCE(EXCLUDED.meta, derived_sleep_daily.meta),
+                          hk_sources = CASE
+                            WHEN jsonb_array_length(EXCLUDED.hk_sources) > 0 THEN EXCLUDED.hk_sources
+                            ELSE derived_sleep_daily.hk_sources
+                          END
+                        """,
+                        {"user_id": user_id, "t0": d0, "t1": d1},
+                        "reconcile derived_sleep_daily from derived_sleep_segments",
                     )
                     session.commit()
                 except Exception:
@@ -1052,7 +1075,6 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
 
                 select_cols = ["hk_uuid", "event_type", "value", "source", "timestamp", "end_ts"]
                 for c in (
-                    "hk_source_bundle_id",
                     "hk_source_name",
                     "hk_source_version",
                     "hk_metadata",
@@ -1092,7 +1114,6 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                             "dist_km": None,
                             "dur_min": None,
                             "kcal": None,
-                            "hk_source_bundle_id": None,
                             "hk_source_name": None,
                             "hk_source_version": None,
                             "hk_metadata": None,
@@ -1106,7 +1127,6 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                         w["source"] = r["source"]
                     # Provenance: keep first non-null.
                     for k in (
-                        "hk_source_bundle_id",
                         "hk_source_name",
                         "hk_source_version",
                         "hk_metadata",
@@ -1154,7 +1174,6 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                                 "duration_min": float(dur_min) if dur_min is not None else None,
                                 "distance_km": float(dist_km) if dist_km is not None else None,
                                 "energy_kcal": float(kcal) if kcal is not None else None,
-                                "hk_source_bundle_id": w.get("hk_source_bundle_id"),
                                 "hk_sources": json.dumps(
                                     [
                                         {"name": w.get("hk_source_name"), "version": w.get("hk_source_version")}
@@ -1171,11 +1190,10 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                                 """
                                 INSERT INTO derived_workouts
                                     (user_id, workout_uuid, workout_type, start_ts, end_ts, duration_min, distance_km, energy_kcal,
-                                     hk_source_bundle_id, hk_sources, hk_metadata,
+                                     hk_sources, hk_metadata,
                                      created_at, updated_at)
                                 VALUES
                                     (:user_id, :workout_uuid, :workout_type, :start_ts, :end_ts, :duration_min, :distance_km, :energy_kcal,
-                                     :hk_source_bundle_id,
                                      CAST(:hk_sources AS jsonb), CAST(:hk_metadata AS jsonb),
                                      NOW(), NOW())
                                 ON CONFLICT (user_id, workout_uuid) DO UPDATE
@@ -1186,7 +1204,6 @@ def process_csv_upload(user_id: str, csv_bytes_b4: str) -> dict[str, int]:
                                     duration_min = COALESCE(EXCLUDED.duration_min, derived_workouts.duration_min),
                                     distance_km = COALESCE(EXCLUDED.distance_km, derived_workouts.distance_km),
                                     energy_kcal = COALESCE(EXCLUDED.energy_kcal, derived_workouts.energy_kcal),
-                                    hk_source_bundle_id = COALESCE(EXCLUDED.hk_source_bundle_id, derived_workouts.hk_source_bundle_id),
                                     hk_metadata = COALESCE(EXCLUDED.hk_metadata, derived_workouts.hk_metadata),
                                     hk_sources = COALESCE(EXCLUDED.hk_sources, derived_workouts.hk_sources),
                                     updated_at = NOW()

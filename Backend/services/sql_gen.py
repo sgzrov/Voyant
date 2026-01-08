@@ -319,7 +319,9 @@ def _rewrite_rollup_hourly_to_tz_derived(sql: str) -> str:
             "   user_id,\n"
             "   (date_trunc('hour', bucket_ts AT TIME ZONE :tz_name) AT TIME ZONE :tz_name) AS bucket_ts,\n"
             "   metric_type,\n"
+            "   (ARRAY_AGG(unit) FILTER (WHERE unit IS NOT NULL))[1] AS unit,\n"
             "   (ARRAY_AGG(meta) FILTER (WHERE meta IS NOT NULL))[1] AS meta,\n"
+            "   (ARRAY_AGG(hk_sources) FILTER (WHERE hk_sources IS NOT NULL))[1] AS hk_sources,\n"
             "   CASE WHEN SUM(n) > 0 THEN SUM(COALESCE(avg_value, 0) * n) / SUM(n) END AS avg_value,\n"
             "   SUM(COALESCE(sum_value, 0)) AS sum_value,\n"
             "   MIN(min_value) AS min_value,\n"
@@ -376,7 +378,9 @@ def _rewrite_rollup_daily_to_tz_derived(sql: str) -> str:
             "   user_id,\n"
             "   (date_trunc('day', bucket_ts AT TIME ZONE :tz_name) AT TIME ZONE :tz_name) AS bucket_ts,\n"
             "   metric_type,\n"
+            "   (ARRAY_AGG(unit) FILTER (WHERE unit IS NOT NULL))[1] AS unit,\n"
             "   (ARRAY_AGG(meta) FILTER (WHERE meta IS NOT NULL))[1] AS meta,\n"
+            "   (ARRAY_AGG(hk_sources) FILTER (WHERE hk_sources IS NOT NULL))[1] AS hk_sources,\n"
             "   CASE WHEN SUM(n) > 0 THEN SUM(COALESCE(avg_value, 0) * n) / SUM(n) END AS avg_value,\n"
             "   SUM(COALESCE(sum_value, 0)) AS sum_value,\n"
             "   MIN(min_value) AS min_value,\n"
@@ -616,24 +620,12 @@ def _sanitize_sql(sql: str) -> str:
         health_sources={"derived_rollup_hourly", "derived_rollup_daily", "derived_sleep_daily", "derived_workouts", "derived_workout_segments"},
     )
 
-    # Allow multi-table ONLY for the specific combos:
-    if len(used_health_sources) > 1:
-        allowed_combos = (
-            {"derived_workouts", "derived_workout_segments"},
-            {"derived_workouts", "derived_rollup_hourly"},
-            {"derived_workouts", "derived_rollup_daily"},
-            {"derived_workouts", "derived_sleep_daily"},
-            {"derived_workouts", "derived_workout_segments", "derived_rollup_hourly"},
-            {"derived_workouts", "derived_workout_segments", "derived_rollup_daily"},
-            {"derived_workouts", "derived_workout_segments", "derived_sleep_daily"},
+    # We allow joining derived tables, but keep a simple cap to avoid pathological multi-joins
+    # (this sanitizer is regex-based; huge join graphs can be expensive and hard to reason about).
+    if len(used_health_sources) > 4:
+        raise ValueError(
+            "Query uses too many health tables. Limit joins to at most 4 derived health tables."
         )
-        if used_health_sources not in allowed_combos:
-            raise ValueError(
-                "Query must use exactly one health table (derived_rollup_hourly OR derived_rollup_daily OR derived_sleep_daily OR derived_workouts OR derived_workout_segments), "
-                "or one of the allowed combos: "
-                "(derived_workouts + derived_workout_segments) / (derived_workouts + derived_rollup_hourly) / (derived_workouts + derived_rollup_daily) / (derived_workouts + derived_sleep_daily) / "
-                "(derived_workouts + derived_workout_segments + derived_rollup_hourly) / (derived_workouts + derived_workout_segments + derived_rollup_daily) / (derived_workouts + derived_workout_segments + derived_sleep_daily)"
-            )
 
     # Always rewrite to safe derived tables BEFORE further validation/rewrites:
     # - hourly rollups get tz-normalized and scoped to user_id
@@ -725,108 +717,15 @@ def _sanitize_sql(sql: str) -> str:
     # JSON numeric strings may include decimals; ::int can fail in generated SQL.
     s = re.sub(r"::\s*(int|integer)\b", "::float", s, flags=re.IGNORECASE)
 
-    # Normalize day-level comparisons to the user's timezone (best-effort rewrites).
+    # Fix common operator-precedence bug in generated SQL:
+    # "ts AT TIME ZONE x.meta ->> 'tz_name'" is parsed as (ts AT TIME ZONE x.meta) ->> 'tz_name',
+    # which calls timezone(jsonb, timestamptz) and fails. Parenthesize the JSON extraction.
     try:
-        def _rewrite_day_eq_to_range(match: re.Match) -> str:
-            expr = match.group(1).strip()
-            base = "(bucket_ts AT TIME ZONE :tz_name)"
-            return f"{base} >= ({expr})::timestamp AND {base} < (({expr})::timestamp + INTERVAL '1 day')"
-        base = "(bucket_ts AT TIME ZONE :tz_name)"
-        def _rewrite_ts_day_eq_to_range(match: re.Match) -> str:
-            expr = match.group(1).strip()
-            base = "(timestamp AT TIME ZONE :tz_name)"
-            return f"{base} >= ({expr})::timestamp AND {base} < (({expr})::timestamp + INTERVAL '1 day')"
-        def _rewrite_dates(sql_in: str) -> str:
-            steps: list[tuple[str, callable]] = [
-                ("current_date", lambda x: re.sub(r"(?is)\bcurrent_date\b", "(now() AT TIME ZONE :tz_name)::date", x)),
-                ("date_bucket_ts", lambda x: re.sub(
-                    r"(?is)\bdate\s*\(\s*((?:[a-zA-Z_][\w]*\.)?)bucket_ts\s*\)",
-                    r"DATE(\1bucket_ts AT TIME ZONE :tz_name)",
-                    x,
-                )),
-                ("date_timestamp", lambda x: re.sub(
-                    r"(?is)\bdate\s*\(\s*((?:[a-zA-Z_][\w]*\.)?)timestamp\s*\)",
-                    r"DATE(\1timestamp AT TIME ZONE :tz_name)",
-                    x,
-                )),
-                ("bucket_ts_cast_date", lambda x: re.sub(
-                    r"(?is)\b((?:[a-zA-Z_][\w]*\.)?)bucket_ts\s*::\s*date\b",
-                    r"( \1bucket_ts AT TIME ZONE :tz_name )::date",
-                    x,
-                )),
-                ("timestamp_cast_date", lambda x: re.sub(
-                    r"(?is)\b((?:[a-zA-Z_][\w]*\.)?)timestamp\s*::\s*date\b",
-                    r"( \1timestamp AT TIME ZONE :tz_name )::date",
-                    x,
-                )),
-                ("bucket_ts_day_eq_yesterday", lambda x: re.sub(
-                    r"(?is)\(\s*bucket_ts\s+at\s+time\s+zone\s*:tz_name\s*\)\s*::\s*date\s*=\s*\(\s*now\(\)\s+at\s+time\s+zone\s*:tz_name\s*\)\s*::\s*date\s*-\s*interval\s*'1\s*day'\b",
-                    f"{base} >= (date_trunc('day', now() AT TIME ZONE :tz_name) - INTERVAL '1 day') AND {base} < date_trunc('day', now() AT TIME ZONE :tz_name)",
-                    x,
-                )),
-                ("bucket_ts_day_eq_today", lambda x: re.sub(
-                    r"(?is)\(\s*bucket_ts\s+at\s+time\s+zone\s*:tz_name\s*\)\s*::\s*date\s*=\s*\(\s*now\(\)\s+at\s+time\s+zone\s*:tz_name\s*\)\s*::\s*date\b",
-                    f"{base} >= date_trunc('day', now() AT TIME ZONE :tz_name) AND {base} < (date_trunc('day', now() AT TIME ZONE :tz_name) + INTERVAL '1 day')",
-                    x,
-                )),
-                ("bucket_ts_day_eq_generic", lambda x: re.sub(
-                    r"(?is)\(\s*bucket_ts\s+at\s+time\s+zone\s*:tz_name\s*\)\s*::\s*date\s*=\s*(.+?)(?=\s+\bAND\b|\s+\bOR\b|\s+\bGROUP\b|\s+\bORDER\b|\s+\bLIMIT\b|\)|$)",
-                    _rewrite_day_eq_to_range,
-                    x,
-                )),
-                ("timestamp_day_eq_generic", lambda x: re.sub(
-                    r"(?is)\(\s*timestamp\s+at\s+time\s+zone\s*:tz_name\s*\)\s*::\s*date\s*=\s*(.+?)(?=\s+\bAND\b|\s+\bOR\b|\s+\bGROUP\b|\s+\bORDER\b|\s+\bLIMIT\b|\)|$)",
-                    _rewrite_ts_day_eq_to_range,
-                    x,
-                )),
-                ("date_trunc_day_now", lambda x: re.sub(
-                    r"(?is)date_trunc\s*\(\s*'day'\s*,\s*now\s*\(\s*\)\s*\)",
-                    "date_trunc('day', now() AT TIME ZONE :tz_name)",
-                    x,
-                )),
-                ("now", lambda x: re.sub(
-                    r"(?is)\bnow\s*\(\s*\)\b(?!\s+at\s+time\s+zone\b)",
-                    "(now() AT TIME ZONE :tz_name)",
-                    x,
-                )),
-                ("bucket_ts_comparisons", lambda x: re.sub(
-                    r"(?is)\b((?:[a-zA-Z_][\w]*\.)?)bucket_ts\s*(>=|>|<=|<)\s*",
-                    r"(\1bucket_ts AT TIME ZONE :tz_name) \2 ",
-                    x,
-                )),
-                ("timestamp_comparisons", lambda x: re.sub(
-                    r"(?is)\b((?:[a-zA-Z_][\w]*\.)?)timestamp\s*(>=|>|<=|<)\s*",
-                    r"(\1timestamp AT TIME ZONE :tz_name) \2 ",
-                    x,
-                )),
-                ("placeholder_yesterday_start", lambda x: re.sub(
-                    r"(?is)'yesterday_start'",
-                    "(date_trunc('day', now() AT TIME ZONE :tz_name) - INTERVAL '1 day')",
-                    x,
-                )),
-                ("placeholder_yesterday_end", lambda x: re.sub(
-                    r"(?is)'yesterday_end'",
-                    "date_trunc('day', now() AT TIME ZONE :tz_name)",
-                    x,
-                )),
-                ("placeholder_today_start", lambda x: re.sub(
-                    r"(?is)'today_start'",
-                    "date_trunc('day', now() AT TIME ZONE :tz_name)",
-                    x,
-                )),
-                ("placeholder_today_end", lambda x: re.sub(
-                    r"(?is)'today_end'",
-                    "(date_trunc('day', now() AT TIME ZONE :tz_name) + INTERVAL '1 day')",
-                    x,
-                )),
-            ]
-            out, _changed = _apply_rewrite_pipeline(sql_in, steps)
-            return out
-
-        s_new = _rewrite_dates(s)
-        if s_new != s:
-            s = s_new
-            logger.info("sql.rewrite.dates: normalized CURRENT_DATE and DATE(bucket_ts) to user tz")
+        s = re.sub(
+            r"(?is)\bat\s+time\s+zone\s+([a-zA-Z_][\w]*\.[a-zA-Z_]\w*)\s*->>\s*'([^']+)'",
+            r"AT TIME ZONE (\1->>'\2')",
+            s,
+        )
     except Exception:
         pass
 

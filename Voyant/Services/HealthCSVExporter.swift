@@ -345,6 +345,8 @@ struct HealthCSVExporter {
                         case .asleep: return "sleep_asleep_unspecified_minutes"
                         case .awake: return "sleep_awake_minutes"
                         case .inBed: return "sleep_in_bed_minutes"
+                        // Some SDKs still expose this case even on older OS versions.
+                        case .asleepUnspecified: return "sleep_asleep_unspecified_minutes"
                         // Future-proof: don't drop unknown values.
                         @unknown default: return "sleep_asleep_unspecified_minutes"
                         }
@@ -532,7 +534,8 @@ struct HealthCSVExporter {
         let specs = MetricSpec.defaultSpecs()
         let group = DispatchGroup()
 
-        let predicate = HKQuery.predicateForSamples(withStart: start, end: end, options: .strictStartDate)
+        // Use an overlapping predicate (no strictStartDate) so chunk boundaries don't truncate sleep/workout sessions.
+        let predicate = HKQuery.predicateForSamples(withStart: start, end: end, options: [])
         let sort = NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)
 
         for spec in specs {
@@ -572,7 +575,7 @@ struct HealthCSVExporter {
         // Workouts within window (mirrored into health_events-style rows)
         group.enter()
         let workoutType = HKObjectType.workoutType()
-        let workoutPredicate = HKQuery.predicateForSamples(withStart: start, end: end, options: .strictStartDate)
+        let workoutPredicate = HKQuery.predicateForSamples(withStart: start, end: end, options: [])
         let workoutSort = NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)
         let workoutQuery = HKSampleQuery(sampleType: workoutType, predicate: workoutPredicate, limit: HKObjectQueryNoLimit, sortDescriptors: [workoutSort]) { _, samples, error in
             defer { group.leave() }
