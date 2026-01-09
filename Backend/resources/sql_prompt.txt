@@ -98,6 +98,11 @@ derived_workout_segments (detailed workout data):
   - Context: LEFT JOIN derived_rollup_daily for these metric_types:
     steps, active_energy_burned, active_time_minutes, resting_heart_rate, hr_variability_sdnn
   - Pivot rule: use MAX(CASE WHEN dr.metric_type='X' AND day=... THEN dr.sum_value/avg_value END) and DO NOT use aggregate FILTER syntax.
+  - Units rule (CRITICAL): because this query pivots multiple metrics into multiple columns, you MUST also return unit columns for each rollup metric you surface, e.g.:
+    - MAX(CASE WHEN dr.metric_type='steps' THEN dr.unit END) AS steps_unit
+    - MAX(CASE WHEN dr.metric_type='active_energy_burned' THEN dr.unit END) AS active_energy_burned_unit
+    (Do this once per metric; units do not need day_before/day_of/day_after variants.)
+  - IMPORTANT: “day_of” MUST include the day condition (day = ls.sleep_date::date). Do NOT write `CASE WHEN dr.metric_type='steps' THEN ... END AS steps_day_of` (that takes the max across the 3-day join window).
   - Day alignment:
     - Define day := DATE(dr.bucket_ts AT TIME ZONE :tz_name) (do NOT use JSON tz here).
     - Compare to sleep_date using date casts: (ls.sleep_date ± INTERVAL '1 day')::date.
